@@ -1,4 +1,4 @@
-# akasa Code Index
+# Akasa Kernel Code Index
 
 This index serves as the architectural map. It outlines the core directories and their operational purpose to maintain a clear mental model of the ecosystem, preventing cognitive overload and logic drift.
 
@@ -13,6 +13,7 @@ akasa/
 │   ├── db.py                       # Thread-local SQLite connection pool and WAL schema migrations
 │   ├── extension.py                # Extension SDK context wrappers, SettingsManager, and JobManager
 │   ├── hooks.py                    # Priority event bus (HookRegistry) and authorization engine
+│   ├── process.py                  # [comment required]
 │   ├── py.typed                    # PEP 561 marker for static typing compliance
 │   ├── sync.py                     # Kernel state heartbeat and system delta calculator
 │   ├── types.py                    # Tier 1 type definitions, protocols, and event contracts
@@ -23,6 +24,14 @@ akasa/
 │       └── __init__.py             # Background task scheduler, step chaining, and job executor
 ├── docs/                           # [comment required]
 │   ├── 00_index.md                 # [comment required]
-│   └── 01_engineering_standards.md # [comment required]
-└── pyproject.toml                  # Build system specification and dependencies
+│   ├── 01_engineering_standards.md # [comment required]
+│   └── adrs/                       # [comment required]
+│       └── 0001_domain_agnostic_ioc_and_process_sandboxing.md # [comment required]
+├── pyproject.toml                  # Build system specification and dependencies
+└── tests/                          # [comment required]
+    ├── fitness/                    # [comment required]
+    │   ├── __init__.py             # Background task scheduler, step chaining, and job executor
+    │   ├── core.py                 # [comment required]
+    │   └── rules_python.py         # [comment required]
+    └── fitness_functions.py        # [comment required]
 ```
