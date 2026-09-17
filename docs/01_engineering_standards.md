@@ -20,7 +20,8 @@ Akasa is a strictly domain-agnostic Tier 1 application kernel and volume router.
 Logic, pathing, and settings management must operate deterministically from a single source of truth across all tenant contexts.
 
 * **Host-Agnostic Control Directory Resolution:** Hidden control directories must never be hardcoded as literal string paths (e.g. `".insetu"`). Control directory names must always resolve dynamically via `os.environ.get("AKASA_CONTROL_DIR", ".akasa")`.
-* **Workspace Physics SSOT:** Physical workspace locations and workflows are resolved via `get_workspace_physics(workspace_id)`. System routing indexes reside in `<control_dir>/system.json`.
+* **Workspace Physics SSOT:** Physical workspace locations are resolved via `get_workspace_physics(workspace_id)`, returning a canonical 2-tuple `(config_path, workspace_root)`. System routing indexes reside in `<control_dir>/system.json`.
+* **Volume-Sandboxed Subprocess Execution (`ProcessManager`):** Shell and subprocess operations must execute through `ProcessManager` (exposed on SDK context via `ctx.exec`), enforcing sandbox boundaries anchored to mounted volume targets with enforced timeouts.
 * **Multi-Scoped Settings Matrix (`SettingsManager`):** Settings are managed statelessly across four explicit scopes:
   * `daemon`: System-wide preferences stored in `<control_dir>/system.json`.
   * `workspace`: Tenant-specific settings stored in `<tenant_control_dir>/workspace.settings.json`.
