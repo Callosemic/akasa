@@ -41,7 +41,6 @@ class AkasaURI:
         if not self.path or self.path == '/':
             return ""
         return posixpath.basename(self.path.rstrip('/'))
-
     @property
     def parent(self) -> 'AkasaURI':
         if not self.path:
@@ -51,3 +50,29 @@ class AkasaURI:
         if parent_path:
             return AkasaURI(f"{base}/{parent_path}")
         return AkasaURI(base)
+
+    def join(self, child_path: str) -> 'AkasaURI':
+        if not child_path:
+            return self
+        child_clean = str(child_path).replace('\\', '/').lstrip('/')
+        new_path = posixpath.join(self.path, child_clean) if self.path else child_clean
+        if str(child_path).replace('\\', '/').endswith('/') and not new_path.endswith('/'):
+            new_path += '/'
+        base = f"{self.scheme}://{self.volume}" if self.scheme else self.volume
+        return AkasaURI(f"{base}/{new_path}" if new_path else base)
+
+    def relative_to(self, base_uri: 'AkasaURI') -> str:
+        if self.scheme != base_uri.scheme or self.volume != base_uri.volume:
+            raise ValueError(f"URIs do not share the same scheme and volume: '{self.scheme}://{self.volume}' vs '{base_uri.scheme}://{base_uri.volume}'")
+        if not self.path.startswith(base_uri.path):
+            raise ValueError("Current URI is not a subpath of the base URI.")
+        return self.path[len(base_uri.path):].lstrip('/')
+
+    def match(self, pattern: str) -> bool:
+        import fnmatch
+        full_str = f"{self.scheme}://{self.volume}/{self.path}" if self.scheme else f"{self.volume}/{self.path}" if self.volume else self.path
+        if fnmatch.fnmatch(full_str, pattern):
+            return True
+        if fnmatch.fnmatch(self.path, pattern):
+            return True
+        return False

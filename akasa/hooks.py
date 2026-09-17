@@ -8,21 +8,6 @@ from typing import TypedDict, Optional, List, Dict, Any, Union
 class HookPayload_MutateWorkspaceConfig(TypedDict, total=False):
     cfg: Dict[str, Any]
     workspace_id: Optional[str]
-
-class HookPayload_CompileContexts(TypedDict, total=False):
-    manifest: Dict[str, Any]
-    workspace_id: Optional[str]
-    target_repos: Optional[List[str]]
-    touched_buckets: Optional[List[str]]
-    is_full_sweep: Optional[Union[bool, List[str]]]
-
-class HookPayload_PreCompileDocument(TypedDict, total=False):
-    filepath: str
-    text: str
-    workspace_id: Optional[str]
-class HookPayload_RequestChangelogSuggestions(TypedDict, total=False):
-    repo: str
-    workspace_id: Optional[str]
 class HookPayload_VFSMutated(TypedDict, total=False):
     mutations: List[Dict[str, Any]]
     workspace_id: Optional[str]
@@ -35,9 +20,8 @@ class HookPayload_RegisterManifestSignatures(TypedDict, total=False):
     workspace_id: Optional[str]
     since_ts: Optional[float]
 _event_thread_local = threading.local()
-
 class HookRegistry:
-    """The central Event Bus for the inSetu Micro-Kernel."""
+    """The central Event Bus for the Akasa Micro-Kernel."""
 
     def __init__(self):
         self._hooks = {}
@@ -75,13 +59,26 @@ class HookRegistry:
         if mod.startswith('akasa.') or getattr(cb, 'is_core', False):
             return True
 
-        mod_name = mod.split('.')[-1]
-        ext_name = mod_name.replace('engine_', '') if mod_name.startswith('engine_') else None
+        # Inversion of Control: Determine if the module belongs to an enabled extension
+        # by checking if any segment of its import path matches an active extension name.
+        ext_name = None
+        from akasa.utils import load_config
+        try:
+            enabled_exts = set(load_config(workspace_id).get("extensions", []))
+            for part in mod.split('.'):
+                if part in enabled_exts:
+                    ext_name = part
+                    break
+        except Exception:
+            pass
 
         # Special Guardrail: Extensions are strictly banned from system_boot
         if event_name == 'system_boot':
             from akasa.utils import is_core_module
+            # Graceful fallback: If ext_name didn't resolve, check if the module path belongs to a known core module
             if ext_name and is_core_module(ext_name):
+                return True
+            if any(is_core_module(p) for p in mod.split('.')):
                 return True
             print(f"⚠️ [Event Bus] Banned hook: Non-core extension '{mod}' attempted to subscribe to 'system_boot'. Use 'workspace_boot' instead.")
             return False

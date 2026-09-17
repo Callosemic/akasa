@@ -14,22 +14,20 @@ def sniff_tenant_id():
 
 def get_physics_for(workspace_id):
     return get_workspace_physics(workspace_id)
-
 def get_tenant_control_dir(workspace_id=None):
-    cfg_path, _, _ = get_workspace_physics(workspace_id)
+    cfg_path, _ = get_workspace_physics(workspace_id)
     return Path(cfg_path).parent.as_posix()
 def get_workspace_physics(workspace_id=None):
     if not workspace_id:
         workspace_id = sniff_tenant_id()
     control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
-    local_insetu_dir = Path(_cwd).joinpath(control_dir_name).as_posix()
-    default_config = Path(local_insetu_dir).joinpath("config.json").as_posix()
-    index_path = Path(local_insetu_dir).joinpath("system.json").as_posix()
-
-    env_config = os.environ.get("INSETU_CONFIG")
+    local_control_dir = Path(_cwd).joinpath(control_dir_name).as_posix()
+    default_config = Path(local_control_dir).joinpath("config.json").as_posix()
+    index_path = Path(local_control_dir).joinpath("system.json").as_posix()
+    env_config = os.environ.get("AKASA_CONFIG")
     if env_config:
         resolved_cfg = os.path.abspath(os.path.expanduser(env_config))
-        return resolved_cfg, _cwd, Path(resolved_cfg).parent.joinpath("workflows.json").as_posix()
+        return resolved_cfg, _cwd
     target_ws = workspace_id or "default"
 
     resolved_cfg = default_config
@@ -48,33 +46,31 @@ def get_workspace_physics(workspace_id=None):
             pass
     if cfg_path:
         if not os.path.isabs(os.path.expanduser(cfg_path)):
-            resolved_cfg = os.path.abspath(Path(local_insetu_dir).joinpath(cfg_path).as_posix())
+            resolved_cfg = os.path.abspath(Path(local_control_dir).joinpath(cfg_path).as_posix())
         else:
             resolved_cfg = os.path.abspath(os.path.expanduser(cfg_path))
-
     if not os.path.exists(resolved_cfg) and target_ws == "default":
         resolved_cfg = default_config
-    workflows_path = Path(resolved_cfg).parent.joinpath("workflows.json").as_posix()
+
     if os.path.exists(resolved_cfg):
         try:
             c_data = load_json_config(resolved_cfg, {})
             if "workspace_root" in c_data:
-                return resolved_cfg, Path(c_data["workspace_root"]).expanduser().resolve().as_posix(), workflows_path
+                return resolved_cfg, Path(c_data["workspace_root"]).expanduser().resolve().as_posix()
         except Exception:
             pass
 
-        return resolved_cfg, Path(resolved_cfg).parent.parent.as_posix(), workflows_path
+        return resolved_cfg, Path(resolved_cfg).parent.parent.as_posix()
 
     if target_ws != "default":
-        return resolved_cfg, Path(resolved_cfg).parent.parent.as_posix(), workflows_path
+        return resolved_cfg, Path(resolved_cfg).parent.parent.as_posix()
 
-    return resolved_cfg, _cwd, workflows_path
+    return resolved_cfg, _cwd
 CORE_MODULES = set()
-
 def _discover_core_modules():
     """JIT Hook evaluation to retrieve host-provided core modules."""
     from akasa.hooks import hooks
-    modules = {'core_text_blobs'}
+    modules = set()
     for res in hooks.emit('register_core_modules'):
         if res: modules.update(res)
     return modules
@@ -122,42 +118,26 @@ def load_json_config(filepath, default_fallback=None):
         _JSON_MTIME[filepath] = current_mtime
 
     return _JSON_CACHE[filepath]
-
 def save_json_config(filepath, data, workspace_id=None):
     global _JSON_CACHE, _JSON_MTIME
     import json
     import time
-    import os
-    from pathlib import Path
+    from akasa.vfs import execute_vfs_save
 
-    os.makedirs(Path(filepath).parent, exist_ok=True)
-
-    # Write atomically to prevent JSON read-collisions during boot/reload
-    temp_path = f"{filepath}.tmp"
-    with open(temp_path, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2)
-    os.replace(temp_path, filepath)
+    content = json.dumps(data, indent=2)
+    execute_vfs_save(workspace_id or "default", filepath, content, data={"is_absolute_artifact": True, "ignore_ledger": True})
 
     _JSON_CACHE[filepath] = data
     _JSON_MTIME[filepath] = time.time()
 
 _MUTATED_CONFIG_CACHE = {}
 _MUTATED_CONFIG_MTIME = {}
-
 def load_config(workspace_id=None):
-    cfg_path, _, _ = get_workspace_physics(workspace_id)
+    cfg_path, _ = get_workspace_physics(workspace_id)
     current_mtime = os.path.getmtime(cfg_path) if os.path.exists(cfg_path) else 0
     if cfg_path not in _MUTATED_CONFIG_CACHE or current_mtime > _MUTATED_CONFIG_MTIME.get(cfg_path, 0):
         import copy
         cfg = copy.deepcopy(load_json_config(cfg_path, {}))
-
-        # Runtime Sanitization: Strip boundary whitespace to forgive manual config.json edits
-        for repo in cfg.get("target_repos", []):
-            if repo.get("repo_dir"):
-                repo["repo_dir"] = repo["repo_dir"].strip()
-            if repo.get("physical_path"):
-                repo["physical_path"] = repo["physical_path"].strip()
-
         from akasa.hooks import hooks
         hooks.emit('mutate_workspace_config', cfg, workspace_id=workspace_id)
         _MUTATED_CONFIG_CACHE[cfg_path] = cfg
@@ -184,21 +164,20 @@ import urllib.parse
 import posixpath
 import re
 def parse_uri(path_str):
-    """SDK Helper: Parses any scheme:// or relative path into (repo_dir, relative_path)."""
+    """SDK Helper: Parses any scheme:// or relative path into (volume, relative_path)."""
     if not path_str:
         return "", ""
 
     from akasa.uri import AkasaURI
     uri = AkasaURI(path_str)
-
     # Strict mapping for fully qualified URIs
     if uri.scheme:
         return uri.volume, uri.path
 
     # Legacy fallback for scheme-less paths (e.g. 'repo/file.txt')
-    parts = uri.path.split('/', 1)
-    if len(parts) > 1:
-        return parts[0], parts[1]
+    fallback_uri = AkasaURI(f"vfs://{uri.path}")
+    if fallback_uri.volume and fallback_uri.path:
+        return fallback_uri.volume, fallback_uri.path
     return "", uri.path
 
 def slugify(text):
@@ -219,7 +198,7 @@ def slugify(text):
     return re.sub(r'_+', '_', clean).strip('_')
 def resolve_sandbox_path(filepath, workspace_id=None):
     """Tier 1 Safe Path Resolution: Prevents directory traversal breakouts."""
-    _, workspace_root, _ = get_workspace_physics(workspace_id)
+    _, workspace_root = get_workspace_physics(workspace_id)
     ws_root_path = Path(workspace_root).resolve()
 
     from akasa.uri import AkasaURI
@@ -235,38 +214,30 @@ def resolve_sandbox_path(filepath, workspace_id=None):
             norm_path = resolved_abs.relative_to(ws_root_path).as_posix()
         except ValueError:
             norm_path = resolved_abs.name
-
     resolved = ws_root_path.joinpath(norm_path).resolve()
-    if not resolved.exists():
-        parts = norm_path.split('/')
-        if len(parts) > 1 and parts[0] == parts[1]:
-            dedup_path = ws_root_path.joinpath(*parts[1:]).resolve()
-            if dedup_path.exists():
-                return dedup_path.as_posix()
-
     return resolved.as_posix()
-
 def resolve_system_artifact_path(filepath, workspace_id):
-    cfg_path, _, _ = get_workspace_physics(workspace_id)
-    active_insetu_base = Path(cfg_path).parent.resolve()
-    default_insetu_base = Path(_cwd).joinpath(".insetu").resolve()
+    cfg_path, _ = get_workspace_physics(workspace_id)
+    control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
+
+    active_control_base = Path(cfg_path).parent.resolve()
+    default_control_base = Path(_cwd).joinpath(control_dir_name).resolve()
     resolved_abs = Path(filepath).resolve()
-    if str(resolved_abs).startswith(str(active_insetu_base)) or str(resolved_abs).startswith(str(default_insetu_base)):
+
+    if str(resolved_abs).startswith(str(active_control_base)) or str(resolved_abs).startswith(str(default_control_base)):
         return resolved_abs.as_posix()
     else:
         return resolve_sandbox_path(filepath, workspace_id)
-
 def build_tree_dict(file_paths):
     tree = {}
     for path in file_paths:
-        parts = path.split('/')
+        parts = Path(path).parts
         current = tree
         for part in parts:
             if part not in current:
                 current[part] = {}
             current = current[part]
     return tree
-
 def generate_ascii_tree(file_paths):
     tree = build_tree_dict(file_paths)
     def print_tree(node, prefix=""):
@@ -278,118 +249,3 @@ def generate_ascii_tree(file_paths):
             lines.extend(print_tree(node[key], prefix + ("    " if is_last else "│   ")))
         return lines
     return ".\n" + "\n".join(print_tree(tree))
-
-def resolve_macro_includes(text, current_filepath, pattern, read_callback, depth=0):
-    import re
-    if depth > 5:
-        return text + "\n[!] INCLUSION DEPTH LIMIT EXCEEDED"
-    def replacer(match):
-        include_path = match.group(1).strip()
-        params_str = match.group(2) if len(match.groups()) > 1 and match.group(2) else ""
-
-        if include_path.startswith('./') or include_path.startswith('../'):
-            parts = current_filepath.split('/')[:-1]
-            for p in include_path.split('/'):
-                if p == '.': continue
-                elif p == '..': 
-                    if parts: parts.pop()
-                else: parts.append(p)
-            target_path = '/'.join(parts)
-        else:
-            target_path = include_path.lstrip('/')
-
-        inc_content = read_callback(target_path)
-        if inc_content is not None:
-            if params_str:
-                param_matches = re.finditer(r'([a-zA-Z0-9_]+)\s*:\s*(?:"([^"]*)"|([^;}]*))', params_str)
-                for pm in param_matches:
-                    key = pm.group(1)
-                    val = pm.group(2) if pm.group(2) is not None else pm.group(3).strip()
-                    macro_pattern = r'\{\{\s*macro_' + re.escape(key) + r'\s*\}\}'
-                    inc_content = re.sub(macro_pattern, val, inc_content)
-            return resolve_macro_includes(inc_content, target_path, pattern, read_callback, depth + 1)
-        else:
-            return f"[!] MACRO TARGET NOT FOUND: {include_path}"
-
-    return re.sub(pattern, replacer, text)
-
-def _get_base_step_and_diffs(lines):
-    """Analyzes a block of code to find its true structural base indentation unit (LCD > 1)."""
-    indents = sorted(list(set(len(line) - len(line.lstrip()) for line in lines if line.strip())))
-    if len(indents) > 1:
-        diffs = [indents[k+1] - indents[k] for k in range(len(indents)-1)]
-        valid_diffs = [d for d in diffs if d > 1]
-
-        if valid_diffs:
-            best_step = 4
-            min_error = float('inf')
-
-            for S in [4, 2, 3, 8]:
-                error = 0
-                has_base_jump = False
-
-                for d in valid_diffs:
-                    k = max(1, int(round(d / S)))
-                    if k == 1:
-                        has_base_jump = True
-                    error += abs(d - (k * S))
-
-                if not has_base_jump:
-                    error += 1000 
-
-                if error < min_error:
-                    min_error = error
-                    best_step = S
-
-            return best_step, diffs
-    return 4, []
-
-def parse_blocks(text):
-    import re
-    files = {}
-    current_file = None
-    state = "OUTSIDE"
-    current_type = "exact"
-    search_lines, replace_lines = [], []
-
-    if "<<<<<<< FILE:" in text:
-        text = "<<<<<<< FILE:" + text.split("<<<<<<< FILE:", 1)[1]
-
-    text = re.sub(
-        r'^[ \t\xa0]*(?:>[ \t\xa0]*)+REPLACE[ \t\xa0]*(?:\n[ \t\xa0]*(?:>[ \t\xa0]*)+$)*',
-        '>>>>>>> REPLACE',
-        text,
-        flags=re.MULTILINE
-    )
-
-    lines = text.replace('\r\n', '\n').replace('\xa0', ' ').split('\n')
-    for line in lines:
-        if line.startswith("<<<<<<< FILE:"):
-            current_file = line.replace("<<<<<<< FILE:", "").strip()
-            if current_file not in files: files[current_file] = []
-            state = "OUTSIDE"
-        elif line.startswith("<<<<<<< SEARCH"):
-            state = "SEARCH"
-            search_lines = []
-            current_type = "regex" if "REGEX" in line else "exact"
-        elif line.startswith("======="):
-            if state == "SEARCH":
-                state = "REPLACE"
-                replace_lines = []
-            elif state == "OUTSIDE" and current_file:
-                print(f"  [~] Warning: Missing '<<<<<<< SEARCH' tag detected for {current_file}. Auto-healing as a genesis patch.")
-                state = "REPLACE"
-                search_lines = []
-                replace_lines = []
-        elif line.startswith(">>>>>>> REPLACE"):
-            if state == "REPLACE" and current_file:
-                files[current_file].append({
-                    "type": current_type,
-                    "search": "\n".join(search_lines),
-                    "replace": "\n".join(replace_lines)
-                })
-            state = "OUTSIDE"
-        else:
-            if state == "SEARCH": search_lines.append(line)
-            elif state == "REPLACE": replace_lines.append(line)
-    return files

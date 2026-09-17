@@ -40,15 +40,12 @@ class JobChainPayload(TypedDict, total=False):
     """Payload formalizing the background worker step-chaining contract (ADR 0037)."""
     steps: List[JobChainStep]
     on_complete_hook: Optional[str]
-
 class WorkspacePathsDict(TypedDict):
     """Spatial path mappings for an active tenant workspace."""
     workspace_root: TenantPath
     control_dir: TenantPath
     config_path: TenantPath
     data_dir: TenantPath
-    contexts_dir: TenantPath
-    diffs_dir: TenantPath
 
 class VFSStorageEngine(Protocol):
     """Structural interface contract for VFS operations."""

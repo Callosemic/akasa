@@ -14,7 +14,7 @@ class DefaultVFSDriver:
             return resolved.as_posix()
         return target.as_posix()
 
-_DRIVERS = {'vfs': DefaultVFSDriver(), 'ctx': DefaultVFSDriver()}
+_DRIVERS = {'vfs': DefaultVFSDriver()}
 _MOUNT_TABLE = {}
 
 def register_driver(scheme, driver_instance):
@@ -28,25 +28,26 @@ def mount_volume(workspace_id, scheme, volume, physical_target):
 def _resolve_physical_path(filepath, workspace_id, is_absolute_artifact=False):
     """Centralized SSOT for VFS path resolution via the Volume Router."""
     if not filepath: return None
-    from akasa.utils import resolve_system_artifact_path, resolve_sandbox_path
+    from akasa.utils import resolve_system_artifact_path, parse_uri
     from akasa.uri import AkasaURI
     from pathlib import Path
 
-    uri = AkasaURI(filepath)
+    if is_absolute_artifact and Path(filepath).is_absolute():
+        return resolve_system_artifact_path(filepath, workspace_id)
 
-    if is_absolute_artifact and Path(uri.path).is_absolute():
-        return resolve_system_artifact_path(uri.path, workspace_id)
+    vol, rel = parse_uri(filepath)
+    if vol and "://" not in str(filepath):
+        uri = AkasaURI(f"vfs://{vol}/{rel}")
+    else:
+        uri = AkasaURI(filepath)
 
     scheme = uri.scheme or 'vfs'
     volume = uri.volume or ""
 
     mount_key = (workspace_id, scheme, volume)
     physical_target = _MOUNT_TABLE.get(mount_key)
-
     if not physical_target:
-        # Fallback for unmounted volumes/legacy paths within the default sandbox
-        check_path = f"{volume}/{uri.path}" if volume else uri.path
-        return resolve_sandbox_path(check_path, workspace_id)
+        return None
 
     driver = _DRIVERS.get(scheme)
     if not driver:
@@ -104,24 +105,27 @@ def _vfs_commit_worker():
                         os.makedirs(Path(resolved_dest).parent, exist_ok=True)
                         import shutil
                         shutil.move(resolved_src, resolved_dest)
-                    ignore_ledger = bool(data.get("is_absolute_artifact") or data.get("ignore_ledger"))
-                    if not ignore_ledger:
-                        import time
-                        from akasa.db import get_connection
-                        db_conn = get_connection("workers", workspace_id=workspace_id)
-                        db_conn.execute(
-                            "INSERT OR REPLACE INTO vfs_event_log (filepath, mutation_type, timestamp) VALUES (?, ?, ?)",
-                            (filepath, 'deleted', time.time())
-                        )
-                        db_conn.execute(
-                            "INSERT OR REPLACE INTO vfs_event_log (filepath, mutation_type, timestamp) VALUES (?, ?, ?)",
-                            (dest_path, 'added', time.time())
-                        )
-                        db_conn.commit()
-                    hooks.emit('vfs_mutated', workspace_id=workspace_id, mutations=[
-                        {"filepath": filepath, "operation": "delete", "ignore_ledger": ignore_ledger},
-                        {"filepath": dest_path, "operation": "save", "ignore_ledger": ignore_ledger}
-                    ])
+
+                        ignore_ledger = bool(data.get("is_absolute_artifact") or data.get("ignore_ledger"))
+                        if not ignore_ledger:
+                            import time
+                            from akasa.db import get_connection
+                            db_conn = get_connection("workers", workspace_id=workspace_id)
+                            db_conn.execute(
+                                "INSERT OR REPLACE INTO vfs_event_log (filepath, mutation_type, timestamp) VALUES (?, ?, ?)",
+                                (filepath, 'deleted', time.time())
+                            )
+                            db_conn.execute(
+                                "INSERT OR REPLACE INTO vfs_event_log (filepath, mutation_type, timestamp) VALUES (?, ?, ?)",
+                                (dest_path, 'added', time.time())
+                            )
+                            db_conn.commit()
+                        hooks.emit('vfs_mutated', workspace_id=workspace_id, mutations=[
+                            {"filepath": filepath, "operation": "delete", "ignore_ledger": ignore_ledger},
+                            {"filepath": dest_path, "operation": "save", "ignore_ledger": ignore_ledger}
+                        ])
+                    else:
+                        print(f"❌ [VFS Pipeline] Move aborted: Source file missing on disk ({filepath})")
                 else:
                     execute_vfs_save_physical(workspace_id, filepath, content, data)
             except Exception as e:
@@ -146,36 +150,19 @@ def stop_vfs_pipeline(**kwargs):
     _VFS_WRITE_QUEUE.put(None)
     if _VFS_WORKER_THREAD:
         _VFS_WORKER_THREAD.join(timeout=5.0)
-
 def execute_vfs_move(workspace_id, filepath, dest_path):
     _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "move", "dest_path": dest_path}))
     return {"status": "accepted", "message": f"File move queued."}, 202
-def execute_vfs_archive(workspace_id, filepath):
-    from akasa.uri import AkasaURI
-    uri = AkasaURI(filepath)
-
-    if not uri.parent.path or uri.parent.path == '.':
-        rel_dest = f"archived/{uri.basename}"
-    else:
-        rel_dest = f"{uri.parent.path}/archived/{uri.basename}"
-
-    _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "move", "dest_path": rel_dest}))
-    return {"status": "accepted", "message": f"File archive queued.", "new_path": rel_dest}, 202
-
 def execute_vfs_delete(workspace_id, filepath):
     _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "delete"}))
     return {"status": "accepted", "message": f"File deletion queued."}, 202
+
 def execute_vfs_save(workspace_id, filepath, content, data=None):
     if data is None:
         data = {}
-    if filepath.lower().endswith('.json'):
-        import json
-        try:
-            json.loads(content)
-        except Exception as e:
-            raise ValueError(f"Invalid JSON syntax: {str(e)}")
     _VFS_WRITE_QUEUE.put((workspace_id, filepath, content, data))
     return {"status": "accepted", "message": f"File {filepath} queued for atomic background commit."}
+
 def execute_vfs_save_physical(workspace_id, filepath, content, data):
     resolved_path = _resolve_physical_path(filepath, workspace_id, data.get("is_absolute_artifact"))
 
@@ -213,13 +200,10 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data):
             (filepath, 'modified' if not is_new else 'added', time.time())
         )
         db_conn.commit()
-        
     delete_source = data.get("delete_source")
     if delete_source:
-        overrides = hooks.emit('vfs_resolve_path', filepath=delete_source, workspace_id=workspace_id)
-        from akasa.utils import resolve_sandbox_path
-        old_abs_path = next((r for r in overrides if r), None) or resolve_sandbox_path(delete_source, workspace_id)
-        if os.path.exists(old_abs_path) and os.path.abspath(old_abs_path) != os.path.abspath(resolved_path):
+        old_abs_path = _resolve_physical_path(delete_source, workspace_id, data.get("is_absolute_artifact"))
+        if old_abs_path and os.path.exists(old_abs_path) and os.path.abspath(old_abs_path) != os.path.abspath(resolved_path):
             os.remove(old_abs_path)
             hooks.emit('vfs_mutated', workspace_id=workspace_id, mutations=[{"filepath": delete_source, "operation": "delete", "ignore_ledger": ignore_ledger}])
             try:
@@ -273,8 +257,7 @@ class VFSTransaction:
             with open(resolved, 'r', encoding='utf-8') as f:
                 return f.read()
         except UnicodeDecodeError:
-            # Graceful fallback for binary payloads (e.g. .git objects) to prevent 500 errors
-            return "[Binary Data]"
+            return None
 
     def __enter__(self):
         self._in_transaction = True
@@ -296,10 +279,11 @@ class VFSTransaction:
 
         if not resolved_dir or not os.path.exists(resolved_dir):
             return
-
         for root, dirs, files in os.walk(resolved_dir):
-            # Ignore standard noise at the kernel level
-            dirs[:] = [d for d in dirs if d not in ['.git', 'node_modules', '__pycache__']]
+            # Inversion of Control: Host application defines standard noise to ignore
+            from akasa.hooks import hooks
+            ignored_dirs = next((res for res in hooks.emit('request_vfs_ignore_dirs', workspace_id=self.workspace_id) if res), [])
+            dirs[:] = [d for d in dirs if d not in ignored_dirs]
             for file in files:
                 if exts and not any(file.endswith(ext) for ext in exts):
                     continue

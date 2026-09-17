@@ -30,8 +30,8 @@ def get_system_deltas(workspace_id=None, since_ts=0.0):
     is_compiling_immediate = False
     for r in active_job_rows:
         cb = r['callback_name'] or ""
-        # Strictly define which tasks represent a global UI-blocking compilation state
-        is_compiler = cb.startswith('compile_') or cb in ('pack_selection_task', 'execute_delayed_compile', 'boot_scan_task', 'resolve_topology_task', 'scan_topology_task')
+        # Inversion of Control: Let the host application define which tasks block the UI
+        is_compiler = any(hooks.emit('evaluate_blocking_task', task_name=cb, workspace_id=wid))
 
         if is_compiler:
             is_compiling_immediate = True
@@ -48,13 +48,14 @@ def get_system_deltas(workspace_id=None, since_ts=0.0):
 
     active_modules = list(active_modules_set)
     pending_modules = [m for m in pending_modules_set if m not in active_modules_set]
+    # IoC: Host application determines if any running metronome jobs should lock the UI
+    active_jobs = conn.execute("SELECT callback_name FROM jobs WHERE status = 'running'").fetchall()
+    is_compiling_delayed = any(
+        any(hooks.emit('evaluate_blocking_task', task_name=j['callback_name'], workspace_id=wid))
+        for j in active_jobs
+    )
 
-    # Routine metronome jobs (garbage collection, sweeps) do not lock the UI.
-    compiling_jobs = conn.execute(
-        "SELECT count(*) FROM jobs WHERE status = 'running' AND callback_name = 'execute_delayed_compile'"
-    ).fetchone()[0]
-
-    is_compiling = is_compiling_immediate or (compiling_jobs > 0)
+    is_compiling = is_compiling_immediate or is_compiling_delayed
 
     # 3. Collect Signatures via Event Bus
     signatures = {}

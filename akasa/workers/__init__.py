@@ -255,14 +255,14 @@ def sweep_ephemeral_artifacts(workspace_id="default"):
     """Sweeps and deletes expired temporary files and old immediate jobs."""
     conn = get_connection("workers", workspace_id=workspace_id)
     now = time.time()
-
     # 1. Sweep Ephemeral Artifacts
     cursor = conn.execute("SELECT id, filepath FROM ephemeral_artifacts WHERE expires_at < ?", (now,))
     for row in cursor.fetchall():
         try:
             import os
+            from akasa.vfs import execute_vfs_delete
             if os.path.exists(row['filepath']):
-                os.remove(row['filepath'])
+                execute_vfs_delete(workspace_id, row['filepath'])
             conn.execute("DELETE FROM ephemeral_artifacts WHERE id=?", (row['id'],))
         except Exception as e:
             print(f"⚠️ Failed to garbage collect ephemeral artifact {row['filepath']}: {e}")

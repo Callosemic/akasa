@@ -137,10 +137,12 @@ class SettingsManager:
             data = load_json_config(filepath, {})
 
             if scope == 'daemon':
-                if self.ext_name in ('core_system', 'system') and key in data:
-                    return data[key]
-                elif key in data.get(self.ext_name, {}):
+                # Agnostic Fallback: If it is nested under the extension, return it.
+                # Otherwise, if it manages a root configuration parameter, return the root.
+                if key in data.get(self.ext_name, {}):
                     return data[self.ext_name][key]
+                elif key in data:
+                    return data[key]
             elif scope == 'repo':
                 if repo and key in data.get(repo, {}).get(self.ext_name, {}):
                     return data[repo][self.ext_name][key]
@@ -183,7 +185,9 @@ class SettingsManager:
             data = load_json_config(filepath, {})
 
             if scope == 'daemon':
-                if self.ext_name in ('core_system', 'system'):
+                # Agnostic Write: If the setting already exists at the root level, assume it's a global daemon 
+                # parameter and update it there. Otherwise, safely namespace it under the extension's dictionary.
+                if key in data and not isinstance(data[key], dict):
                     data[key] = value
                 else:
                     if self.ext_name not in data: data[self.ext_name] = {}
@@ -251,7 +255,8 @@ class SettingsManager:
             else:
                 target = buffers[scope]
                 if scope == 'daemon':
-                    if self.ext_name == 'core_system': target[k] = val
+                    if k in target and not isinstance(target[k], dict):
+                        target[k] = val
                     else:
                         if self.ext_name not in target: target[self.ext_name] = {}
                         target[self.ext_name][k] = val
@@ -363,14 +368,13 @@ class ExtensionContext:
         from akasa.hooks import hooks
         from pathlib import Path
 
-        cfg_path, ws_root, wf_path = get_workspace_physics(self.workspace_id)
+        cfg_path, ws_root = get_workspace_physics(self.workspace_id)
         workspace_dir = Path(cfg_path).parent.as_posix()
-        artifacts_base = Path(workspace_dir).joinpath("data").as_posix()
+        artifacts_base = Path(workspace_dir).joinpath("ext", self.ext_name, "data").as_posix()
         base_paths = {
             "config_path": cfg_path,
             "control_dir": workspace_dir,
             "workspace_root": ws_root,
-            "workflows_path": wf_path,
             "artifacts_base": artifacts_base
         }
 
@@ -381,26 +385,25 @@ class ExtensionContext:
                 base_paths.update(p_dict)
 
         return base_paths
-
     @property
     def config(self):
         """Lazily fetches the active tenant's workspace configuration."""
         return load_config(self.workspace_id)
+
+    @property
+    def exec(self):
+        """Returns a sandboxed ProcessManager keyed to the active tenant workspace."""
+        from akasa.process import ProcessManager
+        return ProcessManager(self.workspace_id)
     def resolve_path(self, filepath):
         """Safely anchors a relative path to the physical workspace bounds."""
         from akasa.vfs import _resolve_physical_path
         return _resolve_physical_path(filepath, self.workspace_id)
-    def get_repo_path(self, repo_dir):
-        """SSOT for resolving a repository's physical override or logical path."""
-        import os
-        for c in self.config.get("target_repos", []):
-            if c.get("repo_dir") == repo_dir and c.get("physical_path"):
-                return os.path.abspath(os.path.expanduser(c.get("physical_path")))
-        return self.resolve_path(repo_dir)
-    def find_path_candidates(self, query_path, allowed_repos=None):
+
+    def find_path_candidates(self, query_path, **kwargs):
         """Opt-in candidate discovery for path disambiguation."""
         from akasa.hooks import hooks
-        results = hooks.emit('find_path_candidates', query_path=query_path, workspace_id=self.workspace_id, allowed_repos=allowed_repos)
+        results = hooks.emit('find_path_candidates', query_path=query_path, workspace_id=self.workspace_id, **kwargs)
         return next((r for r in results if r), [])
     @property
     def manifest(self):
@@ -467,14 +470,12 @@ class AkasaExtension:
     Agnostic Blueprint wrapper that enforces tenant isolation, API routing,
     authorization, and SQLite schema migrations for kernel extensions.
     """
-    def __init__(self, name, module_name, title=None, description="", schema=None, virtual_contexts=None, target_repos=None, core=False, settings_schema=None):
+    def __init__(self, name, module_name, title=None, description="", schema=None, core=False, settings_schema=None):
         self.name = name
         self.title = title or name.replace('_', ' ').title()
         self.description = description
         self.bp = Blueprint(name, module_name)
         self.schema = schema or {}
-        self.virtual_contexts = virtual_contexts or []
-        self.target_repos = target_repos or []
         self.core = core
         self.settings_schema = settings_schema or []
 
@@ -513,29 +514,9 @@ class AkasaExtension:
             if job_id:
                 payload["job_id"] = job_id
             return jsonify(payload)
-
         @self.route('settings/schema', methods=['GET'])
         def get_settings_schema(ctx):
             return jsonify(self.settings_schema)
-        if self.virtual_contexts or self.target_repos:
-            from akasa.hooks import hooks
-            @hooks.on('mutate_workspace_config')
-            def _inject_declarative_config(cfg, workspace_id=None, **kwargs):
-                if self.name not in cfg.get("extensions", []): return
-
-                if self.target_repos:
-                    targets = cfg.get("target_repos", [])
-                    for tr in self.target_repos:
-                        if not any(r.get("repo_dir") == tr.get("repo_dir") for r in targets):
-                            targets.append(tr)
-                    cfg["target_repos"] = targets
-
-                if self.virtual_contexts:
-                    if "virtual_contexts" not in cfg:
-                        cfg["virtual_contexts"] = []
-                    for vc in self.virtual_contexts:
-                        if not any(v.get("out_file") == vc.get("out_file") for v in cfg["virtual_contexts"]):
-                            cfg["virtual_contexts"].append(vc)
 
     def get_context(self, workspace_id, job_id=None):
         """SDK Factory: Returns a fully hydrated context inherently bound to this extension's schema."""
@@ -585,6 +566,3 @@ class AkasaExtension:
             self.bp.route(full_rule, **options)(wrapper)
             return wrapper
         return decorator
-
-# Backwards compatibility alias for host applications
-InSetuExtension = AkasaExtension
