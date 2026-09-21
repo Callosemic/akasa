@@ -27,7 +27,7 @@ Logic, pathing, and settings management must operate deterministically from a si
   * `workspace`: Tenant-specific settings stored in `<tenant_control_dir>/workspace.settings.json`.
   * `repo`: Repository-level settings stored in `<tenant_control_dir>/repo.settings.json`.
   * `secure`: Encrypted credentials stored in `<tenant_control_dir>/secrets.json` using Fernet cryptography driven by `~/.akasa/master_key.txt`.
-* **Cache Invalidation:** Any mutation to configuration structures or settings files on disk must explicitly clear internal memory caches (`_MUTATED_CONFIG_CACHE` and `_MUTATED_CONFIG_MTIME`) to prevent stale reads across worker threads.
+* **Thread-Safe Single-Flight Cache Invalidation:** Any mutation to configuration structures or settings files on disk must emit a `config_mutated` event via `hooks.emit('config_mutated', workspace_id=...)`. Configuration loaders rely on `@thread_safe_cache` with single-flight execution barriers and race-condition protected invalidation hooks.
 * **Defensive Fallbacks:** When accessing nested dictionary or array properties in configurations, getters must enforce explicit non-`None` fallbacks (e.g., `(cfg.get('key') or [])`) to prevent `TypeError` during iteration when keys are set to `null` in JSON payloads.
 
 ---
@@ -54,6 +54,7 @@ Physical file I/O must never block main thread execution or risk partial file wr
 * **Non-Blocking Write Queue (`_VFS_WRITE_QUEUE`):** File mutations (`save`, `delete`, `move`) are enqueued onto a background commit pipeline thread (`_vfs_commit_worker`). REST and SDK endpoints accept writes asynchronously and return HTTP 202 status confirmations.
 * **Idempotency Gatekeeper:** Prior to writing to disk, the VFS worker evaluates existing disk contents. If the payload is identical, the disk write and subsequent event ledger updates are silently dropped to eliminate phantom I/O events.
 * **Queued Event-Driven Barrier Sentinel (`sync_vfs_barrier`):** Read-after-write synchronization is achieved by enqueuing an explicit `{"action": "barrier", "barrier_event": event}` sentinel onto `_VFS_WRITE_QUEUE`. Threads wait specifically on their barrier event, avoiding polling loops or CPU starvation.
+* **Auto-Healing Database Connections:** Connection pooling in `get_connection()` runs `PRAGMA quick_check(1)` upon connection. Corrupt disk images are automatically quarantined to `.corrupt_<timestamp>`, re-initialized, and re-migrated cleanly.
 * **Declarative Schema Auto-Migration:** SQLite database tables required by kernel extensions register declarative schemas (`register_schema`) which auto-migrate on tenant boot via column diffing.
 
 ---
@@ -85,8 +86,8 @@ Background tasks, sweeping routines, and scheduled execution must operate throug
 ## 5. Event Bus Governance (`HookRegistry`)
 
 Inter-module signaling and lifecycle notifications route through the synchronous/asynchronous `HookRegistry`.
-
-* **Tenant Authorization (`_is_authorized`):** Before invoking a hook callback, the event bus verifies that the subscriber's module is enabled in the active workspace context (`is_extension_enabled`). Core system modules (`akasa.*`) bypass authorization checks.
+* **Tenant Authorization (`_is_authorized`):** Before invoking a hook callback, the event bus verifies that the subscriber's module is enabled in the active workspace context (`is_extension_enabled`). Core system modules (`akasa.*`) and registered trusted host namespaces (`register_trusted_namespace`) bypass authorization checks.
+* **Dependency-Injected Routing & Real-Time Broadcast:** Spatial volume routing functions can be injected via `set_workspace_router()`. UI signals and job progress updates are automatically dispatched to client queues via the global SSE bus (`sse_bus.emit_sse`).
 * **`system_boot` Boundary Protection:** Non-core domain extensions are explicitly banned from subscribing to `@hooks.on('system_boot')`. Domain extensions must subscribe to `@hooks.on('workspace_boot')` or `@hooks.on('topology_boot_complete')`.
 * **Execution Telemetry:** Synchronous hook executions exceeding 1.0 seconds trigger telemetry warnings to identify slow handlers blocking event propagation.
 
