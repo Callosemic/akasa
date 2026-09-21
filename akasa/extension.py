@@ -13,24 +13,53 @@ class JobManager:
         self.ext_name = ext_name
         self.workspace_id = workspace_id
         self.current_job_id = job_id
-    def submit(self, task_name, coalesce=False, **kwargs):
+    def submit(self, task_name, coalesce=False, job_category="system_background", **kwargs):
         import uuid, json
         from akasa.workers import submit_immediate_job
         job_prefix = self.ext_name[:3].lower()
         job_id = f"{job_prefix}_{uuid.uuid4().hex[:8]}"
         args_json = json.dumps(kwargs)
         return submit_immediate_job(
-            job_id, self.ext_name, task_name, args_json, self.workspace_id, coalesce=coalesce
+            job_id, self.ext_name, task_name, args_json, self.workspace_id, coalesce=coalesce, job_category=job_category
         )
-
     def submit_one_shot(self, task_name, delay_ms, **kwargs):
         import uuid, json
         from akasa.workers import submit_one_shot_job
+        kwargs.pop("job_category", None) # Cleanse leaked routing attributes
         job_prefix = self.ext_name[:3].lower()
         job_id = f"{job_prefix}_{uuid.uuid4().hex[:8]}"
         args_json = json.dumps(kwargs)
         submit_one_shot_job(job_id, self.ext_name, task_name, delay_ms, args_json, self.workspace_id)
         return job_id
+
+    def submit_chain(self, steps, on_complete_hook=None, job_category="system_background", **kwargs):
+        """SDK Helper: Automatically constructs and dispatches an ADR 0037 background job chain."""
+        if not steps: return None
+        import uuid, json
+        from akasa.workers import submit_immediate_job
+
+        first_step = steps[0]
+        job_id = f"chn_{uuid.uuid4().hex[:8]}"
+
+        chain_data = {}
+        if len(steps) > 1:
+            chain_data["steps"] = steps[1:]
+        if on_complete_hook:
+            chain_data["on_complete_hook"] = on_complete_hook
+
+        if chain_data:
+            kwargs["_chain"] = chain_data
+
+        args_json = json.dumps(kwargs)
+        return submit_immediate_job(
+            job_id, 
+            first_step["ext_name"], 
+            first_step["worker_name"], 
+            args_json, 
+            self.workspace_id, 
+            coalesce=False,
+            job_category=job_category
+        )
 
     def is_in_flight(self, task_name):
         """SDK Helper: Checks if a specific background worker task is currently queued or processing."""
@@ -151,9 +180,8 @@ class SettingsManager:
                     return data[self.ext_name][key]
 
         return field.get('default', default)
-
     def set(self, key, value, repo=None):
-        from akasa.utils import load_json_config, save_json_config, get_tenant_control_dir, _MUTATED_CONFIG_CACHE, _MUTATED_CONFIG_MTIME
+        from akasa.utils import load_json_config, save_json_config, get_tenant_control_dir
         from pathlib import Path
 
         field = self._get_field_meta(key)
@@ -200,11 +228,10 @@ class SettingsManager:
             else:
                 if self.ext_name not in data: data[self.ext_name] = {}
                 data[self.ext_name][key] = value
-
             save_json_config(filepath, data, self.workspace_id)
 
-        _MUTATED_CONFIG_CACHE.clear()
-        _MUTATED_CONFIG_MTIME.clear()
+        from akasa.hooks import hooks
+        hooks.emit('config_mutated', workspace_id=self.workspace_id)
         self._sync_vfs_barrier()
 
     def get_all(self, repo=None):
@@ -215,7 +242,7 @@ class SettingsManager:
             result[fid] = self.get(fid, repo=repo)
         return result
     def update(self, payload_dict, repo=None):
-        from akasa.utils import load_json_config, save_json_config, get_tenant_control_dir, _MUTATED_CONFIG_CACHE, _MUTATED_CONFIG_MTIME
+        from akasa.utils import load_json_config, save_json_config, get_tenant_control_dir
         from pathlib import Path
 
         control_dir = get_tenant_control_dir(self.workspace_id)
@@ -276,18 +303,23 @@ class SettingsManager:
         if 'repo' in dirty: save_json_config(repo_path, buffers['repo'], self.workspace_id)
         if 'secure' in dirty: save_json_config(secrets_path, buffers['secure'], self.workspace_id)
         if dirty:
-            _MUTATED_CONFIG_CACHE.clear()
-            _MUTATED_CONFIG_MTIME.clear()
+            from akasa.hooks import hooks
+            hooks.emit('config_mutated', workspace_id=self.workspace_id)
             self._sync_vfs_barrier()
-
-    def _sync_vfs_barrier(self):
+    def _sync_vfs_barrier(self, timeout=5.0):
         """Internal barrier to guarantee read-after-write consistency for settings."""
         from akasa.vfs import _VFS_WRITE_QUEUE, _VFS_SHUTDOWN_SIGNAL
-        import time
-        while _VFS_WRITE_QUEUE.unfinished_tasks > 0:
-            if _VFS_SHUTDOWN_SIGNAL.is_set():
-                break
-            time.sleep(0.1)
+        import threading
+
+        barrier_event = threading.Event()
+        _VFS_WRITE_QUEUE.put((self.workspace_id, "", "", {"action": "barrier", "barrier_event": barrier_event}))
+
+        settled = barrier_event.wait(timeout=timeout)
+
+        if _VFS_SHUTDOWN_SIGNAL.is_set():
+            raise RuntimeError("Transaction aborted mid-flight due to system shutdown or workspace context swap.")
+        if not settled:
+            raise TimeoutError(f"VFS Barrier Timeout: The async write queue failed to reach the sync watermark within {timeout} seconds.")
 
 class StoreManager:
     def __init__(self, workspace_id):
@@ -300,15 +332,13 @@ class StoreManager:
         data = load_json_config(filepath, {})
         return data.get(key, default)
     def set(self, filename, key, value):
-        from akasa.utils import load_json_config, save_json_config, get_tenant_control_dir, _MUTATED_CONFIG_CACHE, _MUTATED_CONFIG_MTIME
+        from akasa.utils import load_json_config, save_json_config, get_tenant_control_dir
         from pathlib import Path
         control_dir = get_tenant_control_dir(self.workspace_id)
         filepath = Path(control_dir).joinpath(filename).as_posix()
         data = load_json_config(filepath, {})
         data[key] = value
         save_json_config(filepath, data, self.workspace_id)
-        _MUTATED_CONFIG_CACHE.clear()
-        _MUTATED_CONFIG_MTIME.clear()
 class DatabaseWrapper:
     """Lightweight ORM/CRUD wrapper for centralized SQLite access."""
     def __init__(self, conn):

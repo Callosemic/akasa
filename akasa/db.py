@@ -94,17 +94,46 @@ def get_connection(db_name, workspace_id=None):
             _local.connections[oldest_key].close()
         except Exception: pass
         del _local.connections[oldest_key]
-
     os.makedirs(db_dir, exist_ok=True)
-    # Bypassing same_thread check is safe here because we guarantee thread-local storage
-    conn = sqlite3.connect(db_path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
 
-    # Enforce Concurrent Data Safety Laws
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA synchronous=NORMAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    conn.commit()
+    def _connect():
+        conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL;")
+        conn.execute("PRAGMA synchronous=NORMAL;")
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.commit()
+        cursor = conn.execute("PRAGMA quick_check(1);")
+        res = cursor.fetchone()
+        if res and res[0] != "ok":
+            raise sqlite3.DatabaseError(f"Database disk image is malformed: {res[0]}")
+        return conn
+
+    try:
+        conn = _connect()
+    except sqlite3.DatabaseError as e:
+        if "malformed" in str(e).lower() or "corrupt" in str(e).lower():
+            print(f"⚠️ [Akasa DB] Malformed database detected at '{db_path}'. Healing database...")
+            try:
+                sqlite3.connect(db_path).close()
+            except Exception:
+                pass
+            import time, shutil
+            corrupt_path = f"{db_path}.corrupt_{int(time.time())}"
+            try:
+                if os.path.exists(db_path):
+                    shutil.move(db_path, corrupt_path)
+                for ext in ["-wal", "-shm"]:
+                    if os.path.exists(db_path + ext):
+                        os.remove(db_path + ext)
+            except Exception as move_err:
+                print(f"⚠️ [Akasa DB] Failed to move corrupt db: {move_err}")
+
+            conn = _connect()
+            if db_name in _REGISTERED_SCHEMAS:
+                apply_declarative_schema(db_name, _REGISTERED_SCHEMAS[db_name], workspace_id)
+        else:
+            raise
 
     _local.connections[cache_key] = conn
     return conn

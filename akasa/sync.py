@@ -13,7 +13,6 @@ def get_system_deltas(workspace_id=None, since_ts=0.0):
     wid = workspace_id or sniff_tenant_id() or "default"
     now = time.time()
     conn = get_connection("workers", workspace_id=wid)
-    
     # 1. Physical Mutations
     cursor = conn.execute(
         "SELECT filepath, mutation_type as operation, timestamp FROM vfs_event_log WHERE timestamp > ? ORDER BY timestamp ASC",
@@ -21,41 +20,32 @@ def get_system_deltas(workspace_id=None, since_ts=0.0):
     )
     mutations = [dict(r) for r in cursor.fetchall()]
     # 2. Telemetry & Is Compiling State
+    # Guardrail: Ignore ghost jobs that haven't received a progress update in the last 5 minutes
+    cutoff_ts = now - 300.0
     active_job_rows = conn.execute(
-        "SELECT ext_name, callback_name, args_json FROM immediate_jobs WHERE status IN ('pending', 'processing')"
+        "SELECT ext_name, callback_name, args_json FROM immediate_jobs WHERE status IN ('pending', 'processing') AND job_category = 'ui_blocking' AND updated_at > ?",
+        (cutoff_ts,)
     ).fetchall()
 
     active_modules_set = set()
     pending_modules_set = set()
-    is_compiling_immediate = False
-    for r in active_job_rows:
-        cb = r['callback_name'] or ""
-        # Inversion of Control: Let the host application define which tasks block the UI
-        is_compiler = any(hooks.emit('evaluate_blocking_task', task_name=cb, workspace_id=wid))
+    is_compiling = False
 
-        if is_compiler:
-            is_compiling_immediate = True
-            if r['ext_name']:
-                active_modules_set.add(r['ext_name'])
-            try:
-                import json
-                args = json.loads(r['args_json'] or "{}")
-                for step in args.get('_chain', {}).get('steps', []):
-                    if step.get('ext_name'):
-                        pending_modules_set.add(step['ext_name'])
-            except Exception:
-                pass
+    for r in active_job_rows:
+        is_compiling = True
+        if r['ext_name']:
+            active_modules_set.add(r['ext_name'])
+        try:
+            import json
+            args = json.loads(r['args_json'] or "{}")
+            for step in args.get('_chain', {}).get('steps', []):
+                if step.get('ext_name'):
+                    pending_modules_set.add(step['ext_name'])
+        except Exception:
+            pass
 
     active_modules = list(active_modules_set)
     pending_modules = [m for m in pending_modules_set if m not in active_modules_set]
-    # IoC: Host application determines if any running metronome jobs should lock the UI
-    active_jobs = conn.execute("SELECT callback_name FROM jobs WHERE status = 'running'").fetchall()
-    is_compiling_delayed = any(
-        any(hooks.emit('evaluate_blocking_task', task_name=j['callback_name'], workspace_id=wid))
-        for j in active_jobs
-    )
-
-    is_compiling = is_compiling_immediate or is_compiling_delayed
 
     # 3. Collect Signatures via Event Bus
     signatures = {}

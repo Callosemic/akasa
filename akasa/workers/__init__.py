@@ -79,8 +79,7 @@ def cancel_job(job_id, workspace_id=None):
     conn = get_connection("workers", workspace_id=workspace_id)
     conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
     conn.commit()
-
-def submit_immediate_job(job_id, ext_name, callback_name, args_json="{}", workspace_id=None, coalesce=False):
+def submit_immediate_job(job_id, ext_name, callback_name, args_json="{}", workspace_id=None, coalesce=False, job_category="system_background"):
     """Drops a task directly into the active ThreadPoolExecutor and logs its lifecycle for UI polling."""
     if _shutdown_event.is_set():
         return False
@@ -94,10 +93,22 @@ def submit_immediate_job(job_id, ext_name, callback_name, args_json="{}", worksp
         ).fetchone()
         if existing:
             return existing['id']
+
+    # Seed the initial artifact with chain context so the UI knows its place in the pipeline
+    initial_artifact = {}
+    try:
+        parsed_args = json.loads(args_json)
+        if 'chain_history' in parsed_args:
+            initial_artifact['chain_history'] = parsed_args['chain_history']
+        if 'root_job_id' in parsed_args:
+            initial_artifact['root_job_id'] = parsed_args['root_job_id']
+    except Exception:
+        pass
+
     conn.execute("""
-        INSERT OR REPLACE INTO immediate_jobs (id, ext_name, callback_name, status, status_message, artifact_json, created_at, updated_at, args_json)
-        VALUES (?, ?, ?, 'processing', 'Initializing...', '{}', ?, ?, ?)
-    """, (job_id, ext_name, callback_name, now, now, args_json))
+        INSERT OR REPLACE INTO immediate_jobs (id, ext_name, callback_name, status, status_message, artifact_json, created_at, updated_at, args_json, job_category)
+        VALUES (?, ?, ?, 'processing', 'Initializing...', ?, ?, ?, ?, ?)
+    """, (job_id, ext_name, callback_name, json.dumps(initial_artifact), now, now, args_json, job_category))
     conn.commit()
     if not _shutdown_event.is_set():
         try:
@@ -134,7 +145,43 @@ def update_immediate_job_status(job_id, status, message=None, artifact=None, wor
     params.append(job_id)
     query = f"UPDATE immediate_jobs SET {', '.join(updates)} WHERE id=?"
     conn.execute(query, tuple(params))
+    try:
+        job_row = conn.execute("SELECT ext_name, artifact_json, job_category FROM immediate_jobs WHERE id=?", (job_id,)).fetchone()
+        ext_name = job_row['ext_name'] if job_row else ''
+        job_category = job_row['job_category'] if job_row and 'job_category' in job_row.keys() else 'system_background'
+
+        # Hydrate missing artifact payloads from the DB so SSE broadcasts retain chain_history
+        if artifact is None and job_row and job_row['artifact_json']:
+            try:
+                artifact = json.loads(job_row['artifact_json'])
+            except Exception:
+                artifact = {}
+    except Exception:
+        ext_name = ''
+        job_category = 'system_background'
+
     conn.commit()
+
+    try:
+        from akasa.events import sse_bus
+        from akasa.sync import get_system_deltas
+
+        # Calculate SSOT system state to keep UI dumb
+        deltas = get_system_deltas(workspace_id=workspace_id)
+
+        sse_bus.emit_sse('job_progress', {
+            "id": job_id,
+            "ext_name": ext_name,
+            "job_category": job_category,
+            "status": status,
+            "message": message,
+            "artifact": artifact or {},
+            "workspace_id": workspace_id,
+            "active_modules": deltas.get("active_modules", []),
+            "pending_modules": deltas.get("pending_modules", [])
+        })
+    except Exception:
+        pass
 
 def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws):
     """Executes an immediate job and manages its lifecycle in the ledger."""
@@ -206,12 +253,19 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
         next_kwargs['_chain'] = next_chain
         next_kwargs['root_job_id'] = root_job_id
         next_kwargs['chain_history'] = history
-
         next_args_json = json.dumps(next_kwargs)
         import uuid
         prefix = next_step['ext_name'][:3].lower()
         next_job_id = f"{prefix}_{uuid.uuid4().hex[:8]}"
-        submit_immediate_job(next_job_id, next_step['ext_name'], next_step['worker_name'], next_args_json, workspace_id=target_ws)
+
+        # Inherit job category from parent
+        try:
+            curr_row = get_connection("workers", workspace_id=target_ws).execute("SELECT job_category FROM immediate_jobs WHERE id=?", (job_id,)).fetchone()
+            job_cat = curr_row['job_category'] if curr_row and 'job_category' in curr_row.keys() else 'system_background'
+        except Exception:
+            job_cat = 'system_background'
+
+        submit_immediate_job(next_job_id, next_step['ext_name'], next_step['worker_name'], next_args_json, workspace_id=target_ws, job_category=job_cat)
 
         from akasa.hooks import hooks
         hooks.emit_background('job_baton_passed', workspace_id=target_ws, root_job_id=root_job_id, previous_job_id=job_id, next_job_id=next_job_id, ext_name=next_step['ext_name'])
@@ -388,9 +442,15 @@ def _init_worker_schema(workspace_id="default"):
                         meta_json TEXT,
                         created_at REAL,
                         updated_at REAL,
-                        args_json TEXT
+                        args_json TEXT,
+                        job_category TEXT DEFAULT 'system_background'
                 )
         """)
+        try:
+                conn.execute("ALTER TABLE immediate_jobs ADD COLUMN job_category TEXT DEFAULT 'system_background'")
+                conn.commit()
+        except Exception:
+                pass
         try:
                 conn.execute("ALTER TABLE jobs ADD COLUMN jitter_ms INTEGER DEFAULT 0")
                 conn.execute("ALTER TABLE immediate_jobs ADD COLUMN meta_json TEXT")
@@ -412,10 +472,9 @@ def _init_worker_schema(workspace_id="default"):
         """)
         conn.commit()
         _INITIALIZED_WORKSPACES.add(workspace_id)
-_observer = None
 @hooks.on('system_boot', priority=10)
 def start_workers(**kwargs):
-        global _executor, _metronome_thread, _observer
+        global _executor, _metronome_thread
         _executor = ThreadPoolExecutor(max_workers=20)
         from akasa.utils import _cwd, load_json_config
         import os
@@ -440,19 +499,12 @@ def start_workers(**kwargs):
         _metronome_thread = threading.Thread(target=_metronome_loop, daemon=True)
         _metronome_thread.start()
         print("⚙️  Stateless Worker Metronome Online.")
-        results = hooks.emit('start_filesystem_observer', workspace_ids=workspace_ids)
-        _observer = next((r for r in results if r is not None), None)
 
 @hooks.on('system_shutdown')
 def stop_workers(**kwargs):
-    global _executor, _observer
+    global _executor
     print("🛑 Suspending Worker Metronome...")
     _shutdown_event.set()
-    if _observer:
-        try:
-            _observer.stop()
-            _observer.join(timeout=2.0)
-        except Exception: pass
     if _executor:
         _executor.shutdown(wait=False)
 

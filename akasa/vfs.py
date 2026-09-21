@@ -79,6 +79,9 @@ def _vfs_commit_worker():
                 elif action == "delete":
                     resolved_path = _resolve_physical_path(filepath, workspace_id, data.get("is_absolute_artifact"))
 
+                    try: hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=filepath, resolved_path=resolved_path, content="", data=data)
+                    except Exception: pass
+
                     if resolved_path and os.path.exists(resolved_path):
                         if os.path.isdir(resolved_path):
                             import shutil
@@ -100,6 +103,11 @@ def _vfs_commit_worker():
                     dest_path = data.get("dest_path")
                     resolved_src = _resolve_physical_path(filepath, workspace_id, data.get("is_absolute_artifact"))
                     resolved_dest = _resolve_physical_path(dest_path, workspace_id, data.get("is_absolute_artifact"))
+
+                    try: 
+                        hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=filepath, resolved_path=resolved_src, content="", data=data)
+                        hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=dest_path, resolved_path=resolved_dest, content="", data=data)
+                    except Exception: pass
 
                     if resolved_src and resolved_dest and os.path.exists(resolved_src):
                         os.makedirs(Path(resolved_dest).parent, exist_ok=True)

@@ -20,12 +20,27 @@ class HookPayload_RegisterManifestSignatures(TypedDict, total=False):
     workspace_id: Optional[str]
     since_ts: Optional[float]
 _event_thread_local = threading.local()
+
 class HookRegistry:
     """The central Event Bus for the Akasa Micro-Kernel."""
-
     def __init__(self):
         self._hooks = {}
         self._lock = threading.Lock()
+        self._workspace_router = None
+        self._trusted_namespaces = set()
+        self._extension_namespaces = set()
+
+    def register_trusted_namespace(self, namespace):
+        """DI Interface: Host OS registers its Tier 2 core namespace for event bypass privileges."""
+        self._trusted_namespaces.add(namespace)
+
+    def register_extension_namespace(self, namespace):
+        """DI Interface: Host OS registers its Tier 3 extension namespace."""
+        self._extension_namespaces.add(namespace)
+
+    def set_workspace_router(self, router_func):
+        """Dependency Injection: Allows the host OS to define spatial routing."""
+        self._workspace_router = router_func
     def on(self, event_name, priority=50):
         """Decorator for extensions to subscribe to OS lifecycle events."""
         def decorator(func):
@@ -57,6 +72,10 @@ class HookRegistry:
 
         # Core system modules (Akasa kernel or explicitly flagged core modules) are always authorized
         if mod.startswith('akasa.') or getattr(cb, 'is_core', False):
+            return True
+
+        # DI: Trusted host OS namespaces bypass tenant authorization (Tier 2 isolation)
+        if any(mod.startswith(ns) for ns in self._trusted_namespaces):
             return True
 
         # Inversion of Control: Determine if the module belongs to an enabled extension
@@ -92,6 +111,11 @@ class HookRegistry:
     def emit(self, event_name, *args, **kwargs):
         """Core OS trigger to broadcast payloads to all subscribed extensions."""
         import time
+        from akasa.events import sse_bus
+        # Auto-forward high-priority UI signals to the SSE stream
+        if event_name in ('topology_resolved',):
+            safe_payload = {k: v for k, v in kwargs.items() if isinstance(v, (str, int, float, bool, list, dict))}
+            sse_bus.emit_sse(event_name, safe_payload)
 
         # Re-entrancy Guard: Prevent infinite recursion loops on the same thread
         if not hasattr(_event_thread_local, 'active_events'):
@@ -105,14 +129,12 @@ class HookRegistry:
             workspace_ids = set()
             if kwargs.get('workspace_id'):
                 workspace_ids.add(kwargs['workspace_id'])
-
-            if event_name == 'vfs_mutated':
-                mutations = kwargs.get('mutations', [])
-                if mutations and 'filepath' in mutations[0]:
-                    mapped_res = self.emit('resolve_owning_workspaces', filepath=mutations[0]['filepath'])
-                    for res in mapped_res:
-                        if isinstance(res, (set, list)):
-                            workspace_ids.update(res)
+            if event_name == 'vfs_mutated' and self._workspace_router:
+                for m in kwargs.get('mutations', []):
+                    if 'filepath' in m:
+                        mapped_res = self._workspace_router(m['filepath'])
+                        if mapped_res:
+                            workspace_ids.update(mapped_res)
 
             if not workspace_ids:
                 from flask import has_request_context
@@ -147,15 +169,13 @@ class HookRegistry:
         workspace_ids = set()
         if kwargs.get('workspace_id'):
             workspace_ids.add(kwargs['workspace_id'])
-
-        if event_name == 'vfs_mutated':
-            mutations = kwargs.get('mutations', [])
-            if mutations and 'filepath' in mutations[0]:
-                # IoC: Ask Tier 2 Topology to spatially map the file
-                mapped_res = self.emit('resolve_owning_workspaces', filepath=mutations[0]['filepath'])
-                for res in mapped_res:
-                    if isinstance(res, (set, list)):
-                        workspace_ids.update(res)
+        if event_name == 'vfs_mutated' and self._workspace_router:
+            for m in kwargs.get('mutations', []):
+                if 'filepath' in m:
+                    # DI: Ask the registered router to spatially map the file
+                    mapped_res = self._workspace_router(m['filepath'])
+                    if mapped_res:
+                        workspace_ids.update(mapped_res)
 
         if not workspace_ids:
             from flask import has_request_context

@@ -66,19 +66,14 @@ def get_workspace_physics(workspace_id=None):
         return resolved_cfg, Path(resolved_cfg).parent.parent.as_posix()
 
     return resolved_cfg, _cwd
-CORE_MODULES = set()
-def _discover_core_modules():
-    """JIT Hook evaluation to retrieve host-provided core modules."""
-    from akasa.hooks import hooks
-    modules = set()
-    for res in hooks.emit('register_core_modules'):
-        if res: modules.update(res)
-    return modules
+_CORE_MODULES = set()
+
+def register_core_module(ext_name):
+    """DI Interface: Host OS declares its foundational modules."""
+    _CORE_MODULES.add(ext_name)
 
 def is_core_module(ext_name):
-    if not CORE_MODULES:
-        CORE_MODULES.update(_discover_core_modules())
-    return ext_name in CORE_MODULES
+    return ext_name in _CORE_MODULES
 
 def is_extension_enabled(ext_name, workspace_id=None):
     if is_core_module(ext_name):
@@ -96,6 +91,72 @@ def extension_auth(ext_name):
                 return jsonify({"error": f"403 Forbidden: Extension '{ext_name}' is not enabled in this workspace."}), 403
             return f(*args, **kwargs)
         return decorated_function
+    return decorator
+import threading
+import time
+from functools import wraps
+def thread_safe_cache(ttl=2.0, key_maker=lambda *args, **kwargs: "global"):
+    """
+    A non-blocking, single-flight TTL cache with invalidation race protection.
+    Prevents lock contention during invalidation and eliminates DB cache stampedes.
+    """
+    def decorator(func):
+        cache = {}
+        compilation_locks = {}
+        invalidated_at = {}
+        state_lock = threading.Lock()
+
+        def _get_key_lock(key):
+            with state_lock:
+                if key not in compilation_locks:
+                    compilation_locks[key] = threading.Lock()
+                return compilation_locks[key]
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            key = key_maker(*args, **kwargs)
+            now = time.time()
+
+            # 1. Fast Lock-Free Read
+            with state_lock:
+                if key in cache and (not ttl or now - cache[key]['ts'] < ttl):
+                    return json.loads(cache[key]['json_data'])
+
+            # 2. Single-Flight Execution Barrier
+            key_lock = _get_key_lock(key)
+            with key_lock:
+                # Re-check cache in case another thread computed it while waiting
+                with state_lock:
+                    if key in cache and (not ttl or now - cache[key]['ts'] < ttl):
+                        return json.loads(cache[key]['json_data'])
+
+                calc_start = time.time()
+                result = func(*args, **kwargs)
+                json_data = json.dumps(result)
+
+                with state_lock:
+                    # Discard result if an invalidation occurred during calculation
+                    if invalidated_at.get(key, 0) < calc_start:
+                        cache[key] = {'ts': time.time(), 'json_data': json_data}
+                    return json.loads(json_data)
+
+        def invalidate(*args, **kwargs):
+            key = key_maker(*args, **kwargs)
+            with state_lock:
+                invalidated_at[key] = time.time()
+                if key in cache:
+                    del cache[key]
+
+        def clear_all():
+            with state_lock:
+                now = time.time()
+                for k in list(cache.keys()):
+                    invalidated_at[k] = now
+                cache.clear()
+
+        wrapper.invalidate = invalidate
+        wrapper.clear_all = clear_all
+        return wrapper
     return decorator
 
 _JSON_CACHE = {}
@@ -129,21 +190,29 @@ def save_json_config(filepath, data, workspace_id=None):
 
     _JSON_CACHE[filepath] = data
     _JSON_MTIME[filepath] = time.time()
+_is_invalidator_bound = False
 
-_MUTATED_CONFIG_CACHE = {}
-_MUTATED_CONFIG_MTIME = {}
+@thread_safe_cache(ttl=2.0, key_maker=lambda workspace_id=None, **kwargs: str(workspace_id))
 def load_config(workspace_id=None):
-    cfg_path, _ = get_workspace_physics(workspace_id)
-    current_mtime = os.path.getmtime(cfg_path) if os.path.exists(cfg_path) else 0
-    if cfg_path not in _MUTATED_CONFIG_CACHE or current_mtime > _MUTATED_CONFIG_MTIME.get(cfg_path, 0):
-        import copy
-        cfg = copy.deepcopy(load_json_config(cfg_path, {}))
-        from akasa.hooks import hooks
-        hooks.emit('mutate_workspace_config', cfg, workspace_id=workspace_id)
-        _MUTATED_CONFIG_CACHE[cfg_path] = cfg
-        _MUTATED_CONFIG_MTIME[cfg_path] = current_mtime
+    global _is_invalidator_bound
+    from akasa.hooks import hooks
 
-    return _MUTATED_CONFIG_CACHE[cfg_path]
+    # Decoupled Invalidation: Bind the cache invalidator on first execution to prevent circular imports
+    if not _is_invalidator_bound:
+        @hooks.on('config_mutated')
+        def _invalidate_config(workspace_id=None, **kwargs):
+            if workspace_id:
+                load_config.invalidate(workspace_id=workspace_id)
+            else:
+                load_config.clear_all()
+        _is_invalidator_bound = True
+
+    cfg_path, _ = get_workspace_physics(workspace_id)
+    cfg = load_json_config(cfg_path, {})
+
+    hooks.emit('mutate_workspace_config', cfg, workspace_id=workspace_id)
+
+    return cfg
 def get_all_workspace_ids():
     control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
     index_path = Path(_cwd).joinpath(control_dir_name, "system.json").as_posix()
@@ -179,6 +248,52 @@ def parse_uri(path_str):
     if fallback_uri.volume and fallback_uri.path:
         return fallback_uri.volume, fallback_uri.path
     return "", uri.path
+def fold_vfs_events(events):
+    """
+    Mathematical state machine for VFS event stream folding.
+    Reduces a chronological list of high-velocity VFS events down to their net-effective state.
+    """
+    folded = {}
+
+    for ev in events:
+        # Support both dictionaries and future BaseJobPayload dataclasses
+        fp = ev.get('filepath') if isinstance(ev, dict) else getattr(ev, 'filepath', None)
+        op = ev.get('mutation_type', ev.get('operation', 'save')) if isinstance(ev, dict) else getattr(ev, 'event_type', 'save')
+
+        if not fp:
+            continue
+
+        op = op.lower()
+        is_dir = fp.endswith('/')
+
+        if op in ('delete', 'deleted', 'remove', 'removed'):
+            # Hierarchical Pruning: Annihilate any preceding events for children of this directory
+            dir_prefix = fp if is_dir else f"{fp}/"
+            keys_to_remove = [k for k in folded.keys() if k.startswith(dir_prefix)]
+            for k in keys_to_remove:
+                del folded[k]
+
+            # Annihilation: If the file was explicitly CREATED in this window, and now deleted, it never existed.
+            # If it was just MODIFIED, the net effect is still a DELETION.
+            if fp in folded:
+                first_op = folded[fp].get('original_op', '')
+                if first_op in ('added', 'create', 'created'):
+                    del folded[fp]
+                    continue
+
+            # Otherwise, record the net deletion
+            folded[fp] = {'op': 'delete', 'event': ev, 'original_op': 'delete'}
+
+        elif op in ('save', 'modified', 'added', 'create', 'created'):
+            # Coalescence: Overwrite previous events. Preserve the original operation type if it was a creation.
+            original_op = op
+            if fp in folded and folded[fp]['op'] not in ('delete', 'deleted'):
+                original_op = folded[fp].get('original_op', op)
+
+            folded[fp] = {'op': 'save', 'event': ev, 'original_op': original_op}
+
+    # Extract the surviving net-effective events
+    return [state['event'] for state in folded.values()]
 
 def slugify(text):
     if not text:
@@ -201,9 +316,9 @@ def resolve_sandbox_path(filepath, workspace_id=None):
     _, workspace_root = get_workspace_physics(workspace_id)
     ws_root_path = Path(workspace_root).resolve()
 
+    filepath_str = str(filepath)
     from akasa.uri import AkasaURI
-    # The URI primitive natively strips schemes and squashes traversals mathematically
-    uri = AkasaURI(str(filepath))
+    uri = AkasaURI(filepath_str)
     norm_path = uri.path
 
     if Path(norm_path).is_absolute():
@@ -214,6 +329,7 @@ def resolve_sandbox_path(filepath, workspace_id=None):
             norm_path = resolved_abs.relative_to(ws_root_path).as_posix()
         except ValueError:
             norm_path = resolved_abs.name
+
     resolved = ws_root_path.joinpath(norm_path).resolve()
     return resolved.as_posix()
 def resolve_system_artifact_path(filepath, workspace_id):
