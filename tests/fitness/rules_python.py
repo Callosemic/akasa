@@ -55,6 +55,14 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                         node.lineno,
                         f"Domain-specific token '{node.value}' detected in Tier 1 kernel."
                     )
+
+            if self.filename != "utils.py" and ("_mutated_config_cache" in val or "_mutated_config_mtime" in val):
+                report_violation(
+                    "DEPRECATED_CACHE_MUTATION",
+                    self.filepath,
+                    node.lineno,
+                    "Direct config cache dictionary mutation is deprecated. Emit 'config_mutated' event instead."
+                )
         self.generic_visit(node)
 
     def visit_Assign(self, node):

@@ -11,9 +11,10 @@ akasa/
 │   ├── auth/                       # Authentication blueprint, token exchange, and Fernet encryption
 │   │   └── __init__.py             # Background task scheduler, step chaining, and job executor
 │   ├── db.py                       # Thread-local SQLite connection pool and WAL schema migrations
+│   ├── events.py                   # Thread-safe SSE event bus and client queue manager
 │   ├── extension.py                # Extension SDK context wrappers, SettingsManager, and JobManager
 │   ├── hooks.py                    # Priority event bus (HookRegistry) and authorization engine
-│   ├── process.py                  # [comment required]
+│   ├── process.py                  # Volume-sandboxed process manager and execution wrapper
 │   ├── py.typed                    # PEP 561 marker for static typing compliance
 │   ├── sync.py                     # Kernel state heartbeat and system delta calculator
 │   ├── types.py                    # Tier 1 type definitions, protocols, and event contracts
@@ -22,11 +23,12 @@ akasa/
 │   ├── vfs.py                      # Virtual File System, volume router, and async write queue
 │   └── workers/                    # Metronome worker engine and job ledger
 │       └── __init__.py             # Background task scheduler, step chaining, and job executor
-├── docs/                           # [comment required]
-│   ├── 00_index.md                 # [comment required]
-│   ├── 01_engineering_standards.md # [comment required]
-│   └── adrs/                       # [comment required]
-│       └── 0001_domain_agnostic_ioc_and_process_sandboxing.md # [comment required]
+├── docs/                           # Architectural documentation and standards
+│   ├── 00_index.md                 # Master documentation index
+│   ├── 01_engineering_standards.md # Core engineering standards and audit guardrails
+│   └── adrs/                       # Architectural Decision Records (ADRs)
+│       ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001 specification
+│       └── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # [comment required]
 ├── pyproject.toml                  # Build system specification and dependencies
 └── tests/                          # [comment required]
     ├── fitness/                    # [comment required]
