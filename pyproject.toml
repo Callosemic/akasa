@@ -19,11 +19,12 @@ include = ["akasa", "akasa.*"]
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
 [tool.semantic_release]
+build_command = ""
 version_toml = [
     "pyproject.toml:project.version"
 ]
 commit_parser = "conventional"
-vcs_release = false
+vcs_release = true
 prerelease_token = "rc"
 allow_zero_version = true
 major_on_zero = false
