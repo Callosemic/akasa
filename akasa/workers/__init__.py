@@ -500,6 +500,13 @@ def _metronome_loop():
                 except Exception as e:
                     import traceback
                     try:
+                        if "malformed" in str(e).lower() or "corrupt" in str(e).lower():
+                            from akasa.db import _local
+                            cache_key = (ws_id, "workers")
+                            if hasattr(_local, 'connections') and cache_key in _local.connections:
+                                try: _local.connections[cache_key].close()
+                                except Exception: pass
+                                del _local.connections[cache_key]
                         from akasa.hooks import hooks
                         hooks.emit_background('system_error', source="Metronome:InnerLoop", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=json.dumps({"workspace": ws_id}), workspace_id=ws_id)
                     except Exception: pass
