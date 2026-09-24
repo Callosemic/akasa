@@ -1,5 +1,5 @@
 import functools
-from typing import TYPE_CHECKING, Optional, Dict, Any
+from typing import TYPE_CHECKING, Optional, Dict, Any, TypedDict
 from flask import Blueprint, request, jsonify
 
 if TYPE_CHECKING:
@@ -8,6 +8,13 @@ import os
 from akasa.db import get_connection, register_schema
 from akasa.utils import extension_auth, load_config
 from akasa.vfs import VFSTransaction
+
+class SettingsUpdateResponse(TypedDict, total=False):
+    status: str
+    requires_refresh: bool
+    job_id: str
+    error: str
+
 class JobManager:
     def __init__(self, ext_name, workspace_id, job_id=None):
         self.ext_name = ext_name
@@ -451,9 +458,8 @@ class ExtensionContext:
         chunks = hooks.emit('request_manifest_chunks', target_key=target_key, workspace_id=self.workspace_id)
         return next((c for c in chunks if c), [])
     def parse_uri(self, path_str):
-        from akasa.uri import AkasaURI
-        uri = AkasaURI(path_str)
-        return uri.volume, uri.path
+        from akasa.utils import parse_uri
+        return parse_uri(path_str)
 
     def expand_selection(self, items):
         """
@@ -511,15 +517,16 @@ class AkasaExtension:
 
         if self.settings_schema:
             _REGISTERED_SETTINGS_SCHEMAS[self.name] = self.settings_schema
-
         if self.schema:
             register_schema(self.name, self.schema)
+
         # Universal REST endpoints for extension settings management
-        @self.route('settings', methods=['GET'])
+        @self.route('settings', methods=['GET'], docstring="[sync] Retrieves the current settings for this extension.")
         def get_settings(ctx):
             repo = ctx.req.args.get('repo')
             return jsonify(ctx.settings.get_all(repo=repo))
-        @self.route('settings', methods=['POST'])
+
+        @self.route('settings', methods=['POST'], response_schema=SettingsUpdateResponse, docstring="[sync] Updates the settings for this extension.")
         def update_settings(ctx):
             try:
                 repo = ctx.req.args.get('repo') or (ctx.req.json.get('_repo') if ctx.req.json else None)
@@ -539,12 +546,12 @@ class AkasaExtension:
                         job_id = res["job_id"]
                     if res.get("requires_refresh"):
                         requires_refresh = True
-
             payload = {"status": "success", "requires_refresh": requires_refresh}
             if job_id:
                 payload["job_id"] = job_id
             return jsonify(payload)
-        @self.route('settings/schema', methods=['GET'])
+
+        @self.route('settings/schema', methods=['GET'], docstring="[sync] Retrieves the declarative settings schema for this extension.")
         def get_settings_schema(ctx):
             return jsonify(self.settings_schema)
 
@@ -565,7 +572,6 @@ class AkasaExtension:
             # to dynamically inject job_id and workspace_id based on the wrapper's exact kwargs.
             def wrapper(job_id=None, workspace_id=None, **kwargs):
                 ctx = ExtensionContext(self.name, workspace_id, settings_schema=self.settings_schema, job_id=job_id)
-                update_immediate_job_status(job_id, 'processing', "Initializing task...", workspace_id=workspace_id)
 
                 # Execute the domain logic
                 if 'job_id' in inspect.signature(f).parameters:
@@ -575,8 +581,7 @@ class AkasaExtension:
             register_callback(self.name, task_name, wrapper)
             return wrapper
         return decorator
-
-    def route(self, rule, **options):
+    def route(self, rule, request_schema=None, response_schema=None, **options):
         # SDK Guardrail: Ban empty routes to prevent 308 Mixed Content redirect traps behind reverse proxies
         if rule in ['', '/']:
             raise ValueError(f"SDK Exception in '{self.name}': Empty root routes ('' or '/') are banned. Please use an explicit endpoint name like 'list' or 'index'.")
@@ -584,6 +589,26 @@ class AkasaExtension:
         # Auto-Routing: Enforce strict stateless multi-tenant boundaries natively
         clean_rule = rule.lstrip('/')
         full_rule = f'/api/<workspace_id>/{self.name}/{clean_rule}'
+        # OS Reflection: Register structural contracts for automated OpenAPI generation
+        # Attach directly to the underlying Flask Blueprint instance for Flask reflection
+        if not hasattr(self.bp, 'route_schemas'):
+            self.bp.route_schemas = {}
+            
+        if full_rule not in self.bp.route_schemas:
+            self.bp.route_schemas[full_rule] = {}
+            
+        docstring = options.pop('docstring', None)
+        for method in options.get('methods', ['GET']):
+            m_upper = method.upper()
+            req_sch = request_schema.get(m_upper) if isinstance(request_schema, dict) else request_schema
+            res_sch = response_schema.get(m_upper) if isinstance(response_schema, dict) else response_schema
+            
+            self.bp.route_schemas[full_rule][m_upper] = {
+                "request_schema": req_sch,
+                "response_schema": res_sch,
+                "docstring": docstring
+            }
+
         def decorator(f):
             @functools.wraps(f)
             def wrapper(workspace_id, *args, **kwargs):

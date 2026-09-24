@@ -1,4 +1,5 @@
 import time
+import json
 from akasa.db import get_connection
 from akasa.hooks import hooks
 from akasa.utils import sniff_tenant_id
@@ -29,15 +30,18 @@ def get_system_deltas(workspace_id=None, since_ts=0.0):
 
     active_modules_set = set()
     pending_modules_set = set()
-    is_compiling = False
-
+    is_pipeline_active = False
     for r in active_job_rows:
-        is_compiling = True
-        if r['ext_name']:
-            active_modules_set.add(r['ext_name'])
+        ext_name = r['ext_name']
+        if ext_name:
+            active_modules_set.add(ext_name)
         try:
-            import json
             args = json.loads(r['args_json'] or "{}")
+
+            # Pure Agnostic Kernel: Only evaluate structural DAG chains or explicit generic tags
+            if '_chain' in args or 'chain_history' in args or args.get('is_pipeline'):
+                is_pipeline_active = True
+
             for step in args.get('_chain', {}).get('steps', []):
                 if step.get('ext_name'):
                     pending_modules_set.add(step['ext_name'])
@@ -60,7 +64,7 @@ def get_system_deltas(workspace_id=None, since_ts=0.0):
     return {
         "timestamp": now,
         "backend_boot_ts": KERNEL_BOOT_TS,
-        "is_compiling": is_compiling,
+        "is_pipeline_active": is_pipeline_active,
         "active_modules": active_modules,
         "pending_modules": pending_modules,
         "mutations": mutations,

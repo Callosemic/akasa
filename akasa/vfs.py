@@ -5,7 +5,6 @@ from pathlib import Path
 from akasa.hooks import hooks
 class DefaultVFSDriver:
     def resolve(self, uri_obj, workspace_id, physical_target):
-        from pathlib import Path
         target = Path(physical_target).resolve()
         if uri_obj.path:
             resolved = target.joinpath(uri_obj.path).resolve()
@@ -24,13 +23,11 @@ def mount_volume(workspace_id, scheme, volume, physical_target):
     if not volume:
         volume = ""
     _MOUNT_TABLE[(workspace_id, scheme, volume)] = physical_target
-
 def _resolve_physical_path(filepath, workspace_id, is_absolute_artifact=False):
     """Centralized SSOT for VFS path resolution via the Volume Router."""
     if not filepath: return None
     from akasa.utils import resolve_system_artifact_path, parse_uri
     from akasa.uri import AkasaURI
-    from pathlib import Path
 
     if is_absolute_artifact and Path(filepath).is_absolute():
         return resolve_system_artifact_path(filepath, workspace_id)
@@ -137,7 +134,12 @@ def _vfs_commit_worker():
                 else:
                     execute_vfs_save_physical(workspace_id, filepath, content, data)
             except Exception as e:
+                import traceback
                 print(f"❌ [VFS Pipeline] Background operation failed for {filepath}: {e}")
+                try:
+                    import json
+                    hooks.emit_background('system_error', source="VFS Pipeline", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=json.dumps(data) if isinstance(data, dict) else json.dumps({"data": str(data)}), workspace_id=workspace_id)
+                except Exception: pass
             finally:
                 _VFS_WRITE_QUEUE.task_done()
         except queue.Empty:
@@ -180,17 +182,18 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data):
         pass
 
     is_new = not os.path.exists(resolved_path)
-
     # Idempotency Gatekeeper: Kill phantom writes by dropping identical payloads
     if not is_new and not data.get("delete_source"):
         try:
             with open(resolved_path, 'r', encoding='utf-8') as f:
                 if f.read() == content:
-                    print(f"💽 [VFS TELEMETRY] Silent drop (idempotent): {filepath}")
+                    if os.environ.get("INSETU_DEBUG") == "1":
+                        print(f"💽 [VFS TELEMETRY] Silent drop (idempotent): {filepath}")
                     return  # Silently drop the transaction before touching disk or the event ledger
         except Exception:
             pass
-    print(f"💽 [VFS TELEMETRY] Writing to disk: {filepath}")
+    if os.environ.get("INSETU_DEBUG") == "1":
+        print(f"💽 [VFS TELEMETRY] Writing to disk: {filepath}")
 
     target_dir = Path(resolved_path).parent.as_posix()
     if target_dir:
@@ -227,7 +230,8 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data):
                     (delete_source, 'deleted', time.time())
                 )
                 db_conn.commit()
-    print(f"💽 [VFS TELEMETRY] Emitting vfs_mutated for {filepath} (ignore_ledger={ignore_ledger})")
+    if os.environ.get("INSETU_DEBUG") == "1":
+        print(f"💽 [VFS TELEMETRY] Emitting vfs_mutated for {filepath} (ignore_ledger={ignore_ledger})")
     hooks.emit('vfs_mutated', workspace_id=workspace_id, mutations=[{"filepath": filepath, "operation": "save", "ignore_ledger": ignore_ledger}])
 class VFSTransaction:
     """Provides atomic-style batching and async queue dispatch for file mutations."""
@@ -289,7 +293,6 @@ class VFSTransaction:
             return
         for root, dirs, files in os.walk(resolved_dir):
             # Inversion of Control: Host application defines standard noise to ignore
-            from akasa.hooks import hooks
             ignored_dirs = next((res for res in hooks.emit('request_vfs_ignore_dirs', workspace_id=self.workspace_id) if res), [])
             dirs[:] = [d for d in dirs if d not in ignored_dirs]
             for file in files:

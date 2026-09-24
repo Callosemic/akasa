@@ -116,19 +116,26 @@ def thread_safe_cache(ttl=2.0, key_maker=lambda *args, **kwargs: "global"):
         def wrapper(*args, **kwargs):
             key = key_maker(*args, **kwargs)
             now = time.time()
-
             # 1. Fast Lock-Free Read
+            cached_json = None
             with state_lock:
                 if key in cache and (not ttl or now - cache[key]['ts'] < ttl):
-                    return json.loads(cache[key]['json_data'])
+                    cached_json = cache[key]['json_data']
+
+            if cached_json is not None:
+                return json.loads(cached_json)
 
             # 2. Single-Flight Execution Barrier
             key_lock = _get_key_lock(key)
             with key_lock:
                 # Re-check cache in case another thread computed it while waiting
+                cached_json = None
                 with state_lock:
                     if key in cache and (not ttl or now - cache[key]['ts'] < ttl):
-                        return json.loads(cache[key]['json_data'])
+                        cached_json = cache[key]['json_data']
+
+                if cached_json is not None:
+                    return json.loads(cached_json)
 
                 calc_start = time.time()
                 result = func(*args, **kwargs)
@@ -181,7 +188,6 @@ def load_json_config(filepath, default_fallback=None):
     return _JSON_CACHE[filepath]
 def save_json_config(filepath, data, workspace_id=None):
     global _JSON_CACHE, _JSON_MTIME
-    import json
     import time
     from akasa.vfs import execute_vfs_save
 
@@ -227,6 +233,64 @@ def get_all_workspace_ids():
         except Exception:
             pass
     return workspace_ids
+def typeddict_to_openapi(td_class):
+    """Transforms a Python TypedDict into an OpenAPI 3.0 JSON Schema object natively."""
+    import typing
+    if not hasattr(td_class, "__annotations__"):
+        return {"type": "object"}
+
+    properties = {}
+    required = []
+
+    # Support Python 3.9+ runtime required keys extraction
+    req_keys = getattr(td_class, '__required_keys__', td_class.__annotations__.keys())
+
+    for key, typ in td_class.__annotations__.items():
+        if key in req_keys:
+            required.append(key)
+
+        origin = typing.get_origin(typ)
+        args = typing.get_args(typ)
+
+        # Handle Optional[X] / Union[X, None]
+        if origin is typing.Union and type(None) in args:
+            typ = next(a for a in args if a is not type(None))
+            origin = typing.get_origin(typ)
+            args = typing.get_args(typ)
+        # Native type mapping
+        if origin is typing.Literal:
+            properties[key] = {"type": "string", "enum": list(args)}
+        elif origin is list or origin is typing.List or typ is list:
+            item_type = {"type": "string"} # Default fallback
+            if args:
+                if hasattr(args[0], '__annotations__'):
+                    item_type = typeddict_to_openapi(args[0])
+                else:
+                    item_str = str(args[0]).lower()
+                    if 'int' in item_str: item_type = {"type": "integer"}
+                    elif 'float' in item_str: item_type = {"type": "number"}
+                    elif 'bool' in item_str: item_type = {"type": "boolean"}
+                    elif 'dict' in item_str or 'object' in item_str: item_type = {"type": "object", "additionalProperties": True}
+            properties[key] = {"type": "array", "items": item_type}
+        elif origin is dict or origin is typing.Dict or typ is dict:
+            properties[key] = {"type": "object", "additionalProperties": True}
+        elif hasattr(typ, '__annotations__'):
+            properties[key] = typeddict_to_openapi(typ)
+        else:
+            type_str = str(typ).lower()
+            if 'str' in type_str: properties[key] = {"type": "string"}
+            elif 'int' in type_str: properties[key] = {"type": "integer"}
+            elif 'float' in type_str: properties[key] = {"type": "number"}
+            elif 'bool' in type_str: properties[key] = {"type": "boolean"}
+            elif 'bytes' in type_str or 'file' in type_str: properties[key] = {"type": "string", "format": "binary"}
+            else: properties[key] = {"type": "object"}
+
+    schema = {"type": "object", "properties": properties}
+    if required:
+        schema["required"] = list(required)
+
+    return schema
+
 def generate_idempotency_hash(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True)
 import urllib.parse
@@ -242,11 +306,13 @@ def parse_uri(path_str):
     # Strict mapping for fully qualified URIs
     if uri.scheme:
         return uri.volume, uri.path
-
     # Legacy fallback for scheme-less paths (e.g. 'repo/file.txt')
-    fallback_uri = AkasaURI(f"vfs://{uri.path}")
-    if fallback_uri.volume and fallback_uri.path:
+    clean_path = str(path_str).replace('\\', '/').strip()
+    fallback_uri = AkasaURI(f"vfs://{clean_path}")
+    if fallback_uri.volume and (fallback_uri.path or '/' in clean_path):
         return fallback_uri.volume, fallback_uri.path
+    elif fallback_uri.volume and not fallback_uri.path:
+        return fallback_uri.volume, ""
     return "", uri.path
 def fold_vfs_events(events):
     """
@@ -331,6 +397,8 @@ def resolve_sandbox_path(filepath, workspace_id=None):
             norm_path = resolved_abs.name
 
     resolved = ws_root_path.joinpath(norm_path).resolve()
+    if not str(resolved).startswith(str(ws_root_path)):
+        return ws_root_path.as_posix()
     return resolved.as_posix()
 def resolve_system_artifact_path(filepath, workspace_id):
     cfg_path, _ = get_workspace_physics(workspace_id)

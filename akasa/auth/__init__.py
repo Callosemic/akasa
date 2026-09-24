@@ -102,10 +102,18 @@ def bootstrap():
         # Check for cross-origin browser requests (Localhost Drive-By CSRF prevention)
         origin = request.headers.get('Origin', '')
         referer = request.headers.get('Referer', '')
-        allowed_hosts = ['127.0.0.1', 'localhost', '.ts.net']
-        if origin and not any(host in origin for host in allowed_hosts):
+
+        import urllib.parse
+        def is_allowed(url_str):
+            try:
+                hostname = urllib.parse.urlparse(url_str).hostname or ""
+                return hostname in ['127.0.0.1', 'localhost'] or hostname.endswith('.ts.net')
+            except Exception:
+                return False
+
+        if origin and not is_allowed(origin):
             return jsonify({"error": "Forbidden: Cross-origin request blocked"}), 403
-        if referer and not any(host in referer for host in allowed_hosts):
+        if referer and not is_allowed(referer):
             return jsonify({"error": "Forbidden: Cross-origin request blocked"}), 403
 
         return jsonify({

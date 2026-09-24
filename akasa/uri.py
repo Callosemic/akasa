@@ -48,8 +48,8 @@ class AkasaURI:
         parent_path = posixpath.dirname(self.path.rstrip('/'))
         base = f"{self.scheme}://{self.volume}" if self.scheme else self.volume
         if parent_path:
-            return AkasaURI(f"{base}/{parent_path}")
-        return AkasaURI(base)
+            return self.__class__(f"{base}/{parent_path}/") if base else self.__class__(f"{parent_path}/")
+        return self.__class__(f"{base}/" if base else "")
 
     def join(self, child_path: str) -> 'AkasaURI':
         if not child_path:
@@ -59,7 +59,8 @@ class AkasaURI:
         if str(child_path).replace('\\', '/').endswith('/') and not new_path.endswith('/'):
             new_path += '/'
         base = f"{self.scheme}://{self.volume}" if self.scheme else self.volume
-        return AkasaURI(f"{base}/{new_path}" if new_path else base)
+        full = f"{base}/{new_path}" if base else new_path
+        return self.__class__(full)
 
     def relative_to(self, base_uri: 'AkasaURI') -> str:
         if self.scheme != base_uri.scheme or self.volume != base_uri.volume:
@@ -70,9 +71,39 @@ class AkasaURI:
 
     def match(self, pattern: str) -> bool:
         import fnmatch
-        full_str = f"{self.scheme}://{self.volume}/{self.path}" if self.scheme else f"{self.volume}/{self.path}" if self.volume else self.path
+        full_str = str(self)
         if fnmatch.fnmatch(full_str, pattern):
             return True
         if fnmatch.fnmatch(self.path, pattern):
             return True
         return False
+
+    def __str__(self) -> str:
+        if self.scheme:
+            base = f"{self.scheme}://{self.volume}" if self.volume else f"{self.scheme}://"
+            if self.path:
+                return f"{base}/{self.path}"
+            return f"{base}/" if self.is_dir else base
+        elif self.volume:
+            base = self.volume
+            if self.path:
+                return f"{base}/{self.path}"
+            return f"{base}/" if self.is_dir else base
+        else:
+            return self.path if self.path else ("/" if self.is_dir else "")
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}('{str(self)}')"
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, AkasaURI):
+            return str(self) == str(other)
+        if isinstance(other, str):
+            return str(self) == other
+        return False
+
+    def __hash__(self) -> int:
+        return hash(str(self))
+
+    def __fspath__(self) -> str:
+        return str(self)

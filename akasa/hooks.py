@@ -127,14 +127,14 @@ class HookRegistry:
         _event_thread_local.active_events.add(event_name)
         try:
             workspace_ids = set()
-            if kwargs.get('workspace_id'):
-                workspace_ids.add(kwargs['workspace_id'])
-            if event_name == 'vfs_mutated' and self._workspace_router:
-                for m in kwargs.get('mutations', []):
-                    if 'filepath' in m:
-                        mapped_res = self._workspace_router(m['filepath'])
-                        if mapped_res:
-                            workspace_ids.update(mapped_res)
+            origin_ws = kwargs.get('workspace_id')
+            if origin_ws:
+                workspace_ids.add(origin_ws)
+
+            if self._workspace_router:
+                mapped_res = self._workspace_router(event_name, **kwargs)
+                if mapped_res:
+                    workspace_ids.update(mapped_res)
 
             if not workspace_ids:
                 from flask import has_request_context
@@ -157,25 +157,33 @@ class HookRegistry:
                         t0 = time.time()
                         results.append(cb(*args, **kwargs))
                         t1 = time.time()
-                        if t1 - t0 > 1.0:
+                        if t1 - t0 > 5.0:
                             print(f"🐌 [Event Bus Telemetry] Hook '{event_name}' -> {cb.__module__}.{cb.__name__} took {t1 - t0:.2f}s")
                     except Exception as e:
+                        import traceback
                         print(f"⚠️ [Event Bus] Error in '{event_name}' callback {cb.__name__}: {e}")
+                        try:
+                            # Prevent infinite recursion if the system_error hook itself fails
+                            if event_name != 'system_error':
+                                import json
+                                safe_payload = {k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v for k, v in kwargs.items()}
+                                self.emit_background('system_error', source=f"Hook:{event_name}:{cb.__name__}", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=json.dumps(safe_payload), workspace_id=wid)
+                        except Exception: pass
             return results
         finally:
             _event_thread_local.active_events.remove(event_name)
     def emit_background(self, event_name, *args, **kwargs):
         """Dispatches long-running hooks to a background thread to prevent blocking."""
         workspace_ids = set()
-        if kwargs.get('workspace_id'):
-            workspace_ids.add(kwargs['workspace_id'])
-        if event_name == 'vfs_mutated' and self._workspace_router:
-            for m in kwargs.get('mutations', []):
-                if 'filepath' in m:
-                    # DI: Ask the registered router to spatially map the file
-                    mapped_res = self._workspace_router(m['filepath'])
-                    if mapped_res:
-                        workspace_ids.update(mapped_res)
+        origin_ws = kwargs.get('workspace_id')
+        if origin_ws:
+            workspace_ids.add(origin_ws)
+
+        if self._workspace_router:
+            # DI: Ask the registered router to spatially map the event
+            mapped_res = self._workspace_router(event_name, **kwargs)
+            if mapped_res:
+                workspace_ids.update(mapped_res)
 
         if not workspace_ids:
             from flask import has_request_context
@@ -197,7 +205,14 @@ class HookRegistry:
                     try:
                         cb(*args, **kwargs)
                     except Exception as e:
+                        import traceback
                         print(f"⚠️ [Event Bus] Error in async '{event_name}' callback {cb.__name__}: {e}")
+                        try:
+                            if event_name != 'system_error':
+                                import json
+                                safe_payload = {k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v for k, v in kwargs.items()}
+                                self.emit_background('system_error', source=f"AsyncHook:{event_name}:{cb.__name__}", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=json.dumps(safe_payload), workspace_id=wid)
+                        except Exception: pass
 
         with self._lock:
             has_callbacks = bool(self._hooks.get(event_name, []))
