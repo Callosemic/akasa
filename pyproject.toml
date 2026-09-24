@@ -2,11 +2,11 @@
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
-
 [project]
 name = "akasa"
 version = "0.1.0"
 description = "Agnostic Volume Router and Event Bus Substrate."
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "Flask>=3.0.0",
