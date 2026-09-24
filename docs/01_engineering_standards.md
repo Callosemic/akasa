@@ -89,13 +89,14 @@ Inter-module signaling and lifecycle notifications route through the synchronous
 * **Tenant Authorization (`_is_authorized`):** Before invoking a hook callback, the event bus verifies that the subscriber's module is enabled in the active workspace context (`is_extension_enabled`). Core system modules (`akasa.*`) and registered trusted host namespaces (`register_trusted_namespace`) bypass authorization checks.
 * **Dependency-Injected Routing & Real-Time Broadcast:** Spatial volume routing functions can be injected via `set_workspace_router()`. UI signals and job progress updates are automatically dispatched to client queues via the global SSE bus (`sse_bus.emit_sse`).
 * **`system_boot` Boundary Protection:** Non-core domain extensions are explicitly banned from subscribing to `@hooks.on('system_boot')`. Domain extensions must subscribe to `@hooks.on('workspace_boot')` or `@hooks.on('topology_boot_complete')`.
-* **Execution Telemetry:** Synchronous hook executions exceeding 1.0 seconds trigger telemetry warnings to identify slow handlers blocking event propagation.
+* **Execution Telemetry:** Synchronous hook executions exceeding 5.0 seconds trigger telemetry warnings to identify slow handlers blocking event propagation.
+* **Centralized Exception Dispatch:** Unhandled exceptions during event hook callbacks, background worker execution, or VFS write queue operations must emit background `system_error` events via `hooks.emit_background('system_error', ...)`.
 
 ---
 
 ## 6. Type Parity & Contract Specifications
 
 All public SDK methods, event bus payloads, and worker interfaces must conform strictly to the canonical type contracts defined in `akasa/types.py`.
-
-* **Canonical Types:** Use `WorkspaceID`, `FilePath`, `TenantPath`, `FileMutationPayload`, `JobProgressPayload`, `JobSchedulePayload`, and `JobChainPayload`.
+* **Canonical Types:** Use `WorkspaceID`, `FilePath`, `TenantPath`, `FileMutationPayload`, `JobProgressPayload`, `JobSchedulePayload`, `JobChainPayload`, `ChainStepSchema`, and `ChainStepArtifact`.
 * **No Ambiguous Property Aliases:** Event payloads and API payloads must evaluate SSOT property names (`filepath` rather than ambiguous aliases like `path` or `filename`).
+* **OpenAPI Schema Reflection:** API routes registered via `AkasaExtension.route()` must accept typed request/response schemas. `TypedDict` annotations are converted to OpenAPI 3.0 JSON Schema objects using `typeddict_to_openapi()`.
