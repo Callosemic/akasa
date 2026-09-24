@@ -9,7 +9,7 @@ akasa/
 ├── README.md                       # Core substrate documentation and usage guide
 ├── akasa/                          # Central kernel package root
 │   ├── auth/                       # Authentication blueprint, token exchange, and Fernet encryption
-│   │   └── __init__.py             # Background task scheduler, step chaining, and job executor
+│   │   └── __init__.py             # Fitness test suite entry point and runner
 │   ├── db.py                       # Thread-local SQLite connection pool and WAL schema migrations
 │   ├── events.py                   # Thread-safe SSE event bus and client queue manager
 │   ├── extension.py                # Extension SDK context wrappers, SettingsManager, and JobManager
@@ -22,7 +22,7 @@ akasa/
 │   ├── utils.py                    # Dynamic workspace physics, JSON config helpers, and macro tools
 │   ├── vfs.py                      # Virtual File System, volume router, and async write queue
 │   └── workers/                    # Metronome worker engine and job ledger
-│       └── __init__.py             # Background task scheduler, step chaining, and job executor
+│       └── __init__.py             # Fitness test suite entry point and runner
 ├── docs/                           # Architectural documentation and standards
 │   ├── 00_index.md                 # Master documentation index
 │   ├── 01_engineering_standards.md # Core engineering standards and audit guardrails
@@ -31,10 +31,10 @@ akasa/
 │       ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
 │       └── 0003_openapi_reflection_dag_orchestration_and_error_hooks.md # ADR 0003 specification
 ├── pyproject.toml                  # Build system specification and dependencies
-└── tests/                          # [comment required]
-    ├── fitness/                    # [comment required]
-    │   ├── __init__.py             # Background task scheduler, step chaining, and job executor
-    │   ├── core.py                 # [comment required]
-    │   └── rules_python.py         # [comment required]
-    └── fitness_functions.py        # [comment required]
+└── tests/                          # Architectural fitness tests and AST validators
+    ├── fitness/                    # Fitness rule package directory
+    │   ├── __init__.py             # Fitness test suite entry point and runner
+    │   ├── core.py                 # Shared fitness test state, path collection, and violation reporter
+    │   └── rules_python.py         # AST visitor rules enforcing Tier 1 substrate purity and guardrails
+    └── fitness_functions.py        # CLI executable entry point for fitness validation
 ```
