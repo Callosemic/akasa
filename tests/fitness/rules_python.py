@@ -46,7 +46,7 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                     f"Hardcoded host token '{node.value}' detected. Use AKASA_CONTROL_DIR environments."
                 )
             # Substrate Purity Check: Detect domain-specific leakage
-            banned_domain_tokens = ["tailscale", "_get_base_step_and_diffs", "resolve_macro_includes"]
+            banned_domain_tokens = ["tailscale", "_get_base_step_and_diffs", "resolve_macro_includes", "is_compiling"]
             for token in banned_domain_tokens:
                 if token in val:
                     report_violation(
