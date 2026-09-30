@@ -52,6 +52,7 @@ Physical file I/O must never block main thread execution or risk partial file wr
 
 * **Logical URI Boundaries (`AkasaURI`):** File locations are addressed using standard RFC 3986 URIs (`scheme://volume/path`). Paths are normalized to POSIX standard without path-segment stripping heuristics.
 * **Non-Blocking Write Queue (`_VFS_WRITE_QUEUE`):** File mutations (`save`, `delete`, `move`) are enqueued onto a background commit pipeline thread (`_vfs_commit_worker`). REST and SDK endpoints accept writes asynchronously and return HTTP 202 status confirmations.
+* **Pre-Flight Volume Validation:** Write operations (`execute_vfs_save` and `VFSTransaction.save`) validate that target volume paths resolve to a mounted volume prior to queuing. Unmounted volume target writes are dropped gracefully with telemetry warnings to prevent invalid worker commits.
 * **Idempotency Gatekeeper:** Prior to writing to disk, the VFS worker evaluates existing disk contents. If the payload is identical, the disk write and subsequent event ledger updates are silently dropped to eliminate phantom I/O events.
 * **Queued Event-Driven Barrier Sentinel (`sync_vfs_barrier`):** Read-after-write synchronization is achieved by enqueuing an explicit `{"action": "barrier", "barrier_event": event}` sentinel onto `_VFS_WRITE_QUEUE`. Threads wait specifically on their barrier event, avoiding polling loops or CPU starvation.
 * **Auto-Healing Database Connections:** Connection pooling in `get_connection()` runs `PRAGMA quick_check(1)` upon connection. Corrupt disk images are automatically quarantined to `.corrupt_<timestamp>`, re-initialized, and re-migrated cleanly. Background workers and loop dispatchers must evict corrupted handles from thread-local storage (`_local.connections`) upon catching database corruption errors to trigger clean auto-healing re-initialization.
@@ -67,6 +68,7 @@ Background tasks, sweeping routines, and scheduled execution must operate throug
 * **Explicit Lifecycle Scheduling:**
   * **Recurring Tasks:** Must be scheduled via `submit_job()` with an explicit `interval_ms > 0`.
   * **One-Shot Delayed Tasks:** Must be scheduled via `submit_one_shot_job()` with `delay_ms`. Upon execution, one-shot tasks automatically delete themselves from the ledger.
+* **Unregistered Callback Auto-Suspension:** Scheduled jobs referencing unregistered Python callbacks automatically log a warning and suspend (`interval_ms = 0`), purging themselves from the ledger to prevent orphaned execution loops.
 * **Job Step Chaining (ADR 0037 Contract):** Complex multi-stage background pipelines are declared using the `_chain` payload format:
   ```python
   {
