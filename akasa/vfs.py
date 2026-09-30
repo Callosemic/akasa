@@ -166,10 +166,17 @@ def execute_vfs_move(workspace_id, filepath, dest_path):
 def execute_vfs_delete(workspace_id, filepath):
     _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "delete"}))
     return {"status": "accepted", "message": f"File deletion queued."}, 202
-
 def execute_vfs_save(workspace_id, filepath, content, data=None):
     if data is None:
         data = {}
+
+    # Pre-flight Volume Validation
+    if not data.get("is_absolute_artifact"):
+        from akasa.vfs import _resolve_physical_path
+        if not _resolve_physical_path(filepath, workspace_id):
+            print(f"⚠️ [VFS] Save dropped: Volume for '{filepath}' is not mounted.")
+            return {"status": "error", "message": f"Volume for '{filepath}' is not mounted."}
+
     _VFS_WRITE_QUEUE.put((workspace_id, filepath, content, data))
     return {"status": "accepted", "message": f"File {filepath} queued for atomic background commit."}
 
@@ -180,6 +187,10 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data):
         hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=filepath, resolved_path=resolved_path, content=content, data=data)
     except Exception as e:
         pass
+
+    if not resolved_path:
+        print(f"❌ [VFS Pipeline] Save aborted: Unable to resolve physical path for '{filepath}' on workspace '{workspace_id}'")
+        return
 
     is_new = not os.path.exists(resolved_path)
     # Idempotency Gatekeeper: Kill phantom writes by dropping identical payloads
@@ -241,6 +252,14 @@ class VFSTransaction:
         self._in_transaction = False
     def save(self, filepath, content, data=None):
         data = data or {}
+
+        # Pre-flight Volume Validation
+        if not data.get("is_absolute_artifact"):
+            from akasa.vfs import _resolve_physical_path
+            if not _resolve_physical_path(filepath, self.workspace_id):
+                print(f"⚠️ [VFS] Transaction dropped: Volume for '{filepath}' is not mounted.")
+                return
+
         # Pre-flight Idempotency Gatekeeper: drop unchanged payloads to prevent phantom VFS events
         if not data.get("delete_source") and self.read(filepath, is_absolute_artifact=data.get("is_absolute_artifact")) == content:
             return

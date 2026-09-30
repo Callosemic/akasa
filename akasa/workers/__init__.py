@@ -433,7 +433,6 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
             target_ws = kwargs.pop("_workspace_id")
     except Exception:
         kwargs = {}
-
     if func:
         try:
             import inspect
@@ -449,7 +448,10 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
                 safe_payload = args_json if (args_json and args_json.strip().startswith('{')) else json.dumps({"raw_args": str(args_json)})
                 hooks.emit_background('system_error', source=f"Cron:{ext_name}:{callback_name}", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=safe_payload, workspace_id=target_ws)
             except Exception: pass
-    
+    else:
+        print(f"⚠️ [Worker] Callback '{ext_name}:{callback_name}' not found for job {job_id}. Suspending job.")
+        interval_ms = 0 # Force job deletion
+
     if not _shutdown_event.is_set():
         try:
             import random

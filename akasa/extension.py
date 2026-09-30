@@ -460,14 +460,13 @@ class ExtensionContext:
     def parse_uri(self, path_str):
         from akasa.utils import parse_uri
         return parse_uri(path_str)
-
-    def expand_selection(self, items):
+    def expand_selection(self, items, gather_only=False):
         """
         SSOT: Expands polymorphic frontend selection items into a flat, 
         deduplicated, and stable-sorted list of physical or logical filepaths.
         """
-        from akasa.hooks import hooks
-        results = hooks.emit('expand_selection', items=items, workspace_id=self.workspace_id)
+        from akasa.hooks import hooks as _hooks
+        results = _hooks.emit('expand_selection', items=items, workspace_id=self.workspace_id, gather_only=gather_only)
         return next((r for r in results if r is not None), items)
     def save_manifest(self, manifest_data, is_full_compile=False):
         """Writes updates to the centralized context manifest."""
