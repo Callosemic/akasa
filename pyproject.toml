@@ -19,7 +19,7 @@ include = ["akasa", "akasa.*"]
 [tool.setuptools.package-data]
 "*" = ["py.typed"]
 [tool.semantic_release]
-build_command = ""
+build_command = "python -m build"
 version_toml = [
     "pyproject.toml:project.version"
 ]
