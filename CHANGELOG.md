@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.1.2 (2026-10-06)
+
+### Bug Fixes
+
+- **kernel**: Enforce VFS volume mounting guardrails, auto-purge missing worker callbacks, and
+  support gather-only selection expansion
+  ([`d6988cf`](https://github.com/Callosemic/akasa/commit/d6988cf957b0f976cc7e4937c8cb81208d228803))
+
+
 ## v0.1.1 (2026-09-24)
 
 ### Bug Fixes
