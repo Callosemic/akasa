@@ -24,6 +24,11 @@ akasa/
 │   ├── vfs.py                      # Virtual File System, volume router, and async write queue
 │   └── workers/                    # Metronome worker engine and job ledger
 │       └── __init__.py             # Fitness test suite entry point and runner
+├── akasa.egg-info/                 # [comment required]
+│   ├── SOURCES.txt                 # [comment required]
+│   ├── dependency_links.txt        # [comment required]
+│   ├── requires.txt                # [comment required]
+│   └── top_level.txt               # [comment required]
 ├── docs/                           # Architectural documentation and standards
 │   ├── 00_index.md                 # Master documentation index
 │   ├── 01_engineering_standards.md # Core engineering standards and audit guardrails
