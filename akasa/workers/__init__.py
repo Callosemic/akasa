@@ -7,6 +7,7 @@ from typing import TypedDict, List, Dict, Any, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor
 from akasa.db import get_connection
 from akasa.hooks import hooks
+from akasa.utils import get_workspace_physics
 
 class ChainStepSchema(TypedDict, total=False):
     id: str
@@ -415,11 +416,22 @@ def sweep_ephemeral_artifacts(workspace_id="default"):
             conn.execute("DELETE FROM ephemeral_artifacts WHERE id=?", (row['id'],))
         except Exception as e:
             print(f"⚠️ Failed to garbage collect ephemeral artifact {row['filepath']}: {e}")
-
     # 2. Sweep Old Immediate Jobs (> 24 hours)
     cutoff = now - 86400
     conn.execute("DELETE FROM immediate_jobs WHERE updated_at < ? AND status IN ('completed', 'failed')", (cutoff,))
     conn.commit()
+
+    # 3. Sweep Old Database Corruption Dumps (> 7 days)
+    try:
+        cfg_path, _ = get_workspace_physics(workspace_id)
+        ext_base = Path(cfg_path).parent.joinpath("ext")
+        if ext_base.exists() and ext_base.is_dir():
+            seven_days_ago = now - (7 * 86400)
+            for corrupt_file in ext_base.rglob("*.db.corrupt_*"):
+                if corrupt_file.is_file() and corrupt_file.stat().st_mtime < seven_days_ago:
+                    os.remove(corrupt_file.as_posix())
+    except Exception as e:
+        print(f"⚠️ Failed to garbage collect old corrupt database dumps: {e}")
 
 register_callback("workers", "sweep_ephemeral_artifacts", sweep_ephemeral_artifacts)
 

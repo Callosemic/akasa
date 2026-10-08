@@ -103,10 +103,6 @@ def get_connection(db_name, workspace_id=None):
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA busy_timeout=5000;")
         conn.commit()
-        cursor = conn.execute("PRAGMA quick_check(1);")
-        res = cursor.fetchone()
-        if res and res[0] != "ok":
-            raise sqlite3.DatabaseError(f"Database disk image is malformed: {res[0]}")
         return conn
 
     try:
