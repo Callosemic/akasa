@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.1.3 (2026-10-08)
+
+### Performance Improvements
+
+- **db**: Streamline connection pooling and add corrupt DB dump garbage collection
+  ([`7b08280`](https://github.com/Callosemic/akasa/commit/7b08280b83303d8bfe6f135a219d62147984d549))
+
+
 ## v0.1.2 (2026-10-06)
 
 ### Bug Fixes
