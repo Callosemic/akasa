@@ -77,6 +77,21 @@ class JobManager:
             (self.ext_name, task_name)
         ).fetchone()
         return bool(row)
+
+    def cancel(self, job_id):
+        """SDK Helper: Cancels a scheduled background job in the Metronome ledger."""
+        from akasa.workers import cancel_job as _cancel_job
+        return _cancel_job(job_id, workspace_id=self.workspace_id)
+
+    def pause(self, job_id):
+        """SDK Helper: Freezes a scheduled background job in the Metronome ledger."""
+        from akasa.workers import pause_job as _pause_job
+        return _pause_job(job_id, workspace_id=self.workspace_id)
+
+    def resume(self, job_id, reset_timer=True):
+        """SDK Helper: Restores a paused background job in the Metronome ledger."""
+        from akasa.workers import resume_job as _resume_job
+        return _resume_job(job_id, workspace_id=self.workspace_id, reset_timer=reset_timer)
     def update_progress(self, message, artifact=None):
         if self.current_job_id:
             from akasa.workers import update_immediate_job_status

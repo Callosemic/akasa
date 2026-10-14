@@ -138,10 +138,44 @@ def cancel_job(job_id, workspace_id=None):
         from akasa.utils import sniff_tenant_id
         workspace_id = sniff_tenant_id()
     workspace_id = workspace_id or "default"
-
     conn = get_connection("workers", workspace_id=workspace_id)
     conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
     conn.commit()
+
+def pause_job(job_id, workspace_id=None):
+    """Freezes a scheduled job in the Metronome ledger without deleting its record."""
+    if not workspace_id:
+        from akasa.utils import sniff_tenant_id as _sniff_tenant_id
+        workspace_id = _sniff_tenant_id()
+    workspace_id = workspace_id or "default"
+
+    conn = get_connection("workers", workspace_id=workspace_id)
+    cursor = conn.execute("UPDATE jobs SET status='paused' WHERE id=?", (job_id,))
+    conn.commit()
+    return cursor.rowcount > 0
+
+def resume_job(job_id, workspace_id=None, reset_timer=True):
+    """Restores a paused job to pending status, optionally recalculating next_run_at."""
+    if not workspace_id:
+        from akasa.utils import sniff_tenant_id as _sniff_tenant_id
+        workspace_id = _sniff_tenant_id()
+    workspace_id = workspace_id or "default"
+
+    conn = get_connection("workers", workspace_id=workspace_id)
+    if reset_timer:
+        row = conn.execute("SELECT interval_ms FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if not row:
+            return False
+        interval_ms = row["interval_ms"] or 0
+        next_run = time.time() + (interval_ms / 1000.0)
+        cursor = conn.execute(
+            "UPDATE jobs SET status='pending', next_run_at=? WHERE id=?",
+            (next_run, job_id)
+        )
+    else:
+        cursor = conn.execute("UPDATE jobs SET status='pending' WHERE id=?", (job_id,))
+    conn.commit()
+    return cursor.rowcount > 0
 def submit_immediate_job(job_id, ext_name, callback_name, args_json="{}", workspace_id=None, coalesce=False, job_category="system_background"):
     """Drops a task directly into the active ThreadPoolExecutor and logs its lifecycle for UI polling."""
     if _shutdown_event.is_set():
