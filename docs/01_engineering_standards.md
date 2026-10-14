@@ -68,6 +68,11 @@ Background tasks, sweeping routines, and scheduled execution must operate throug
 * **Explicit Lifecycle Scheduling:**
   * **Recurring Tasks:** Must be scheduled via `submit_job()` with an explicit `interval_ms > 0`.
   * **One-Shot Delayed Tasks:** Must be scheduled via `submit_one_shot_job()` with `delay_ms`. Upon execution, one-shot tasks automatically delete themselves from the ledger.
+  * **Job State & Lifecycle Controls:** Scheduled tasks support deterministic state controls:
+    * **Cancellation (`cancel_job`):** Purges the scheduled task record from the `jobs` ledger.
+    * **Pause / Freeze (`pause_job`):** Transitions the job state to `paused` without dropping configured intervals or argument metadata.
+    * **Resume (`resume_job`):** Restores `paused` jobs to `pending`, recalculating `next_run_at` based on `interval_ms` when `reset_timer=True`.
+    * **SDK Exposure (`JobManager`):** Extensions manage tenant-scoped job lifecycles via `ctx.jobs.cancel()`, `ctx.jobs.pause()`, and `ctx.jobs.resume()`.
 * **Unregistered Callback Auto-Suspension:** Scheduled jobs referencing unregistered Python callbacks automatically log a warning and suspend (`interval_ms = 0`), purging themselves from the ledger to prevent orphaned execution loops.
 * **Job Step Chaining (ADR 0037 Contract):** Complex multi-stage background pipelines are declared using the `_chain` payload format:
   ```python
