@@ -131,6 +131,64 @@ def _vfs_commit_worker():
                         ])
                     else:
                         print(f"❌ [VFS Pipeline] Move aborted: Source file missing on disk ({filepath})")
+                elif action == "bulk":
+                    import shutil as _shutil
+                    import time as _time
+                    from akasa.db import get_connection as _get_connection
+                    operations = data.get("operations", [])
+                    db_conn = _get_connection("workers", workspace_id=workspace_id)
+                    now_ts = _time.time()
+                    ledger_rows = []
+                    emitted_mutations = []
+
+                    for op_item in operations:
+                        op_type = op_item.get("action")
+                        src_fp = op_item.get("filepath", "")
+                        dst_fp = op_item.get("dest_path", "")
+                        ignore_ledger = bool(op_item.get("ignore_ledger"))
+
+                        if op_type == "delete" and src_fp:
+                            resolved_path = _resolve_physical_path(src_fp, workspace_id, op_item.get("is_absolute_artifact"))
+                            try:
+                                hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=src_fp, resolved_path=resolved_path, content="", data=op_item)
+                            except Exception:
+                                pass
+                            if resolved_path and os.path.exists(resolved_path):
+                                if os.path.isdir(resolved_path):
+                                    _shutil.rmtree(resolved_path)
+                                else:
+                                    os.remove(resolved_path)
+                            if not ignore_ledger:
+                                ledger_rows.append((src_fp, 'deleted', now_ts))
+                            emitted_mutations.append({"filepath": src_fp, "operation": "delete", "ignore_ledger": ignore_ledger})
+                        elif op_type == "move" and src_fp and dst_fp:
+                            resolved_src = _resolve_physical_path(src_fp, workspace_id, op_item.get("is_absolute_artifact"))
+                            resolved_dest = _resolve_physical_path(dst_fp, workspace_id, op_item.get("is_absolute_artifact"))
+                            try:
+                                hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=src_fp, resolved_path=resolved_src, content="", data=op_item)
+                                hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=dst_fp, resolved_path=resolved_dest, content="", data=op_item)
+                            except Exception:
+                                pass
+                            if resolved_src and resolved_dest and os.path.exists(resolved_src):
+                                os.makedirs(Path(resolved_dest).parent, exist_ok=True)
+                                _shutil.move(resolved_src, resolved_dest)
+                                if not ignore_ledger:
+                                    ledger_rows.append((src_fp, 'deleted', now_ts))
+                                    ledger_rows.append((dst_fp, 'added', now_ts))
+                                emitted_mutations.append({"filepath": src_fp, "operation": "delete", "ignore_ledger": ignore_ledger})
+                                emitted_mutations.append({"filepath": dst_fp, "operation": "save", "ignore_ledger": ignore_ledger})
+
+                        elif op_type == "save" and src_fp:
+                            execute_vfs_save_physical(workspace_id, src_fp, op_item.get("content", ""), op_item)
+
+                    if ledger_rows:
+                        db_conn.executemany(
+                            "INSERT OR REPLACE INTO vfs_event_log (filepath, mutation_type, timestamp) VALUES (?, ?, ?)",
+                            ledger_rows
+                        )
+                        db_conn.commit()
+                    if emitted_mutations:
+                        hooks.emit('vfs_mutated', workspace_id=workspace_id, mutations=emitted_mutations)
                 else:
                     execute_vfs_save_physical(workspace_id, filepath, content, data)
             except Exception as e:
@@ -166,6 +224,10 @@ def execute_vfs_move(workspace_id, filepath, dest_path):
 def execute_vfs_delete(workspace_id, filepath):
     _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "delete"}))
     return {"status": "accepted", "message": f"File deletion queued."}, 202
+
+def execute_vfs_bulk(workspace_id, operations):
+    _VFS_WRITE_QUEUE.put((workspace_id, "", "", {"action": "bulk", "operations": operations}))
+    return {"status": "accepted", "message": f"Bulk operation ({len(operations)} item(s)) queued.", "operations": operations}, 202
 def execute_vfs_save(workspace_id, filepath, content, data=None):
     if data is None:
         data = {}
@@ -297,8 +359,18 @@ class VFSTransaction:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._in_transaction = False
         if exc_type is None and self._buffer:
-            for filepath, content, data in self._buffer:
+            if len(self._buffer) == 1:
+                filepath, content, data = self._buffer[0]
                 execute_vfs_save(self.workspace_id, filepath, content, data)
+            else:
+                bulk_ops = []
+                for filepath, content, data in self._buffer:
+                    op_data = dict(data or {})
+                    op_data["action"] = op_data.get("action", "save")
+                    op_data["filepath"] = filepath
+                    op_data["content"] = content
+                    bulk_ops.append(op_data)
+                execute_vfs_bulk(self.workspace_id, bulk_ops)
 
         self._buffer = []
     def walk(self, directory_path, exts=None):
