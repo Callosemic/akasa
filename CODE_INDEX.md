@@ -30,7 +30,8 @@ akasa/
 │   └── adrs/                       # Architectural Decision Records (ADRs)
 │       ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001 specification
 │       ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
-│       └── 0003_openapi_reflection_dag_orchestration_and_error_hooks.md # ADR 0003 specification
+│       ├── 0003_openapi_reflection_dag_orchestration_and_error_hooks.md # ADR 0003 specification
+│       └── 0004_vfs_bulk_mutation_batching_and_atomic_consolidation.md # [comment required]
 ├── pyproject.toml                  # Build system specification and dependencies
 └── tests/                          # Architectural fitness tests and AST validators
     ├── fitness/                    # Fitness rule package directory
