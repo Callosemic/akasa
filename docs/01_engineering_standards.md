@@ -37,11 +37,13 @@ Logic, pathing, and settings management must operate deterministically from a si
 Akasa serves multiple tenant workspaces concurrently within a single process daemon without cross-tenant memory leakage.
 
 * **Request-Scoped Workspace Identification:** Tenant contexts are passed explicitly or extracted via the `X-Workspace-ID` HTTP header (`sniff_tenant_id()`). Default fallback is always `"default"`.
-* **Thread-Local Connection Pooling (`_local`):** SQLite connection pools are stored in thread-local storage (`threading.local()`) and keyed by `(workspace_id, db_name)`. Connection limits are capped at 5 active workspaces per thread using True LRU eviction to prevent WAL handle exhaustion.
-* **Database Safety Standards:** All SQLite handles must enforce:
+* **Thread-Local Connection Pooling (`_local`):** SQLite connection pools are stored in thread-local storage (`threading.local()`) and structured hierarchically as `_local.connections[workspace_id][db_name]`. Connection limits are capped at 3 active workspaces per thread and 4 databases per workspace using True LRU eviction to prevent WAL handle exhaustion.
+* **Thread-Local Connection Lifecycle Purging (`close_thread_connections`):** Per-request WSGI threads and background worker threads must call `close_thread_connections()` upon completing execution to close all cached SQLite connections on the calling thread, preventing file descriptor exhaustion. Individual connections can be evicted using `evict_cached_connection(workspace_id, db_name)`.
+* **Database Relocation & Storage Bounds:** Tenant databases are stored in `<tenant_control_dir>/cache/db/<db_name>.db`. All connections must enforce:
   * Write-Ahead Logging (`PRAGMA journal_mode=WAL;`)
   * Normal synchronization (`PRAGMA synchronous=NORMAL;`)
   * Busy timeouts (`PRAGMA busy_timeout=5000;`)
+  * Bounded cache sizes (`PRAGMA cache_size=-8000;`)
 * **Thread-Local Re-Entrancy Guards:** Event bus emissions utilize thread-local tracking (`_event_thread_local.active_events`) to catch and suppress recursive event loops on the same thread.
 
 ---
@@ -53,8 +55,10 @@ Physical file I/O must never block main thread execution or risk partial file wr
 * **Logical URI Boundaries (`AkasaURI`):** File locations are addressed using standard RFC 3986 URIs (`scheme://volume/path`). Paths are normalized to POSIX standard without path-segment stripping heuristics.
 * **Non-Blocking Write Queue (`_VFS_WRITE_QUEUE`):** File mutations (`save`, `delete`, `move`, `bulk`) are enqueued onto a background commit pipeline thread (`_vfs_commit_worker`). REST and SDK endpoints accept writes asynchronously and return HTTP 202 status confirmations. Multi-mutation batches (`execute_vfs_bulk`) execute atomically in the background worker, batching SQLite ledger records (`executemany`) and emitting a consolidated `vfs_mutated` event list to prevent event bus flooding.
 * **Transaction Batch Aggregation (`VFSTransaction`):** Context-managed mutations buffer locally. Single-file operations fall back to standard `execute_vfs_save`, while multi-item buffers automatically consolidate into a single `execute_vfs_bulk` payload upon context exit (`__exit__`).
-* **Pre-Flight Volume Validation:** Write operations (`execute_vfs_save` and `VFSTransaction.save`) validate that target volume paths resolve to a mounted volume prior to queuing. Unmounted volume target writes are dropped gracefully with telemetry warnings to prevent invalid worker commits.
-* **Idempotency Gatekeeper:** Prior to writing to disk, the VFS worker evaluates existing disk contents. If the payload is identical, the disk write and subsequent event ledger updates are silently dropped to eliminate phantom I/O events.
+* **Pre-Flight Volume Validation:** Write operations (`execute_vfs_save` and `VFSTransaction.save`) validate that target volume paths resolve to a mounted volume prior to queuing. Unmounted volume target writes are dropped gracefully with telemetry warnings (`vfs_mount_missing`) to prevent invalid worker commits.
+* **In-Memory Write-Through LRU Read Cache (`_VFS_READ_CACHE`):** The VFS maintains a 32 MB thread-safe read cache (`_VFS_READ_CACHE`) for files up to 2 MB. Cache hits verify physical file metadata `(st_mtime_ns, st_size)` via a single `os.stat` call. Physical writes, moves, and deletions invalidate affected file paths and directory sub-trees immediately.
+* **Fast-Path Idempotency Gatekeeper:** Prior to disk I/O, `_is_file_identical()` evaluates physical `st_size` and memory cache text against proposed content. Identical payloads are dropped silently before disk writes or event ledger records are dispatched.
+* **Inter-Workspace Virtual Mounts (`ws://`):** Peer tenant data is addressable using the `ws://<source_workspace_id>/<domain>/<relative_path>` URI scheme via `InterWorkspaceVFSDriver`. Target paths resolve strictly within `<source_workspace_dir>/data/<relative_path>`. Access is validated against the host-injected `_MOUNT_AUTHORIZER` callback (`set_mount_authorizer`). Cross-workspace mutations are strictly read-only and rejected with HTTP 403.
 * **Queued Event-Driven Barrier Sentinel (`sync_vfs_barrier`):** Read-after-write synchronization is achieved by enqueuing an explicit `{"action": "barrier", "barrier_event": event}` sentinel onto `_VFS_WRITE_QUEUE`. Threads wait specifically on their barrier event, avoiding polling loops or CPU starvation.
 * **Auto-Healing Database Connections & Retention:** Connection pooling in `get_connection()` catches SQLite corruption errors (`DatabaseError` containing `malformed` or `corrupt`). Corrupt disk images are automatically quarantined to `.corrupt_<timestamp>`, re-initialized, and re-migrated cleanly. Background workers and loop dispatchers evict corrupted handles from thread-local storage (`_local.connections`) upon catching database corruption errors to trigger clean auto-healing re-initialization. Quarantined database dumps (`*.db.corrupt_*`) older than 7 days are automatically garbage-collected by the Metronome worker engine (`sweep_ephemeral_artifacts`).
 * **Declarative Schema Auto-Migration:** SQLite database tables required by kernel extensions register declarative schemas (`register_schema`) which auto-migrate on tenant boot via column diffing.
@@ -86,8 +90,10 @@ Background tasks, sweeping routines, and scheduled execution must operate throug
   }
 
 ```
-
-* **Metronome Loop Resilience:** The Metronome thread queries pending jobs across all registered tenant workspaces in `system.json`, handing ready callbacks off to a constrained `ThreadPoolExecutor`.
+* **Dynamic Condition-Variable Metronome Loop:** The Metronome dispatcher loop (`_metronome_loop`) synchronizes via `threading.Condition` (`_metronome_wakeup`). The loop computes the minimum `next_run_at` timestamp across all pending jobs, waiting on the condition variable until the nearest deadline or waking immediately when new tasks are scheduled via `submit_job()`, `submit_one_shot_job()`, or system shutdown.
+* **Parallel DAG Chain Coordination (`start_dag_chain`):** Multi-stage background pipelines support parallel execution graphs via `start_dag_chain()` and `resolve_dag_chain()`. Root steps execute concurrently in the `ThreadPoolExecutor`. As steps complete, the coordinator evaluates downstream dependencies (`depends_on`), merges step outputs (`state_deltas`) into `chain_state`, emits `job_baton_passed` telemetry, and triggers `on_complete_hook` when all branches resolve.
+* **In-Memory Job Barriers (`wait_for_jobs`):** Callers synchronize with in-flight immediate tasks via `wait_for_jobs(workspace_id, prefix=..., job_id=...)` using in-memory `threading.Event` sentinels (`_active_job_events`), avoiding polling overhead on the database ledger.
+* **Argument-Based Job Coalescing:** `submit_immediate_job` supports `coalesce="args"`, matching active jobs with identical `(ext_name, callback_name, args_json)` to deduplicate identical compute workloads.
 
 ---
 
