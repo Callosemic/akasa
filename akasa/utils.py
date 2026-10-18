@@ -1,13 +1,24 @@
 from pathlib import Path
+from functools import wraps
 import os
+import re
+import copy
 import json
+import time
+import typing
+import functools
+import threading
+import posixpath
+import unicodedata
+import urllib.parse
+from akasa.uri import AkasaURI
 
 _cwd = os.getcwd()
 def sniff_tenant_id():
     try:
-        from flask import request
-        if request and 'X-Workspace-ID' in request.headers:
-            return request.headers['X-Workspace-ID']
+        from flask import request as _request
+        if _request and 'X-Workspace-ID' in _request.headers:
+            return _request.headers['X-Workspace-ID']
     except RuntimeError:
         pass
     return "default"
@@ -82,19 +93,16 @@ def is_extension_enabled(ext_name, workspace_id=None):
     return ext_name in cfg.get("extensions", [])
 def extension_auth(ext_name):
     def decorator(f):
-        import functools
         @functools.wraps(f)
         def decorated_function(*args, **kwargs):
-            from flask import jsonify
+            from flask import jsonify as _jsonify
             ws_id = kwargs.get('workspace_id') or sniff_tenant_id()
             if not is_extension_enabled(ext_name, ws_id):
-                return jsonify({"error": f"403 Forbidden: Extension '{ext_name}' is not enabled in this workspace."}), 403
+                return _jsonify({"error": f"403 Forbidden: Extension '{ext_name}' is not enabled in this workspace."}), 403
             return f(*args, **kwargs)
         return decorated_function
     return decorator
-import threading
-import time
-from functools import wraps
+
 def thread_safe_cache(ttl=2.0, key_maker=lambda *args, **kwargs: "global"):
     """
     A non-blocking, single-flight TTL cache with invalidation race protection.
@@ -111,41 +119,43 @@ def thread_safe_cache(ttl=2.0, key_maker=lambda *args, **kwargs: "global"):
                 if key not in compilation_locks:
                     compilation_locks[key] = threading.Lock()
                 return compilation_locks[key]
-
         @wraps(func)
         def wrapper(*args, **kwargs):
             key = key_maker(*args, **kwargs)
             now = time.time()
             # 1. Fast Lock-Free Read
-            cached_json = None
+            has_cached = False
+            cached_val = None
             with state_lock:
                 if key in cache and (not ttl or now - cache[key]['ts'] < ttl):
-                    cached_json = cache[key]['json_data']
+                    has_cached = True
+                    cached_val = cache[key]['val']
 
-            if cached_json is not None:
-                return json.loads(cached_json)
+            if has_cached:
+                return copy.deepcopy(cached_val)
 
             # 2. Single-Flight Execution Barrier
             key_lock = _get_key_lock(key)
             with key_lock:
                 # Re-check cache in case another thread computed it while waiting
-                cached_json = None
+                has_cached = False
+                cached_val = None
                 with state_lock:
                     if key in cache and (not ttl or now - cache[key]['ts'] < ttl):
-                        cached_json = cache[key]['json_data']
+                        has_cached = True
+                        cached_val = cache[key]['val']
 
-                if cached_json is not None:
-                    return json.loads(cached_json)
+                if has_cached:
+                    return copy.deepcopy(cached_val)
 
                 calc_start = time.time()
                 result = func(*args, **kwargs)
-                json_data = json.dumps(result)
 
                 with state_lock:
                     # Discard result if an invalidation occurred during calculation
                     if invalidated_at.get(key, 0) < calc_start:
-                        cache[key] = {'ts': time.time(), 'json_data': json_data}
-                    return json.loads(json_data)
+                        cache[key] = {'ts': time.time(), 'val': copy.deepcopy(result)}
+                    return result
 
         def invalidate(*args, **kwargs):
             key = key_maker(*args, **kwargs)
@@ -165,7 +175,6 @@ def thread_safe_cache(ttl=2.0, key_maker=lambda *args, **kwargs: "global"):
         wrapper.clear_all = clear_all
         return wrapper
     return decorator
-
 _JSON_CACHE = {}
 _JSON_MTIME = {}
 def load_json_config(filepath, default_fallback=None):
@@ -173,39 +182,42 @@ def load_json_config(filepath, default_fallback=None):
     if default_fallback is None:
         default_fallback = {}
 
-    if not filepath or not os.path.exists(filepath):
+    if not filepath:
         return default_fallback
 
-    current_mtime = os.path.getmtime(filepath)
+    try:
+        current_mtime = os.stat(filepath).st_mtime_ns
+    except OSError:
+        return default_fallback
     if filepath not in _JSON_CACHE or current_mtime > _JSON_MTIME.get(filepath, 0):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
-                _JSON_CACHE[filepath] = json.load(f)
+                raw_text = f.read()
+                json.loads(raw_text)
+                _JSON_CACHE[filepath] = raw_text
         except Exception:
-            _JSON_CACHE[filepath] = default_fallback
+            _JSON_CACHE[filepath] = json.dumps(default_fallback)
         _JSON_MTIME[filepath] = current_mtime
 
-    return _JSON_CACHE[filepath]
+    return json.loads(_JSON_CACHE[filepath])
 def save_json_config(filepath, data, workspace_id=None):
     global _JSON_CACHE, _JSON_MTIME
-    import time
-    from akasa.vfs import execute_vfs_save
+    from akasa.vfs import execute_vfs_save as _execute_vfs_save
 
     content = json.dumps(data, indent=2)
-    execute_vfs_save(workspace_id or "default", filepath, content, data={"is_absolute_artifact": True, "ignore_ledger": True})
+    _execute_vfs_save(workspace_id or "default", filepath, content, data={"is_absolute_artifact": True, "ignore_ledger": True})
 
-    _JSON_CACHE[filepath] = data
-    _JSON_MTIME[filepath] = time.time()
+    _JSON_CACHE[filepath] = content
+    _JSON_MTIME[filepath] = time.time_ns()
 _is_invalidator_bound = False
-
 @thread_safe_cache(ttl=2.0, key_maker=lambda workspace_id=None, **kwargs: str(workspace_id))
 def load_config(workspace_id=None):
     global _is_invalidator_bound
-    from akasa.hooks import hooks
+    from akasa.hooks import hooks as _hooks
 
     # Decoupled Invalidation: Bind the cache invalidator on first execution to prevent circular imports
     if not _is_invalidator_bound:
-        @hooks.on('config_mutated')
+        @_hooks.on('config_mutated')
         def _invalidate_config(workspace_id=None, **kwargs):
             if workspace_id:
                 load_config.invalidate(workspace_id=workspace_id)
@@ -216,7 +228,7 @@ def load_config(workspace_id=None):
     cfg_path, _ = get_workspace_physics(workspace_id)
     cfg = load_json_config(cfg_path, {})
 
-    hooks.emit('mutate_workspace_config', cfg, workspace_id=workspace_id)
+    _hooks.emit('mutate_workspace_config', cfg, workspace_id=workspace_id)
 
     return cfg
 def get_all_workspace_ids():
@@ -225,8 +237,7 @@ def get_all_workspace_ids():
     workspace_ids = ["default"]
     if os.path.exists(index_path):
         try:
-            with open(index_path, 'r', encoding='utf-8') as f:
-                w_data = json.load(f)
+            w_data = load_json_config(index_path, {})
             workspace_ids = list(w_data.get("workspaces", {}).keys())
             if "default" not in workspace_ids:
                 workspace_ids.append("default")
@@ -235,7 +246,6 @@ def get_all_workspace_ids():
     return workspace_ids
 def typeddict_to_openapi(td_class):
     """Transforms a Python TypedDict into an OpenAPI 3.0 JSON Schema object natively."""
-    import typing
     if not hasattr(td_class, "__annotations__"):
         return {"type": "object"}
 
@@ -290,18 +300,14 @@ def typeddict_to_openapi(td_class):
         schema["required"] = list(required)
 
     return schema
-
 def generate_idempotency_hash(payload: dict) -> str:
     return json.dumps(payload, sort_keys=True)
-import urllib.parse
-import posixpath
-import re
+
 def parse_uri(path_str):
     """SDK Helper: Parses any scheme:// or relative path into (volume, relative_path)."""
     if not path_str:
         return "", ""
 
-    from akasa.uri import AkasaURI
     uri = AkasaURI(path_str)
     # Strict mapping for fully qualified URIs
     if uri.scheme:
@@ -360,12 +366,9 @@ def fold_vfs_events(events):
 
     # Extract the surviving net-effective events
     return [state['event'] for state in folded.values()]
-
 def slugify(text):
     if not text:
         return ""
-    import unicodedata
-    import re
     charmap = {
         'Đ': 'D', 'đ': 'd',
         'Æ': 'AE', 'æ': 'ae',
@@ -377,19 +380,28 @@ def slugify(text):
     clean = unicodedata.normalize('NFKD', text).encode('ascii', 'ignore').decode('utf-8')
     clean = re.sub(r'[^a-zA-Z0-9_-]', '_', clean.lower())
     return re.sub(r'_+', '_', clean).strip('_')
+def is_subpath(child_path, parent_path) -> bool:
+    """Returns True if child_path resolves inside or equal to parent_path without prefix collision."""
+    try:
+        c = Path(child_path).resolve()
+        p = Path(parent_path).resolve()
+        return c == p or p in c.parents
+    except Exception:
+        return False
+
+
 def resolve_sandbox_path(filepath, workspace_id=None):
     """Tier 1 Safe Path Resolution: Prevents directory traversal breakouts."""
     _, workspace_root = get_workspace_physics(workspace_id)
     ws_root_path = Path(workspace_root).resolve()
 
     filepath_str = str(filepath)
-    from akasa.uri import AkasaURI
     uri = AkasaURI(filepath_str)
     norm_path = uri.path
 
     if Path(norm_path).is_absolute():
         resolved_abs = Path(norm_path).resolve()
-        if str(resolved_abs).startswith(str(ws_root_path)):
+        if is_subpath(resolved_abs, ws_root_path):
             return resolved_abs.as_posix()
         try:
             norm_path = resolved_abs.relative_to(ws_root_path).as_posix()
@@ -397,9 +409,11 @@ def resolve_sandbox_path(filepath, workspace_id=None):
             norm_path = resolved_abs.name
 
     resolved = ws_root_path.joinpath(norm_path).resolve()
-    if not str(resolved).startswith(str(ws_root_path)):
+    if not is_subpath(resolved, ws_root_path):
         return ws_root_path.as_posix()
     return resolved.as_posix()
+
+
 def resolve_system_artifact_path(filepath, workspace_id):
     cfg_path, _ = get_workspace_physics(workspace_id)
     control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
@@ -408,10 +422,18 @@ def resolve_system_artifact_path(filepath, workspace_id):
     default_control_base = Path(_cwd).joinpath(control_dir_name).resolve()
     resolved_abs = Path(filepath).resolve()
 
-    if str(resolved_abs).startswith(str(active_control_base)) or str(resolved_abs).startswith(str(default_control_base)):
+    if is_subpath(resolved_abs, active_control_base) or is_subpath(resolved_abs, default_control_base):
         return resolved_abs.as_posix()
-    else:
-        return resolve_sandbox_path(filepath, workspace_id)
+
+    for ws_id in get_all_workspace_ids():
+        try:
+            ws_control = Path(get_tenant_control_dir(ws_id)).resolve()
+            if is_subpath(resolved_abs, ws_control):
+                return resolved_abs.as_posix()
+        except Exception:
+            pass
+
+    return resolve_sandbox_path(filepath, workspace_id)
 def build_tree_dict(file_paths):
     tree = {}
     for path in file_paths:

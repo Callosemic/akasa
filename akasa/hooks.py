@@ -1,3 +1,6 @@
+import time
+import json
+import traceback
 import threading
 from typing import TypedDict, Optional, List, Dict, Any, Union
 
@@ -77,13 +80,12 @@ class HookRegistry:
         # DI: Trusted host OS namespaces bypass tenant authorization (Tier 2 isolation)
         if any(mod.startswith(ns) for ns in self._trusted_namespaces):
             return True
-
         # Inversion of Control: Determine if the module belongs to an enabled extension
         # by checking if any segment of its import path matches an active extension name.
         ext_name = None
-        from akasa.utils import load_config
+        from akasa.utils import load_config as _load_config, is_core_module as _is_core_module, is_extension_enabled as _is_extension_enabled
         try:
-            enabled_exts = set(load_config(workspace_id).get("extensions", []))
+            enabled_exts = set(_load_config(workspace_id).get("extensions", []))
             for part in mod.split('.'):
                 if part in enabled_exts:
                     ext_name = part
@@ -93,29 +95,26 @@ class HookRegistry:
 
         # Special Guardrail: Extensions are strictly banned from system_boot
         if event_name == 'system_boot':
-            from akasa.utils import is_core_module
             # Graceful fallback: If ext_name didn't resolve, check if the module path belongs to a known core module
-            if ext_name and is_core_module(ext_name):
+            if ext_name and _is_core_module(ext_name):
                 return True
-            if any(is_core_module(p) for p in mod.split('.')):
+            if any(_is_core_module(p) for p in mod.split('.')):
                 return True
             print(f"⚠️ [Event Bus] Banned hook: Non-core extension '{mod}' attempted to subscribe to 'system_boot'. Use 'workspace_boot' instead.")
             return False
 
         # Cross-reference extension engines against the central SSOT
         if ext_name:
-            from akasa.utils import is_extension_enabled
-            return is_extension_enabled(ext_name, workspace_id)
+            return _is_extension_enabled(ext_name, workspace_id)
 
         return True
     def emit(self, event_name, *args, **kwargs):
         """Core OS trigger to broadcast payloads to all subscribed extensions."""
-        import time
-        from akasa.events import sse_bus
+        from akasa.events import sse_bus as _sse_bus
         # Auto-forward high-priority UI signals to the SSE stream
         if event_name in ('topology_resolved',):
             safe_payload = {k: v for k, v in kwargs.items() if isinstance(v, (str, int, float, bool, list, dict))}
-            sse_bus.emit_sse(event_name, safe_payload)
+            _sse_bus.emit_sse(event_name, safe_payload)
 
         # Re-entrancy Guard: Prevent infinite recursion loops on the same thread
         if not hasattr(_event_thread_local, 'active_events'):
@@ -137,10 +136,10 @@ class HookRegistry:
                     workspace_ids.update(mapped_res)
 
             if not workspace_ids:
-                from flask import has_request_context
-                if has_request_context():
-                    from akasa.utils import sniff_tenant_id
-                    workspace_ids.add(sniff_tenant_id())
+                from flask import has_request_context as _has_request_context
+                if _has_request_context():
+                    from akasa.utils import sniff_tenant_id as _sniff_tenant_id
+                    workspace_ids.add(_sniff_tenant_id())
                 else:
                     workspace_ids.add("default")
 
@@ -160,12 +159,10 @@ class HookRegistry:
                         if t1 - t0 > 5.0:
                             print(f"🐌 [Event Bus Telemetry] Hook '{event_name}' -> {cb.__module__}.{cb.__name__} took {t1 - t0:.2f}s")
                     except Exception as e:
-                        import traceback
                         print(f"⚠️ [Event Bus] Error in '{event_name}' callback {cb.__name__}: {e}")
                         try:
                             # Prevent infinite recursion if the system_error hook itself fails
                             if event_name != 'system_error':
-                                import json
                                 safe_payload = {k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v for k, v in kwargs.items()}
                                 self.emit_background('system_error', source=f"Hook:{event_name}:{cb.__name__}", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=json.dumps(safe_payload), workspace_id=wid)
                         except Exception: pass
@@ -186,10 +183,10 @@ class HookRegistry:
                 workspace_ids.update(mapped_res)
 
         if not workspace_ids:
-            from flask import has_request_context
-            if has_request_context():
-                from akasa.utils import sniff_tenant_id
-                workspace_ids.add(sniff_tenant_id())
+            from flask import has_request_context as _has_request_context
+            if _has_request_context():
+                from akasa.utils import sniff_tenant_id as _sniff_tenant_id
+                workspace_ids.add(_sniff_tenant_id())
             else:
                 workspace_ids.add("default")
 
@@ -205,11 +202,9 @@ class HookRegistry:
                     try:
                         cb(*args, **kwargs)
                     except Exception as e:
-                        import traceback
                         print(f"⚠️ [Event Bus] Error in async '{event_name}' callback {cb.__name__}: {e}")
                         try:
                             if event_name != 'system_error':
-                                import json
                                 safe_payload = {k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v for k, v in kwargs.items()}
                                 self.emit_background('system_error', source=f"AsyncHook:{event_name}:{cb.__name__}", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=json.dumps(safe_payload), workspace_id=wid)
                         except Exception: pass

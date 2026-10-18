@@ -2,12 +2,16 @@ from pathlib import Path
 import os
 import time
 import json
+import uuid
+import random
+import inspect
+import traceback
 import threading
 from typing import TypedDict, List, Dict, Any, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor
-from akasa.db import get_connection
+from akasa.db import get_connection, apply_declarative_schema, evict_cached_connection, close_thread_connections, _REGISTERED_SCHEMAS
 from akasa.hooks import hooks
-from akasa.utils import get_workspace_physics
+from akasa.utils import get_workspace_physics, sniff_tenant_id, get_all_workspace_ids, is_extension_enabled
 
 class ChainStepSchema(TypedDict, total=False):
     id: str
@@ -69,17 +73,135 @@ def resolve_dag_chain(ctx, hook_name: str) -> List[Dict[str, Any]]:
         visit(s['id'])
 
     return ordered_steps
-
 _executor = None
 _metronome_thread = None
 _shutdown_event = threading.Event()
+_metronome_wakeup = threading.Condition()
+_active_job_events: Dict[tuple, threading.Event] = {}
+_active_job_lock = threading.Lock()
+_dag_coordinators: Dict[str, Dict[str, Any]] = {}
+_dag_lock = threading.Lock()
 _callbacks = {}
+
+def start_dag_chain(steps: List[Dict[str, Any]], workspace_id: str, on_complete_hook: Optional[str] = None, job_category: str = "system_background", **kwargs) -> Optional[str]:
+    """
+    Parallel-capable DAG Chain Coordinator.
+    Dispatches all root steps concurrently and fans out/in automatically as prerequisites complete.
+    """
+    if not steps:
+        return None
+
+    step_map = {}
+    for idx, s in enumerate(steps):
+        sid = s.get("id") or f"{s['ext_name']}:{s['worker_name']}:{idx}"
+        step_copy = dict(s)
+        step_copy["id"] = sid
+        step_map[sid] = step_copy
+
+    all_ids = set(step_map.keys())
+    deps_map = {}
+    for sid, s in step_map.items():
+        raw_deps = s.get("depends_on") or []
+        valid_deps = {d for d in raw_deps if d in all_ids}
+        deps_map[sid] = valid_deps
+
+    # If no explicit depends_on metadata is provided, fall back to sequential order
+    if all(len(d) == 0 for d in deps_map.values()) and len(steps) > 1:
+        ordered_ids = [s.get("id") or f"{s['ext_name']}:{s['worker_name']}:{i}" for i, s in enumerate(steps)]
+        for i in range(1, len(ordered_ids)):
+            deps_map[ordered_ids[i]] = {ordered_ids[i - 1]}
+
+    root_job_id = f"chn_{uuid.uuid4().hex[:8]}"
+    ready_ids = [sid for sid, d in deps_map.items() if not d]
+    if not ready_ids:
+        ready_ids = [next(iter(step_map.keys()))]
+    pending_ids = set(all_ids) - set(ready_ids)
+
+    ready_job_ids = {
+        sid: (root_job_id if idx == 0 else f"{step_map[sid]['ext_name'][:3].lower()}_{uuid.uuid4().hex[:8]}")
+        for idx, sid in enumerate(ready_ids)
+    }
+
+    base_kwargs = {k: v for k, v in kwargs.items() if k not in ('_chain', '_dag_root_id', '_dag_step_id')}
+    with _dag_lock:
+        _dag_coordinators[root_job_id] = {
+            "workspace_id": workspace_id,
+            "created_at": time.time(),
+            "step_map": step_map,
+            "deps_map": deps_map,
+            "pending": pending_ids,
+            "in_flight": set(ready_ids),
+            "in_flight_jobs": dict(ready_job_ids),
+            "completed": set(),
+            "failed": False,
+            "on_complete_hook": on_complete_hook,
+            "job_category": job_category,
+            "kwargs": base_kwargs,
+            "history": [],
+            "chain_state": dict(kwargs.get("chain_state", {}))
+        }
+
+    def safe_serializer(obj):
+        return str(obj)
+
+    first_dispatched_id = None
+    for sid in ready_ids:
+        step = step_map[sid]
+        jid = ready_job_ids[sid]
+        if first_dispatched_id is None:
+            first_dispatched_id = jid
+        step_kwargs = dict(base_kwargs)
+        step_kwargs["_dag_root_id"] = root_job_id
+        step_kwargs["_dag_step_id"] = sid
+        step_kwargs["root_job_id"] = root_job_id
+        step_kwargs["chain_history"] = []
+        step_kwargs["chain_state"] = dict(kwargs.get("chain_state", {}))
+        args_json = json.dumps(step_kwargs, default=safe_serializer)
+        submit_immediate_job(jid, step["ext_name"], step["worker_name"], args_json, workspace_id=workspace_id, coalesce=False, job_category=job_category)
+
+    return first_dispatched_id
+
+def wait_for_jobs(workspace_id: str, prefix: str = None, job_id: str = None, timeout: float = 10.0) -> bool:
+    """Blocks the calling thread until all matching in-flight immediate jobs complete or timeout elapses."""
+    deadline = time.time() + timeout
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            return False
+        with _active_job_lock:
+            matching_events = [
+                ev for (ws, jid), ev in _active_job_events.items()
+                if ws == workspace_id and ((job_id and jid == job_id) or (prefix and jid.startswith(prefix)))
+            ]
+        if not matching_events:
+            return True
+        if not matching_events[0].wait(timeout=min(remaining, 0.5)):
+            if time.time() >= deadline:
+                return False
+def _merge_state_deltas(target_state: Dict[str, Any], deltas: Dict[str, Any]) -> None:
+    """Merges step state_deltas into the shared pipeline chain_state dictionary."""
+    if not deltas or not isinstance(deltas, dict):
+        return
+    for k, v in deltas.items():
+        if isinstance(v, list):
+            existing = target_state.get(k, [])
+            target_state[k] = list(dict.fromkeys(existing + v)) if isinstance(existing, list) else v
+        elif isinstance(v, dict):
+            existing = target_state.get(k, {})
+            if isinstance(existing, dict):
+                existing.update(v)
+                target_state[k] = existing
+            else:
+                target_state[k] = v
+        else:
+            target_state[k] = v
+
+
 def register_callback(ext_name, callback_name, func):
     """Extensions register their background functions here to be triggered by the Metronome."""
     _callbacks[f"{ext_name}:{callback_name}"] = func
 def _prepare_job_payload(args_json, workspace_id):
     if not workspace_id:
-        from akasa.utils import sniff_tenant_id
         workspace_id = sniff_tenant_id()
     workspace_id = workspace_id or "default"
     _init_worker_schema(workspace_id)
@@ -104,14 +226,14 @@ def submit_job(job_id, ext_name, callback_name, interval_ms, args_json="{}", jit
     """
     if _shutdown_event.is_set():
         return False
-
     workspace_id, conn, now, args_json = _prepare_job_payload(args_json, workspace_id)
     conn.execute("""
-        INSERT OR REPLACE 
-INTO jobs (id, ext_name, callback_name, interval_ms, jitter_ms, next_run_at, status, args_json)
+        INSERT OR REPLACE INTO jobs (id, ext_name, callback_name, interval_ms, jitter_ms, next_run_at, status, args_json)
         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)
     """, (job_id, ext_name, callback_name, interval_ms, jitter_ms, now, args_json))
     conn.commit()
+    with _metronome_wakeup:
+        _metronome_wakeup.notify_all()
 
 
 def submit_one_shot_job(job_id, ext_name, callback_name, delay_ms, args_json="{}", workspace_id=None):
@@ -132,10 +254,11 @@ def submit_one_shot_job(job_id, ext_name, callback_name, delay_ms, args_json="{}
         VALUES (?, ?, ?, 0, 0, ?, 'pending', ?)
     """, (job_id, ext_name, callback_name, next_run, args_json))
     conn.commit()
+    with _metronome_wakeup:
+        _metronome_wakeup.notify_all()
 def cancel_job(job_id, workspace_id=None):
     """Cancels and removes a scheduled background job from the Metronome ledger."""
     if not workspace_id:
-        from akasa.utils import sniff_tenant_id
         workspace_id = sniff_tenant_id()
     workspace_id = workspace_id or "default"
     conn = get_connection("workers", workspace_id=workspace_id)
@@ -145,8 +268,7 @@ def cancel_job(job_id, workspace_id=None):
 def pause_job(job_id, workspace_id=None):
     """Freezes a scheduled job in the Metronome ledger without deleting its record."""
     if not workspace_id:
-        from akasa.utils import sniff_tenant_id as _sniff_tenant_id
-        workspace_id = _sniff_tenant_id()
+        workspace_id = sniff_tenant_id()
     workspace_id = workspace_id or "default"
 
     conn = get_connection("workers", workspace_id=workspace_id)
@@ -157,8 +279,7 @@ def pause_job(job_id, workspace_id=None):
 def resume_job(job_id, workspace_id=None, reset_timer=True):
     """Restores a paused job to pending status, optionally recalculating next_run_at."""
     if not workspace_id:
-        from akasa.utils import sniff_tenant_id as _sniff_tenant_id
-        workspace_id = _sniff_tenant_id()
+        workspace_id = sniff_tenant_id()
     workspace_id = workspace_id or "default"
 
     conn = get_connection("workers", workspace_id=workspace_id)
@@ -182,8 +303,14 @@ def submit_immediate_job(job_id, ext_name, callback_name, args_json="{}", worksp
         return False
 
     workspace_id, conn, now, args_json = _prepare_job_payload(args_json, workspace_id)
-
-    if coalesce:
+    if coalesce == "args":
+        existing = conn.execute(
+            "SELECT id FROM immediate_jobs WHERE ext_name=? AND callback_name=? AND status IN ('pending', 'processing') AND args_json=?",
+            (ext_name, callback_name, args_json)
+        ).fetchone()
+        if existing:
+            return existing['id']
+    elif coalesce:
         existing = conn.execute(
             "SELECT id FROM immediate_jobs WHERE ext_name=? AND callback_name=? AND status IN ('pending', 'processing')",
             (ext_name, callback_name)
@@ -201,16 +328,23 @@ def submit_immediate_job(job_id, ext_name, callback_name, args_json="{}", worksp
             initial_artifact['root_job_id'] = parsed_args['root_job_id']
     except Exception:
         pass
-
     conn.execute("""
         INSERT OR REPLACE INTO immediate_jobs (id, ext_name, callback_name, status, status_message, artifact_json, created_at, updated_at, args_json, job_category)
         VALUES (?, ?, ?, 'processing', 'Initializing...', ?, ?, ?, ?, ?)
     """, (job_id, ext_name, callback_name, json.dumps(initial_artifact), now, now, args_json, job_category))
     conn.commit()
+    with _active_job_lock:
+        _active_job_events[(workspace_id, job_id)] = threading.Event()
     if not _shutdown_event.is_set():
+        if _executor is None:
+            start_workers()
         try:
             _executor.submit(_execute_immediate_job, job_id, ext_name, callback_name, args_json, workspace_id)
         except RuntimeError as e:
+            with _active_job_lock:
+                ev = _active_job_events.pop((workspace_id, job_id), None)
+                if ev:
+                    ev.set()
             if "shutdown" not in str(e).lower():
                 raise
     return job_id
@@ -242,16 +376,17 @@ def update_immediate_job_status(job_id, status, message=None, artifact=None, wor
     query = f"UPDATE immediate_jobs SET {', '.join(updates)} WHERE id=?"
     conn.execute(query, tuple(params))
     try:
-        job_row = conn.execute("SELECT ext_name, artifact_json, job_category FROM immediate_jobs WHERE id=?", (job_id,)).fetchone()
+        if artifact is not None:
+            job_row = conn.execute("SELECT ext_name, job_category FROM immediate_jobs WHERE id=?", (job_id,)).fetchone()
+        else:
+            job_row = conn.execute("SELECT ext_name, artifact_json, job_category FROM immediate_jobs WHERE id=?", (job_id,)).fetchone()
+            if job_row and job_row['artifact_json']:
+                try:
+                    artifact = json.loads(job_row['artifact_json'])
+                except Exception:
+                    artifact = {}
         ext_name = job_row['ext_name'] if job_row else ''
         job_category = job_row['job_category'] if job_row and 'job_category' in job_row.keys() else 'system_background'
-
-        # Hydrate missing artifact payloads from the DB so SSE broadcasts retain chain_history
-        if artifact is None and job_row and job_row['artifact_json']:
-            try:
-                artifact = json.loads(job_row['artifact_json'])
-            except Exception:
-                artifact = {}
     except Exception:
         ext_name = ''
         job_category = 'system_background'
@@ -259,22 +394,22 @@ def update_immediate_job_status(job_id, status, message=None, artifact=None, wor
     conn.commit()
 
     try:
-        from akasa.events import sse_bus
-        from akasa.sync import get_system_deltas
+        from akasa.events import sse_bus as _sse_bus
+        from akasa.sync import get_active_pipeline_modules as _get_active_pipeline_modules
 
-        # Calculate SSOT system state to keep UI dumb
-        deltas = get_system_deltas(workspace_id=workspace_id)
+        pipeline_state = _get_active_pipeline_modules(workspace_id=workspace_id)
 
-        sse_bus.emit_sse('job_progress', {
+        _sse_bus.emit_sse('job_progress', {
             "id": job_id,
+            "job_id": job_id,
             "ext_name": ext_name,
             "job_category": job_category,
             "status": status,
             "message": message,
             "artifact": artifact or {},
             "workspace_id": workspace_id,
-            "active_modules": deltas.get("active_modules", []),
-            "pending_modules": deltas.get("pending_modules", [])
+            "active_modules": pipeline_state.get("active_modules", []),
+            "pending_modules": pipeline_state.get("pending_modules", [])
         })
     except Exception:
         pass
@@ -295,14 +430,18 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
     root_job_id = kwargs.get('root_job_id') or job_id
     history = list(kwargs.get('chain_history', []))
     chain_data = kwargs.pop('_chain', None)
+    dag_root_id = kwargs.pop('_dag_root_id', None)
+    dag_step_id = kwargs.pop('_dag_step_id', None)
     chain_state = dict(kwargs.get('chain_state', {}))
     step_error = None
     step_msg = None
     step_artifact = {}
 
-    if func:
+    if not is_extension_enabled(ext_name, target_ws):
+        step_error = f"Extension '{ext_name}' is disabled in workspace '{target_ws}'."
+        print(f"⚠️ [Worker] {step_error}")
+    elif func:
         try:
-            import inspect
             sig = inspect.signature(func)
             if 'workspace_id' in sig.parameters:
                 kwargs['workspace_id'] = target_ws
@@ -319,12 +458,10 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
                 if 'next_kwargs' in result:
                     kwargs.update(result['next_kwargs'])
         except Exception as e:
-            import traceback
             err_trace = traceback.format_exc()
             print(f"❌ [Worker] Immediate Job {job_id} failed on workspace [{target_ws}]:\n{err_trace}")
             step_error = str(e)
             try:
-                from akasa.hooks import hooks
                 # args_json might not be valid JSON if it failed parsing
                 safe_payload = args_json if (args_json and args_json.strip().startswith('{')) else json.dumps({"raw_args": str(args_json)})
                 hooks.emit_background('system_error', source=f"Worker:{ext_name}:{callback_name}", error_type=type(e).__name__, message=str(e), traceback=err_trace, payload=safe_payload, workspace_id=target_ws)
@@ -339,10 +476,82 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
         "status": "failed" if step_error else "completed",
         "message": step_error or step_msg or "Step complete."
     })
-
-    # --- STEP CHAINING LOGIC (ADR 0037 - Resilient Handoff) ---
+    # --- STEP CHAINING LOGIC (ADR 0037 & Parallel DAG Fan-Out/Fan-In) ---
     next_job_id = None
-    if chain_data and chain_data.get('steps') and not step_error:
+    if dag_root_id and dag_step_id:
+        to_dispatch = []
+        should_fire_complete = False
+        complete_hook = None
+        job_cat = 'system_background'
+        with _dag_lock:
+            coord = _dag_coordinators.get(dag_root_id)
+            if coord:
+                coord["in_flight"].discard(dag_step_id)
+                coord.get("in_flight_jobs", {}).pop(dag_step_id, None)
+                coord["history"].append({
+                    "ext_name": ext_name,
+                    "job_id": job_id,
+                    "status": "failed" if step_error else "completed",
+                    "message": step_error or step_msg or "Step complete."
+                })
+                history = list(coord["history"])
+                job_cat = coord.get("job_category", "system_background")
+                if step_error:
+                    coord["failed"] = True
+                    coord["error_message"] = step_error
+                    coord["pending"].clear()
+                elif coord.get("failed"):
+                    coord["pending"].clear()
+                else:
+                    coord["completed"].add(dag_step_id)
+                    if step_artifact and 'state_deltas' in step_artifact:
+                        _merge_state_deltas(coord["chain_state"], step_artifact['state_deltas'])
+
+                    for k, v in kwargs.items():
+                        if k not in ('job_id', 'workspace_id', 'root_job_id', 'chain_history', 'chain_state'):
+                            coord["kwargs"][k] = v
+
+                    newly_ready = [
+                        pid for pid in list(coord["pending"])
+                        if coord["deps_map"].get(pid, set()).issubset(coord["completed"])
+                    ]
+                    for pid in newly_ready:
+                        coord["pending"].remove(pid)
+                        coord["in_flight"].add(pid)
+                        step_def = coord["step_map"][pid]
+                        jid = f"{step_def['ext_name'][:3].lower()}_{uuid.uuid4().hex[:8]}"
+                        coord.setdefault("in_flight_jobs", {})[pid] = jid
+                        step_kw = dict(coord["kwargs"])
+                        step_kw["_dag_root_id"] = dag_root_id
+                        step_kw["_dag_step_id"] = pid
+                        step_kw["root_job_id"] = dag_root_id
+                        step_kw["chain_history"] = list(coord["history"])
+                        step_kw["chain_state"] = dict(coord["chain_state"])
+                        to_dispatch.append((jid, step_def, step_kw))
+                if to_dispatch:
+                    next_job_id = to_dispatch[0][0]
+                elif coord["in_flight"]:
+                    # Sibling branch is still running; hand baton to the active sibling job ID
+                    active_sibling_ids = list(coord.get("in_flight_jobs", {}).values())
+                    next_job_id = active_sibling_ids[0] if active_sibling_ids else dag_root_id
+                else:
+                    if not coord["failed"] and coord.get("on_complete_hook"):
+                        should_fire_complete = True
+                        complete_hook = coord["on_complete_hook"]
+                    _dag_coordinators.pop(dag_root_id, None)
+
+        def safe_serializer(obj):
+            return str(obj)
+
+        for jid, step_def, step_kw in to_dispatch:
+            next_args_json = json.dumps(step_kw, default=safe_serializer)
+            submit_immediate_job(jid, step_def['ext_name'], step_def['worker_name'], next_args_json, workspace_id=target_ws, job_category=job_cat)
+            hooks.emit_background('job_baton_passed', workspace_id=target_ws, root_job_id=dag_root_id, previous_job_id=job_id, next_job_id=jid, ext_name=step_def['ext_name'])
+
+        if should_fire_complete and complete_hook:
+            hooks.emit_background(complete_hook, workspace_id=target_ws)
+
+    elif chain_data and chain_data.get('steps') and not step_error:
         next_step = chain_data['steps'][0]
         remaining_steps = chain_data['steps'][1:]
 
@@ -352,34 +561,17 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
         }
         # Generic State Reducer: Accumulates and merges pipeline states automatically
         if step_artifact and 'state_deltas' in step_artifact:
-            for k, v in step_artifact['state_deltas'].items():
-                if isinstance(v, list):
-                    existing = chain_state.get(k, [])
-                    if isinstance(existing, list):
-                        chain_state[k] = list(dict.fromkeys(existing + v))
-                    else:
-                        chain_state[k] = v
-                elif isinstance(v, dict):
-                    existing = chain_state.get(k, {})
-                    if isinstance(existing, dict):
-                        existing.update(v)
-                        chain_state[k] = existing
-                    else:
-                        chain_state[k] = v
-                else:
-                    chain_state[k] = v
+            _merge_state_deltas(chain_state, step_artifact['state_deltas'])
 
         next_kwargs = {k: v for k, v in kwargs.items() if k not in ('job_id', 'workspace_id', 'root_job_id', 'chain_history', 'chain_state')}
         next_kwargs['_chain'] = next_chain
         next_kwargs['root_job_id'] = root_job_id
         next_kwargs['chain_history'] = history
         next_kwargs['chain_state'] = chain_state
-
         # Serialize safely, stringifying any non-serializable objects injected by previous steps
         def safe_serializer(obj):
             return str(obj)
         next_args_json = json.dumps(next_kwargs, default=safe_serializer)
-        import uuid
         prefix = next_step['ext_name'][:3].lower()
         next_job_id = f"{prefix}_{uuid.uuid4().hex[:8]}"
 
@@ -392,11 +584,9 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
 
         submit_immediate_job(next_job_id, next_step['ext_name'], next_step['worker_name'], next_args_json, workspace_id=target_ws, job_category=job_cat)
 
-        from akasa.hooks import hooks
         hooks.emit_background('job_baton_passed', workspace_id=target_ws, root_job_id=root_job_id, previous_job_id=job_id, next_job_id=next_job_id, ext_name=next_step['ext_name'])
 
     elif chain_data and chain_data.get('on_complete_hook') and not step_error:
-        from akasa.hooks import hooks
         hooks.emit_background(chain_data['on_complete_hook'], workspace_id=target_ws)
     # Final completion/failure evaluation for current step
     conn = get_connection("workers", workspace_id=target_ws)
@@ -419,16 +609,19 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
         artifact['chain_history'] = history
         if next_job_id:
             artifact['next_job_id'] = next_job_id
-
         msg = step_msg or current['status_message']
         if step_error:
             update_immediate_job_status(job_id, 'failed', f"Error: {step_error}", artifact, target_ws)
         else:
             update_immediate_job_status(job_id, 'completed', msg, artifact, target_ws)
+    with _active_job_lock:
+        ev = _active_job_events.pop((target_ws, job_id), None)
+        if ev:
+            ev.set()
+    close_thread_connections()
 def register_ephemeral_artifact(filepath, owner, ttl_seconds, workspace_id="default"):
     conn = get_connection("workers", workspace_id=workspace_id)
     now = time.time()
-    import uuid
     art_id = str(uuid.uuid4())
     conn.execute(
         "INSERT INTO ephemeral_artifacts (id, filepath, module_owner, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
@@ -444,24 +637,29 @@ def sweep_ephemeral_artifacts(workspace_id="default"):
     cursor = conn.execute("SELECT id, filepath FROM ephemeral_artifacts WHERE expires_at < ?", (now,))
     for row in cursor.fetchall():
         try:
-            from akasa.vfs import execute_vfs_delete
+            from akasa.vfs import execute_vfs_delete as _execute_vfs_delete
             if os.path.exists(row['filepath']):
-                execute_vfs_delete(workspace_id, row['filepath'])
+                _execute_vfs_delete(workspace_id, row['filepath'])
             conn.execute("DELETE FROM ephemeral_artifacts WHERE id=?", (row['id'],))
         except Exception as e:
             print(f"⚠️ Failed to garbage collect ephemeral artifact {row['filepath']}: {e}")
-    # 2. Sweep Old Immediate Jobs (> 24 hours)
+    # 2. Sweep Old Immediate Jobs, VFS Event Logs (> 24 hours), & Orphaned DAG Coordinators (> 1 hour)
     cutoff = now - 86400
     conn.execute("DELETE FROM immediate_jobs WHERE updated_at < ? AND status IN ('completed', 'failed')", (cutoff,))
+    conn.execute("DELETE FROM vfs_event_log WHERE timestamp < ?", (cutoff,))
     conn.commit()
+    with _dag_lock:
+        stale_dags = [k for k, v in _dag_coordinators.items() if now - v.get("created_at", now) > 3600]
+        for k in stale_dags:
+            _dag_coordinators.pop(k, None)
 
     # 3. Sweep Old Database Corruption Dumps (> 7 days)
     try:
         cfg_path, _ = get_workspace_physics(workspace_id)
-        ext_base = Path(cfg_path).parent.joinpath("ext")
-        if ext_base.exists() and ext_base.is_dir():
+        db_base = Path(cfg_path).parent.joinpath("cache", "db")
+        if db_base.exists() and db_base.is_dir():
             seven_days_ago = now - (7 * 86400)
-            for corrupt_file in ext_base.rglob("*.db.corrupt_*"):
+            for corrupt_file in db_base.rglob("*.db.corrupt_*"):
                 if corrupt_file.is_file() and corrupt_file.stat().st_mtime < seven_days_ago:
                     os.remove(corrupt_file.as_posix())
     except Exception as e:
@@ -479,18 +677,24 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
             target_ws = kwargs.pop("_workspace_id")
     except Exception:
         kwargs = {}
+    if not is_extension_enabled(ext_name, target_ws):
+        print(f"⚠️ [Worker] Extension '{ext_name}' is disabled in workspace '{target_ws}'. Dropping recurring job '{job_id}'.")
+        conn = get_connection("workers", workspace_id=target_ws)
+        conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+        conn.commit()
+        close_thread_connections()
+        return
     if func:
         try:
-            import inspect
             sig = inspect.signature(func)
             if 'workspace_id' in sig.parameters:
                 kwargs['workspace_id'] = target_ws
+            if 'job_id' in sig.parameters and 'job_id' not in kwargs:
+                kwargs['job_id'] = job_id
             func(**kwargs)
         except Exception as e:
-            import traceback
             print(f"❌ [Worker] Job {job_id} failed on workspace context [{target_ws}]: {e}")
             try:
-                from akasa.hooks import hooks
                 safe_payload = args_json if (args_json and args_json.strip().startswith('{')) else json.dumps({"raw_args": str(args_json)})
                 hooks.emit_background('system_error', source=f"Cron:{ext_name}:{callback_name}", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=safe_payload, workspace_id=target_ws)
             except Exception: pass
@@ -500,7 +704,6 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
 
     if not _shutdown_event.is_set():
         try:
-            import random
             actual_interval = interval_ms
             if jitter_ms and jitter_ms > 0:
                 actual_interval += random.randint(-jitter_ms, jitter_ms)
@@ -513,24 +716,13 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
             conn.commit()
         except Exception:
             pass
+    close_thread_connections()
 def _metronome_loop():
-    """The unified Event Loop dispatcher supporting dynamic multi-tenancy."""
-    from akasa.utils import _cwd, load_json_config
-    control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
+    """The unified Event Loop dispatcher supporting dynamic multi-tenancy with condition-variable sleep."""
     while not _shutdown_event.is_set():
+        next_wake_delay = 5.0
         try:
-            index_path = Path(_cwd).joinpath(control_dir_name, "system.json").as_posix()
-            workspace_ids = ["default"]
-
-            if os.path.exists(index_path):
-                try:
-                    w_data = load_json_config(index_path, {})
-
-                    workspace_ids = list(w_data.get("workspaces", {}).keys())
-                    if "default" not in workspace_ids:
-                        workspace_ids.append("default")
-                except Exception:
-                    pass
+            workspace_ids = get_all_workspace_ids()
             now = time.time()
             for ws_id in workspace_ids:
                 try:
@@ -545,153 +737,104 @@ def _metronome_loop():
 
                         jitter = row['jitter_ms'] if 'jitter_ms' in row.keys() else 0
                         _executor.submit(_execute_job, row['id'], row['ext_name'], row['callback_name'], row['interval_ms'], jitter, row['args_json'], ws_id)
+
+                    next_row = conn.execute("SELECT MIN(next_run_at) as min_ts FROM jobs WHERE status='pending'").fetchone()
+                    if next_row and next_row['min_ts'] is not None:
+                        wait_sec = max(0.05, next_row['min_ts'] - time.time())
+                        next_wake_delay = min(next_wake_delay, wait_sec)
                 except Exception as e:
-                    import traceback
                     try:
                         if "malformed" in str(e).lower() or "corrupt" in str(e).lower():
-                            from akasa.db import _local
-                            cache_key = (ws_id, "workers")
-                            if hasattr(_local, 'connections') and cache_key in _local.connections:
-                                try: _local.connections[cache_key].close()
-                                except Exception: pass
-                                del _local.connections[cache_key]
-                        from akasa.hooks import hooks
+                            evict_cached_connection(ws_id, "workers")
                         hooks.emit_background('system_error', source="Metronome:InnerLoop", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=json.dumps({"workspace": ws_id}), workspace_id=ws_id)
                     except Exception: pass
         except Exception as e:
-            import traceback
             try:
-                from akasa.hooks import hooks
                 hooks.emit_background('system_error', source="Metronome:OuterLoop", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=json.dumps({}), workspace_id="default")
             except Exception: pass
-        time.sleep(1.0) # Tick pace
+
+        with _metronome_wakeup:
+            if not _shutdown_event.is_set():
+                _metronome_wakeup.wait(timeout=next_wake_delay)
 
 _INITIALIZED_WORKSPACES = set()
 _SCHEMA_INIT_LOCK = threading.Lock()
 
-def _init_worker_schema(workspace_id="default"):
-        global _INITIALIZED_WORKSPACES
+@hooks.on('workspace_shutdown')
+def _evict_initialized_workspace(workspace_id=None, **kwargs):
+    if workspace_id:
         with _SCHEMA_INIT_LOCK:
-            if workspace_id in _INITIALIZED_WORKSPACES:
-                    return
+            _INITIALIZED_WORKSPACES.discard(workspace_id)
+def _init_worker_schema(workspace_id="default"):
+    global _INITIALIZED_WORKSPACES
+    with _SCHEMA_INIT_LOCK:
+        if workspace_id in _INITIALIZED_WORKSPACES:
+            return
 
-            conn = get_connection("workers", workspace_id=workspace_id)
-            conn.execute("""
-                    CREATE TABLE IF NOT EXISTS jobs (
-                            id TEXT PRIMARY KEY,
-                            ext_name TEXT,
-                            callback_name TEXT,
-                            interval_ms INTEGER,
-                            jitter_ms INTEGER DEFAULT 0,
-                            next_run_at REAL,
-                            status TEXT,
-                            args_json TEXT
-                    )
-            """)
-            conn.execute("""
-                    CREATE TABLE IF NOT EXISTS ephemeral_artifacts (
-                            id TEXT PRIMARY KEY,
-                            filepath TEXT,
-                            module_owner TEXT,
-                            created_at REAL,
-                            expires_at REAL
-                    )
-            """)
-            conn.execute("""
-                    CREATE TABLE IF NOT EXISTS immediate_jobs (
-                            id TEXT PRIMARY KEY,
-                            ext_name TEXT,
-                            callback_name TEXT,
-                            status TEXT,
-                            status_message TEXT,
-                            artifact_json TEXT,
-                            meta_json TEXT,
-                            created_at REAL,
-                            updated_at REAL,
-                            args_json TEXT,
-                            job_category TEXT DEFAULT 'system_background'
-                    )
-            """)
-            try:
-                    conn.execute("ALTER TABLE immediate_jobs ADD COLUMN job_category TEXT DEFAULT 'system_background'")
-                    conn.commit()
-            except Exception:
-                    pass
-            try:
-                    conn.execute("ALTER TABLE jobs ADD COLUMN jitter_ms INTEGER DEFAULT 0")
-                    conn.execute("ALTER TABLE immediate_jobs ADD COLUMN meta_json TEXT")
-                    conn.commit()
-            except Exception:
-                    pass
+        if 'workers' in _REGISTERED_SCHEMAS:
+            apply_declarative_schema('workers', _REGISTERED_SCHEMAS['workers'], workspace_id)
 
+        conn = get_connection("workers", workspace_id=workspace_id)
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_vfs_event_log_ts ON vfs_event_log(timestamp)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_immediate_jobs_status ON immediate_jobs(status)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
+            conn.commit()
+        except Exception:
+            pass
+
+        # SQLite Boot Concurrency Guardrail
+        for _ in range(5):
             try:
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_vfs_event_log_ts ON vfs_event_log(timestamp)")
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_immediate_jobs_status ON immediate_jobs(status)")
-                    conn.execute("CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status)")
-                    conn.commit()
-            except Exception:
-                    pass
-            
-            # SQLite Boot Concurrency Guardrail
-            for _ in range(5):
-                try:
-                    conn.execute("UPDATE jobs SET status='pending' WHERE status='running'")
-                    conn.execute("""
-                            INSERT OR REPLACE INTO jobs (id, ext_name, callback_name, interval_ms, jitter_ms, next_run_at, status, args_json)
-                            VALUES ('sys_garbage_collector', 'workers', 'sweep_ephemeral_artifacts', 300000, 10000, 0, 'pending', '{}')
-                    """)
-                    conn.commit()
+                conn.execute("UPDATE jobs SET status='pending' WHERE status='running'")
+                conn.execute("""
+                    INSERT OR REPLACE INTO jobs (id, ext_name, callback_name, interval_ms, jitter_ms, next_run_at, status, args_json)
+                    VALUES ('sys_garbage_collector', 'workers', 'sweep_ephemeral_artifacts', 300000, 10000, 0, 'pending', '{}')
+                """)
+                conn.commit()
+                break
+            except Exception as e:
+                if "locked" in str(e).lower():
+                    time.sleep(0.2)
+                else:
                     break
-                except Exception as e:
-                    if "locked" in str(e).lower():
-                        time.sleep(0.2)
-                    else:
-                        break
 
-            _INITIALIZED_WORKSPACES.add(workspace_id)
+        _INITIALIZED_WORKSPACES.add(workspace_id)
 @hooks.on('system_boot', priority=10)
 def start_workers(**kwargs):
-        global _executor, _metronome_thread
+    global _executor, _metronome_thread
+    if _executor is not None and _metronome_thread is not None and _metronome_thread.is_alive():
+        return
+    if _executor is None:
         _executor = ThreadPoolExecutor(max_workers=20)
-        from akasa.utils import _cwd, load_json_config
-        import os
-        control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
-        index_path = Path(_cwd).joinpath(control_dir_name, "system.json").as_posix()
-        workspace_ids = ["default"]
-        if os.path.exists(index_path):
-                try:
-                        w_data = load_json_config(index_path, {})
-                        workspace_ids = list(w_data.get("workspaces", {}).keys())
-                        if "default" not in workspace_ids:
-                                workspace_ids.append("default")
-                except Exception:
-                        pass
-        for ws_id in workspace_ids:
-                _init_worker_schema(ws_id)
-                # Clean up ghost jobs strictly once during the OS boot sequence
-                conn = get_connection("workers", workspace_id=ws_id)
-                for _ in range(5):
-                    try:
-                        conn.execute("UPDATE immediate_jobs SET status='failed', status_message='Interrupted by system reboot.' WHERE status IN ('pending', 'processing')")
-                        conn.commit()
-                        break
-                    except Exception as e:
-                        if "locked" in str(e).lower():
-                            time.sleep(0.2)
-                        else:
-                            break
-        _shutdown_event.clear()
-        _metronome_thread = threading.Thread(target=_metronome_loop, daemon=True)
-        _metronome_thread.start()
-        print("⚙️  Stateless Worker Metronome Online.")
-
+    for ws_id in get_all_workspace_ids():
+        _init_worker_schema(ws_id)
+        # Clean up ghost jobs strictly once during the OS boot sequence
+        conn = get_connection("workers", workspace_id=ws_id)
+        for _ in range(5):
+            try:
+                conn.execute("UPDATE immediate_jobs SET status='failed', status_message='Interrupted by system reboot.' WHERE status IN ('pending', 'processing')")
+                conn.commit()
+                break
+            except Exception as e:
+                if "locked" in str(e).lower():
+                    time.sleep(0.2)
+                else:
+                    break
+    _shutdown_event.clear()
+    _metronome_thread = threading.Thread(target=_metronome_loop, daemon=True)
+    _metronome_thread.start()
+    print("⚙️  Stateless Worker Metronome Online.")
 @hooks.on('system_shutdown')
 def stop_workers(**kwargs):
     global _executor
     print("🛑 Suspending Worker Metronome...")
     _shutdown_event.set()
+    with _metronome_wakeup:
+        _metronome_wakeup.notify_all()
     if _executor:
         _executor.shutdown(wait=False)
+        _executor = None
 
     try:
         conn = get_connection("workers")
