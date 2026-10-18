@@ -104,8 +104,19 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                             node.lineno, 
                             "Native file write detected outside vfs.py. Route through VFS async queue."
                         )
-
         if isinstance(node.func, ast.Attribute):
+            if node.func.attr == 'startswith' and self.filename not in ('rules_python.py', 'hooks.py'):
+                # Flag string startswith on path-like variables in kernel modules
+                if isinstance(node.func.value, (ast.Call, ast.Name)):
+                    val_repr = ast.unparse(node.func.value).lower()
+                    if any(term in val_repr for term in ('path', 'resolved', 'dir', 'root', 'target')):
+                        report_violation(
+                            "SUBPATH_SAFETY_MANDATE",
+                            self.filepath,
+                            node.lineno,
+                            f"Path prefix comparison '{val_repr}.startswith()' detected. Use is_subpath() to prevent traversal collisions."
+                        )
+
             if node.func.attr in ('remove', 'rmdir', 'unlink', 'write_text', 'write_bytes') and self.filename not in VFS_WRITE_WHITELIST:
                 report_violation(
                     "ASYNC_VFS_PIPELINE_COMPLIANCE", 
