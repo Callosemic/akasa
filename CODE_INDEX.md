@@ -32,7 +32,8 @@ akasa/
 │       ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
 │       ├── 0003_openapi_reflection_dag_orchestration_and_error_hooks.md # ADR 0003 specification
 │       ├── 0004_vfs_bulk_mutation_batching_and_atomic_consolidation.md # ADR 0004 specification
-│       └── 0005_parallel_dag_orchestration_vfs_ram_caching_and_inter_workspace_routing.md # ADR 0005 specification
+│       ├── 0005_parallel_dag_orchestration_vfs_ram_caching_and_inter_workspace_routing.md # ADR 0005 specification
+│       └── 0006_resource_governance_bounded_executors_and_secret_lifecycle.md # ADR 0006 specification
 ├── pyproject.toml                  # Build system specification and dependencies
 └── tests/                          # Architectural fitness tests and AST validators
     ├── fitness/                    # Fitness rule package directory
