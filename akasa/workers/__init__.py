@@ -11,7 +11,7 @@ from typing import TypedDict, List, Dict, Any, Optional, Literal
 from concurrent.futures import ThreadPoolExecutor
 from akasa.db import get_connection, apply_declarative_schema, evict_cached_connection, close_thread_connections, _REGISTERED_SCHEMAS
 from akasa.hooks import hooks
-from akasa.utils import get_workspace_physics, sniff_tenant_id, get_all_workspace_ids, is_extension_enabled
+from akasa.utils import get_workspace_physics, sniff_tenant_id, get_all_workspace_ids, is_extension_enabled, reclaim_process_memory
 
 class ChainStepSchema(TypedDict, total=False):
     id: str
@@ -74,6 +74,7 @@ def resolve_dag_chain(ctx, hook_name: str) -> List[Dict[str, Any]]:
 
     return ordered_steps
 _executor = None
+_io_executor = None
 _metronome_thread = None
 _shutdown_event = threading.Event()
 _metronome_wakeup = threading.Condition()
@@ -160,6 +161,30 @@ def start_dag_chain(steps: List[Dict[str, Any]], workspace_id: str, on_complete_
         submit_immediate_job(jid, step["ext_name"], step["worker_name"], args_json, workspace_id=workspace_id, coalesce=False, job_category=job_category)
 
     return first_dispatched_id
+
+def run_parallel(fn, items, max_workers: int = 4) -> list:
+    """
+    Executes `fn(item)` across `items` using the shared bounded Akasa I/O ThreadPoolExecutor
+    and deterministically closes thread-local SQLite connections on each worker thread.
+    """
+    global _io_executor
+    items_list = list(items or [])
+    if not items_list:
+        return []
+    if len(items_list) == 1:
+        return [fn(items_list[0])]
+    if _io_executor is None:
+        _io_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="Akasa-IO")
+
+    def _safe_worker(item):
+        try:
+            return fn(item)
+        finally:
+            close_thread_connections()
+
+    futures = [_io_executor.submit(_safe_worker, item) for item in items_list]
+    return [f.result() for f in futures]
+
 
 def wait_for_jobs(workspace_id: str, prefix: str = None, job_id: str = None, timeout: float = 10.0) -> bool:
     """Blocks the calling thread until all matching in-flight immediate jobs complete or timeout elapses."""
@@ -547,9 +572,9 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
             next_args_json = json.dumps(step_kw, default=safe_serializer)
             submit_immediate_job(jid, step_def['ext_name'], step_def['worker_name'], next_args_json, workspace_id=target_ws, job_category=job_cat)
             hooks.emit_background('job_baton_passed', workspace_id=target_ws, root_job_id=dag_root_id, previous_job_id=job_id, next_job_id=jid, ext_name=step_def['ext_name'])
-
         if should_fire_complete and complete_hook:
             hooks.emit_background(complete_hook, workspace_id=target_ws)
+            reclaim_process_memory()
 
     elif chain_data and chain_data.get('steps') and not step_error:
         next_step = chain_data['steps'][0]
@@ -585,9 +610,9 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
         submit_immediate_job(next_job_id, next_step['ext_name'], next_step['worker_name'], next_args_json, workspace_id=target_ws, job_category=job_cat)
 
         hooks.emit_background('job_baton_passed', workspace_id=target_ws, root_job_id=root_job_id, previous_job_id=job_id, next_job_id=next_job_id, ext_name=next_step['ext_name'])
-
     elif chain_data and chain_data.get('on_complete_hook') and not step_error:
         hooks.emit_background(chain_data['on_complete_hook'], workspace_id=target_ws)
+        reclaim_process_memory()
     # Final completion/failure evaluation for current step
     conn = get_connection("workers", workspace_id=target_ws)
     current = conn.execute("SELECT status, artifact_json, status_message FROM immediate_jobs WHERE id=?", (job_id,)).fetchone()
@@ -665,6 +690,8 @@ def sweep_ephemeral_artifacts(workspace_id="default"):
     except Exception as e:
         print(f"⚠️ Failed to garbage collect old corrupt database dumps: {e}")
 
+    reclaim_process_memory()
+
 register_callback("workers", "sweep_ephemeral_artifacts", sweep_ephemeral_artifacts)
 
 def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_json, fallback_ws="default"):
@@ -725,6 +752,8 @@ def _metronome_loop():
             workspace_ids = get_all_workspace_ids()
             now = time.time()
             for ws_id in workspace_ids:
+                if _shutdown_event.is_set():
+                    break
                 try:
                     # JIT initialization: instantly prep schemas for newly mounted workspaces
                     _init_worker_schema(ws_id)
@@ -732,17 +761,29 @@ def _metronome_loop():
                     cursor = conn.execute("SELECT * FROM jobs WHERE status='pending' AND next_run_at <= ?", (now,))
                     ready_jobs = cursor.fetchall()
                     for row in ready_jobs:
+                        executor = _executor
+                        if _shutdown_event.is_set() or executor is None:
+                            break
                         conn.execute("UPDATE jobs SET status='running' WHERE id=?", (row['id'],))
                         conn.commit()
 
                         jitter = row['jitter_ms'] if 'jitter_ms' in row.keys() else 0
-                        _executor.submit(_execute_job, row['id'], row['ext_name'], row['callback_name'], row['interval_ms'], jitter, row['args_json'], ws_id)
+                        try:
+                            executor.submit(_execute_job, row['id'], row['ext_name'], row['callback_name'], row['interval_ms'], jitter, row['args_json'], ws_id)
+                        except RuntimeError as sub_err:
+                            if "shutdown" in str(sub_err).lower():
+                                conn.execute("UPDATE jobs SET status='pending' WHERE id=?", (row['id'],))
+                                conn.commit()
+                                break
+                            raise
 
                     next_row = conn.execute("SELECT MIN(next_run_at) as min_ts FROM jobs WHERE status='pending'").fetchone()
                     if next_row and next_row['min_ts'] is not None:
                         wait_sec = max(0.05, next_row['min_ts'] - time.time())
                         next_wake_delay = min(next_wake_delay, wait_sec)
                 except Exception as e:
+                    if _shutdown_event.is_set() or "cannot schedule new futures after shutdown" in str(e).lower():
+                        break
                     try:
                         if "malformed" in str(e).lower() or "corrupt" in str(e).lower():
                             evict_cached_connection(ws_id, "workers")
@@ -806,7 +847,7 @@ def start_workers(**kwargs):
     if _executor is not None and _metronome_thread is not None and _metronome_thread.is_alive():
         return
     if _executor is None:
-        _executor = ThreadPoolExecutor(max_workers=20)
+        _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="Akasa-Worker")
     for ws_id in get_all_workspace_ids():
         _init_worker_schema(ws_id)
         # Clean up ghost jobs strictly once during the OS boot sequence
@@ -827,7 +868,7 @@ def start_workers(**kwargs):
     print("⚙️  Stateless Worker Metronome Online.")
 @hooks.on('system_shutdown')
 def stop_workers(**kwargs):
-    global _executor
+    global _executor, _io_executor
     print("🛑 Suspending Worker Metronome...")
     _shutdown_event.set()
     with _metronome_wakeup:
@@ -835,6 +876,9 @@ def stop_workers(**kwargs):
     if _executor:
         _executor.shutdown(wait=False)
         _executor = None
+    if _io_executor:
+        _io_executor.shutdown(wait=False)
+        _io_executor = None
 
     try:
         conn = get_connection("workers")

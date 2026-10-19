@@ -89,6 +89,11 @@ class JobManager:
             job_category=job_category,
             **kwargs
         )
+    def map_parallel(self, fn, items) -> list:
+        """SDK Helper: Executes fn(item) across items using the shared bounded kernel I/O pool."""
+        from akasa.workers import run_parallel as _run_parallel
+        return _run_parallel(fn, items)
+
     def wait_for(self, prefix: str = None, job_id: str = None, timeout: float = 10.0) -> bool:
         """SDK Helper: Blocks until matching in-flight immediate jobs complete via in-memory threading.Event."""
         from akasa.workers import wait_for_jobs as _wait_for_jobs
@@ -216,6 +221,7 @@ class JobManager:
             _update_immediate_job_meta(self.current_job_id, meta_dict, workspace_id=self.workspace_id)
 _REGISTERED_SETTINGS_SCHEMAS = {}
 _WORKSPACES_MIGRATED = False
+MASKED_SECRET_SENTINEL = "••••••••"
 
 class SettingsManager:
     def __init__(self, ext_name, workspace_id, schema=None):
@@ -269,8 +275,7 @@ class SettingsManager:
             return Path(control_dir).joinpath(self.repo_filename).as_posix()
         else:
             return Path(control_dir).joinpath(self.workspace_filename).as_posix()
-
-    def get(self, key, default=None, repo=None):
+    def get(self, key, default=None, repo=None, mask_secrets=False):
         field = self._get_field_meta(key)
         if not field:
             return default
@@ -289,13 +294,16 @@ class SettingsManager:
 
             if key in ext_secrets:
                 val = ext_secrets[key]
+                decrypted = val
                 if isinstance(val, str) and val.startswith("v1:"):
                     from akasa.auth import decrypt_secret as _decrypt_secret
-                    return _decrypt_secret(val)
+                    decrypted = _decrypt_secret(val)
                 elif val:
                     self.set(key, val, repo=repo)
-                    return val
-                return val
+                    decrypted = val
+                if mask_secrets:
+                    return MASKED_SECRET_SENTINEL if decrypted else ""
+                return decrypted
         else:
             filepath = self._resolve_filepath(scope)
             data = load_json_config(filepath, {})
@@ -323,6 +331,8 @@ class SettingsManager:
         is_secure = field.get('secure', False)
 
         if is_secure:
+            if value == MASKED_SECRET_SENTINEL:
+                return
             if value:
                 from akasa.auth import encrypt_secret as _encrypt_secret
                 value = _encrypt_secret(value)
@@ -364,13 +374,12 @@ class SettingsManager:
 
         hooks.emit('config_mutated', workspace_id=self.workspace_id)
         self._sync_vfs_barrier()
-
-    def get_all(self, repo=None):
+    def get_all(self, repo=None, mask_secrets=False):
         result = {}
         for field in self.schema:
             fid = field.get('id')
             if not fid: continue
-            result[fid] = self.get(fid, repo=repo)
+            result[fid] = self.get(fid, repo=repo, mask_secrets=mask_secrets)
         return result
     def update(self, payload_dict, repo=None):
         control_dir = get_tenant_control_dir(self.workspace_id)
@@ -397,6 +406,8 @@ class SettingsManager:
             is_secure = field.get('secure', False)
 
             if is_secure:
+                if val == MASKED_SECRET_SENTINEL:
+                    continue
                 if val:
                     from akasa.auth import encrypt_secret as _encrypt_secret
                     val = _encrypt_secret(val)
@@ -633,9 +644,40 @@ class ExtensionContext:
         """
         SSOT: Expands polymorphic frontend selection items into a flat, 
         deduplicated, and stable-sorted list of physical or logical filepaths.
+        Enforces a strict List[str] return contract with native VFS directory expansion fallback.
         """
+        from akasa.uri import AkasaURI as _AkasaURI
+
         results = hooks.emit('expand_selection', items=items, workspace_id=self.workspace_id, gather_only=gather_only)
-        return next((r for r in results if r is not None), items)
+        candidate_list = next((r for r in results if r is not None), None)
+        source_iterable = candidate_list if candidate_list is not None else (items or [])
+
+        normalized_files: List[str] = []
+        for entry in source_iterable:
+            if isinstance(entry, str):
+                raw_str = entry.strip()
+                if not raw_str:
+                    continue
+                uri_obj = _AkasaURI(raw_str)
+                if uri_obj.is_dir:
+                    for walked in self.vfs.walk(str(uri_obj).rstrip('/')):
+                        if not str(walked).endswith(('.gitkeep', '.keep')):
+                            normalized_files.append(str(walked))
+                else:
+                    normalized_files.append(str(uri_obj))
+            elif isinstance(entry, dict):
+                raw_target = str(entry.get("filepath") or entry.get("folderpath") or entry.get("id") or "").strip()
+                if not raw_target:
+                    continue
+                is_dir = bool(entry.get("isDir") or entry.get("folderpath") or raw_target.endswith('/'))
+                if is_dir:
+                    for walked in self.vfs.walk(raw_target.rstrip('/')):
+                        if not str(walked).endswith(('.gitkeep', '.keep')):
+                            normalized_files.append(str(walked))
+                else:
+                    normalized_files.append(str(_AkasaURI(raw_target)))
+
+        return list(dict.fromkeys(normalized_files))
     def save_manifest(self, manifest_data, is_full_compile=False):
         """Writes updates to the centralized context manifest."""
         hooks.emit('save_manifest', manifest_data=manifest_data, is_full_compile=is_full_compile, workspace_id=self.workspace_id)
@@ -672,12 +714,11 @@ class AkasaExtension:
             _REGISTERED_SETTINGS_SCHEMAS[self.name] = self.settings_schema
         if self.schema:
             register_schema(self.name, self.schema)
-
         # Universal REST endpoints for extension settings management
         @self.route('settings', methods=['GET'], docstring="[sync] Retrieves the current settings for this extension.")
         def get_settings(ctx):
             repo = ctx.req.args.get('repo')
-            return jsonify(ctx.settings.get_all(repo=repo))
+            return jsonify(ctx.settings.get_all(repo=repo, mask_secrets=True))
         @self.route('settings', methods=['POST'], response_schema=SettingsUpdateResponse, docstring="[sync] Updates the settings for this extension.")
         def update_settings(ctx):
             try:
@@ -701,10 +742,10 @@ class AkasaExtension:
             if job_id:
                 payload["job_id"] = job_id
             return jsonify(payload)
-
         @self.route('settings/schema', methods=['GET'], docstring="[sync] Retrieves the declarative settings schema for this extension.")
         def get_settings_schema(ctx):
-            return jsonify(self.settings_schema)
+            schema = self.settings_schema(ctx.workspace_id) if callable(self.settings_schema) else self.settings_schema
+            return jsonify(schema)
 
     def get_context(self, workspace_id, job_id=None):
         """SDK Factory: Returns a fully hydrated context inherently bound to this extension's schema."""

@@ -2,6 +2,7 @@ import time
 import json
 import traceback
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict, Optional, List, Dict, Any, Union
 
 # --- EVENT BUS PAYLOAD CONTRACTS ---
@@ -23,12 +24,12 @@ class HookPayload_RegisterManifestSignatures(TypedDict, total=False):
     workspace_id: Optional[str]
     since_ts: Optional[float]
 _event_thread_local = threading.local()
-
 class HookRegistry:
     """The central Event Bus for the Akasa Micro-Kernel."""
     def __init__(self):
         self._hooks = {}
         self._lock = threading.Lock()
+        self._bg_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="Akasa-EventBus")
         self._workspace_router = None
         self._trusted_namespaces = set()
         self._extension_namespaces = set()
@@ -211,9 +212,11 @@ class HookRegistry:
 
         with self._lock:
             has_callbacks = bool(self._hooks.get(event_name, []))
-
         if has_callbacks:
-            threading.Thread(target=_run_hooks, daemon=True).start()
+            try:
+                self._bg_executor.submit(_run_hooks)
+            except RuntimeError:
+                threading.Thread(target=_run_hooks, daemon=True).start()
 
 # The Singleton Event Bus
 hooks = HookRegistry()

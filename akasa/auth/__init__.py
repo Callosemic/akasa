@@ -7,17 +7,17 @@ import urllib.parse
 from pathlib import Path
 from cryptography.fernet import Fernet
 from flask import Blueprint, request, jsonify
-from akasa.utils import load_config, save_json_config, get_workspace_physics, _cwd
+import akasa.utils as _akasa_utils
+from akasa.utils import load_config, load_json_config, save_json_config, get_workspace_physics, get_all_workspace_ids, get_tenant_control_dir
 from akasa.extension import AkasaExtension
 from akasa.hooks import hooks
-from akasa.vfs import execute_vfs_save
 
 auth_bp = Blueprint('auth', __name__)
 
 def get_master_key():
     control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
     global_key_path = Path.home().joinpath(control_dir_name, "master_key.txt")
-    local_key_path = Path(_cwd).joinpath(control_dir_name, "master_key.txt")
+    local_key_path = Path(_akasa_utils._cwd).joinpath(control_dir_name, "master_key.txt")
 
     # Safe Migration: If a legacy local key exists...
     if local_key_path.exists() and os.path.getsize(local_key_path) > 0:
@@ -56,6 +56,55 @@ def decrypt_secret(val: str) -> str:
         return f.decrypt(val[3:].encode('utf-8')).decode('utf-8')
     except Exception:
         return ""
+def rotate_master_key(new_key_str: str) -> bool:
+    """Validates a new Fernet key, re-encrypts all workspace secrets.json files, and updates master_key.txt."""
+    if not new_key_str or not isinstance(new_key_str, str):
+        return False
+    clean_key = new_key_str.strip()
+    old_key_bytes = get_master_key().strip()
+    if clean_key.encode('utf-8') == old_key_bytes:
+        return True
+
+    new_fernet = Fernet(clean_key.encode('utf-8'))
+    old_fernet = Fernet(old_key_bytes)
+
+    def _reencrypt_obj(obj):
+        if isinstance(obj, dict):
+            return {k: _reencrypt_obj(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_reencrypt_obj(v) for v in obj]
+        elif isinstance(obj, str) and obj.startswith("v1:"):
+            try:
+                plain = old_fernet.decrypt(obj[3:].encode('utf-8')).decode('utf-8')
+                return "v1:" + new_fernet.encrypt(plain.encode('utf-8')).decode('utf-8')
+            except Exception:
+                return obj
+        return obj
+
+    for ws_id in get_all_workspace_ids():
+        try:
+            ctrl_dir = get_tenant_control_dir(ws_id)
+            secrets_path = Path(ctrl_dir).joinpath("secrets.json").as_posix()
+            if os.path.exists(secrets_path):
+                s_data = load_json_config(secrets_path, {})
+                if s_data:
+                    rotated_data = _reencrypt_obj(s_data)
+                    save_json_config(secrets_path, rotated_data, workspace_id=ws_id)
+        except Exception as e:
+            print(f"⚠️ [Security] Failed to re-encrypt secrets for workspace '{ws_id}': {e}")
+    control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
+    global_key_path = Path.home().joinpath(control_dir_name, "master_key.txt")
+    local_key_path = Path(_akasa_utils._cwd).joinpath(control_dir_name, "master_key.txt")
+    target_path = local_key_path if local_key_path.exists() else global_key_path
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    target_path.write_bytes(clean_key.encode('utf-8'))
+    try:
+        os.chmod(target_path.as_posix(), 0o600)
+    except OSError:
+        pass
+    return True
+
+
 security_bp = AkasaExtension(
     'security', __name__, title="Security & Encryption", 
     description="Local encryption key management.",
@@ -70,19 +119,22 @@ security_bp = AkasaExtension(
         "description": "This global key encrypts your secrets.json. It is stored securely in your user home directory. If you move this workspace to another machine, you must copy this key to the new machine."
     }]
 )
-@security_bp.route('settings', methods=['POST'])
-def update_security_settings(ctx):
-    data = ctx.req.json or {}
-    new_key = data.get("master_fernet_key")
-    if new_key:
-        control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
-        global_key_path = Path.home().joinpath(control_dir_name, "master_key.txt")
-        local_key_path = Path(_cwd).joinpath(control_dir_name, "master_key.txt")
-        # If a local legacy key exists, update that one to avoid breaking state, otherwise update global
-        target_path = local_key_path if local_key_path.exists() else global_key_path
-        execute_vfs_save(ctx.workspace_id, target_path.as_posix(), new_key, data={"is_absolute_artifact": True, "ignore_ledger": True})
-
-    return {"status": "success", "requires_refresh": False}
+@hooks.on('security_settings_updated')
+def _on_security_settings_updated(workspace_id=None, **kwargs):
+    control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
+    sys_path = Path(_akasa_utils._cwd).joinpath(control_dir_name, "system.json").as_posix()
+    sys_data = load_json_config(sys_path, {})
+    sec_block = sys_data.get("security", {})
+    new_key = sec_block.pop("master_fernet_key", None) if isinstance(sec_block, dict) else None
+    if new_key is not None:
+        if not sec_block:
+            sys_data.pop("security", None)
+        save_json_config(sys_path, sys_data, workspace_id="default")
+        try:
+            rotate_master_key(new_key)
+        except Exception as e:
+            print(f"⚠️ [Security] Master key rotation rejected (invalid Fernet key): {e}")
+    return {"requires_refresh": False}
 # Generate a cryptographically sound scrolling runtime session token
 # Anchor to the environment so it survives os.execv() and Werkzeug hot-reloads
 BOOT_TOKEN = os.environ.get("AKASA_BOOT_TOKEN")

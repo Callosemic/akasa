@@ -1,10 +1,12 @@
 from pathlib import Path
 from functools import wraps
 import os
+import gc
 import re
 import copy
 import json
 import time
+import ctypes
 import typing
 import functools
 import threading
@@ -14,6 +16,15 @@ import urllib.parse
 from akasa.uri import AkasaURI
 
 _cwd = os.getcwd()
+def reclaim_process_memory():
+    """Tier 1 Kernel Memory Governance: Forces Python garbage collection and releases free glibc arenas back to the OS."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
 def sniff_tenant_id():
     try:
         from flask import request as _request
@@ -130,9 +141,8 @@ def thread_safe_cache(ttl=2.0, key_maker=lambda *args, **kwargs: "global"):
                 if key in cache and (not ttl or now - cache[key]['ts'] < ttl):
                     has_cached = True
                     cached_val = cache[key]['val']
-
             if has_cached:
-                return copy.deepcopy(cached_val)
+                return dict(cached_val) if isinstance(cached_val, dict) else (list(cached_val) if isinstance(cached_val, list) else cached_val)
 
             # 2. Single-Flight Execution Barrier
             key_lock = _get_key_lock(key)
@@ -146,7 +156,7 @@ def thread_safe_cache(ttl=2.0, key_maker=lambda *args, **kwargs: "global"):
                         cached_val = cache[key]['val']
 
                 if has_cached:
-                    return copy.deepcopy(cached_val)
+                    return dict(cached_val) if isinstance(cached_val, dict) else (list(cached_val) if isinstance(cached_val, list) else cached_val)
 
                 calc_start = time.time()
                 result = func(*args, **kwargs)
@@ -154,8 +164,8 @@ def thread_safe_cache(ttl=2.0, key_maker=lambda *args, **kwargs: "global"):
                 with state_lock:
                     # Discard result if an invalidation occurred during calculation
                     if invalidated_at.get(key, 0) < calc_start:
-                        cache[key] = {'ts': time.time(), 'val': copy.deepcopy(result)}
-                    return result
+                        cache[key] = {'ts': time.time(), 'val': result}
+                    return dict(result) if isinstance(result, dict) else (list(result) if isinstance(result, list) else result)
 
         def invalidate(*args, **kwargs):
             key = key_maker(*args, **kwargs)

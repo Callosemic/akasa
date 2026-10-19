@@ -12,11 +12,10 @@ from akasa.hooks import hooks
 from akasa.db import get_connection
 from akasa.uri import AkasaURI
 from akasa.utils import resolve_system_artifact_path, parse_uri, get_tenant_control_dir, get_all_workspace_ids, is_subpath
-
 _VFS_READ_CACHE = OrderedDict()
 _VFS_READ_CACHE_BYTES = 0
-_VFS_READ_CACHE_MAX_BYTES = 32 * 1024 * 1024  # 32 MB RAM cache
-_VFS_READ_CACHE_MAX_FILE_BYTES = 2 * 1024 * 1024  # Only cache individual files <= 2 MB
+_VFS_READ_CACHE_MAX_BYTES = 8 * 1024 * 1024  # 8 MB RAM cache
+_VFS_READ_CACHE_MAX_FILE_BYTES = 1 * 1024 * 1024  # Only cache individual files <= 1 MB
 _VFS_CACHE_LOCK = threading.Lock()
 def _cache_get(resolved_path: str, st=None):
     """Returns cached file text if physical (mtime_ns, size) matches; otherwise None."""
@@ -505,6 +504,8 @@ class VFSTransaction:
         self._in_transaction = False
     def save(self, filepath, content, data=None):
         data = data or {}
+        if not data.get("is_absolute_artifact") and filepath and "://" not in str(filepath):
+            raise ValueError(f"Non-canonical URI rejected by VFS save (missing scheme:// prefix): '{filepath}'")
         resolved = _resolve_physical_path(filepath, self.workspace_id, data.get("is_absolute_artifact"))
         if not data.get("is_absolute_artifact") and not resolved:
             print(f"⚠️ [VFS] Transaction dropped: Volume for '{filepath}' is not mounted.")
@@ -520,6 +521,8 @@ class VFSTransaction:
     def delete(self, filepath, data=None):
         """Ergonomic wrapper for queuing an atomic VFS deletion."""
         data = data or {}
+        if not data.get("is_absolute_artifact") and filepath and "://" not in str(filepath):
+            raise ValueError(f"Non-canonical URI rejected by VFS delete (missing scheme:// prefix): '{filepath}'")
         data["action"] = "delete"
         if self._in_transaction:
             self._buffer.append((filepath, "", data))
@@ -527,6 +530,8 @@ class VFSTransaction:
             execute_vfs_save(self.workspace_id, filepath, "", data)
     def read(self, filepath, is_absolute_artifact=False):
         """Safely resolves and reads a file's contents with a single stat syscall."""
+        if not is_absolute_artifact and filepath and "://" not in str(filepath):
+            raise ValueError(f"Non-canonical URI rejected by VFS read (missing scheme:// prefix): '{filepath}'")
         if self._in_transaction and self._buffer:
             for buf_fp, buf_content, buf_data in reversed(self._buffer):
                 if buf_fp == filepath:
