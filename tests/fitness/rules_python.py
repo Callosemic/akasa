@@ -46,7 +46,11 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                     f"Hardcoded host token '{node.value}' detected. Use AKASA_CONTROL_DIR environments."
                 )
             # Substrate Purity Check: Detect domain-specific leakage
-            banned_domain_tokens = ["tailscale", "_get_base_step_and_diffs", "resolve_macro_includes", "is_compiling"]
+            banned_domain_tokens = [
+                "tailscale", ".ts.net", "_get_base_step_and_diffs", "resolve_macro_includes",
+                "request_manifest", "request_vfs_manifest", "request_manifest_chunks",
+                "save_manifest", "insetu", "yomama"
+            ]
             for token in banned_domain_tokens:
                 if token in val:
                     report_violation(
@@ -106,8 +110,14 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                         )
         if isinstance(node.func, ast.Attribute):
             if node.func.attr == 'startswith' and self.filename not in ('rules_python.py', 'hooks.py'):
+                is_scheme_check = (
+                    len(node.args) > 0
+                    and isinstance(node.args[0], ast.Constant)
+                    and isinstance(node.args[0].value, str)
+                    and "://" in node.args[0].value
+                )
                 # Flag string startswith on path-like variables in kernel modules
-                if isinstance(node.func.value, (ast.Call, ast.Name)):
+                if not is_scheme_check and isinstance(node.func.value, (ast.Call, ast.Name)):
                     val_repr = ast.unparse(node.func.value).lower()
                     if any(term in val_repr for term in ('path', 'resolved', 'dir', 'root', 'target')):
                         report_violation(

@@ -5,10 +5,11 @@ This index serves as the architectural map. It outlines the core directories and
 ```text
 akasa/
 ├── .gitkeep                        # Git preservation marker
-├── CHANGELOG.md                    # [comment required]
+├── CHANGELOG.md                    # Auto-generated semantic release changelog
 ├── CODE_INDEX.md                   # Architectural directory map and module overview
 ├── README.md                       # Core substrate documentation and usage guide
 ├── akasa/                          # Central kernel package root
+│   ├── __init__.py                 # Fitness test suite entry point and runner
 │   ├── auth/                       # Authentication blueprint, token exchange, and Fernet encryption
 │   │   └── __init__.py             # Fitness test suite entry point and runner
 │   ├── db.py                       # Thread-local SQLite connection pool and WAL schema migrations
@@ -27,13 +28,15 @@ akasa/
 ├── docs/                           # Architectural documentation and standards
 │   ├── 00_index.md                 # Master documentation index
 │   ├── 01_engineering_standards.md # Core engineering standards and audit guardrails
+│   ├── 02_kernel_api_and_ioc_contracts.md # External SDK, DI, and IoC hook interface contracts
 │   └── adrs/                       # Architectural Decision Records (ADRs)
 │       ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001 specification
 │       ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
 │       ├── 0003_openapi_reflection_dag_orchestration_and_error_hooks.md # ADR 0003 specification
 │       ├── 0004_vfs_bulk_mutation_batching_and_atomic_consolidation.md # ADR 0004 specification
 │       ├── 0005_parallel_dag_orchestration_vfs_ram_caching_and_inter_workspace_routing.md # ADR 0005 specification
-│       └── 0006_resource_governance_bounded_executors_and_secret_lifecycle.md # ADR 0006 specification
+│       ├── 0006_resource_governance_bounded_executors_and_secret_lifecycle.md # ADR 0006 specification
+│       └── 0007_kernel_bootloader_vfs_3way_merge_and_substrate_purity.md # [comment required]
 ├── pyproject.toml                  # Build system specification and dependencies
 └── tests/                          # Architectural fitness tests and AST validators
     ├── fitness/                    # Fitness rule package directory
