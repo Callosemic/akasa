@@ -3,9 +3,9 @@
 This directory contains the core architectural specifications, integration contracts, and engineering guardrails for **Akasa**, the domain-agnostic Tier 1 application kernel and volume router.
 
 ---
-
 ## 📚 Core Documentation
 * **[01 Engineering Standards & Guardrails](./01_engineering_standards.md)**: Baseline rules for substrate purity, stateless multi-tenancy, VFS write-pipeline mechanics, and event bus authorization.
+* **[02 Kernel API & IoC Contracts](./02_kernel_api_and_ioc_contracts.md)**: Definitive external interface specification covering Host DI bootstrapping, Event Bus IoC hooks, `AkasaExtension`, `ExtensionContext`, VFS drivers, and worker orchestration.
 
 ---
 ## 🏛️ Architectural Decision Records (ADRs)
@@ -14,3 +14,5 @@ This directory contains the core architectural specifications, integration contr
 * **[ADR 0003: OpenAPI Reflection, DAG Step Orchestration, and System Error Hooks](./adrs/0003_openapi_reflection_dag_orchestration_and_error_hooks.md)**
 * **[ADR 0004: Asynchronous VFS Bulk Mutation Batching and Transaction Consolidation](./adrs/0004_vfs_bulk_mutation_batching_and_atomic_consolidation.md)**
 * **[ADR 0005: Parallel DAG Orchestration, In-Memory VFS Read Caching, and Inter-Workspace Routing](./adrs/0005_parallel_dag_orchestration_vfs_ram_caching_and_inter_workspace_routing.md)**
+* **[ADR 0006: Kernel Resource Governance, Bounded Thread Pools, and Secret Masking Lifecycle](./adrs/0006_resource_governance_bounded_executors_and_secret_lifecycle.md)**
+* **[ADR 0007: Kernel Bootloader Lifecycle, Causal 3-Way Merging, Substrate Purity, and Self-Healing Persistence](./adrs/0007_kernel_bootloader_vfs_3way_merge_and_substrate_purity.md)**
