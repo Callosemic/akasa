@@ -1,9 +1,11 @@
+import os
 import time
 import json
+import inspect
 import traceback
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from typing import TypedDict, Optional, List, Dict, Any, Union
+from typing import TypedDict, Optional, List, Dict, Any, Union, Callable
 
 # --- EVENT BUS PAYLOAD CONTRACTS ---
 # These TypedDicts serve as machine-readable documentation for extension authors (and LLMs)
@@ -19,10 +21,48 @@ class HookPayload_WorkspaceScoped(TypedDict, total=False):
     workspace_id: Optional[str]
 class HookPayload_WorkspaceShutdown(TypedDict, total=False):
     workspace_id: Optional[str]
-
 class HookPayload_RegisterManifestSignatures(TypedDict, total=False):
     workspace_id: Optional[str]
     since_ts: Optional[float]
+
+class HookPayload_ExecuteIdentityHandshake(TypedDict, total=False):
+    request: Any
+    client_ip: str
+    config: Dict[str, Any]
+    workspace_id: Optional[str]
+
+class HookPayload_IsTrustedOrigin(TypedDict, total=False):
+    url: str
+    hostname: str
+    workspace_id: Optional[str]
+
+class HookPayload_VFSMountMissing(TypedDict, total=False):
+    workspace_id: Optional[str]
+    scheme: str
+    volume: str
+
+class HookPayload_PreFileSave(TypedDict, total=False):
+    workspace_id: Optional[str]
+    filepath: str
+    resolved_path: Optional[str]
+    content: str
+    data: Dict[str, Any]
+
+class HookPayload_JobBatonPassed(TypedDict, total=False):
+    workspace_id: Optional[str]
+    root_job_id: str
+    previous_job_id: str
+    next_job_id: str
+    ext_name: str
+
+class HookPayload_SystemError(TypedDict, total=False):
+    workspace_id: Optional[str]
+    source: str
+    error_type: str
+    message: str
+    traceback: str
+    payload: str
+
 _event_thread_local = threading.local()
 class HookRegistry:
     """The central Event Bus for the Akasa Micro-Kernel."""
@@ -33,6 +73,11 @@ class HookRegistry:
         self._workspace_router = None
         self._trusted_namespaces = set()
         self._extension_namespaces = set()
+        self._sse_passthrough_events = set()
+
+    def register_sse_passthrough(self, *event_names):
+        """DI Interface: Host OS registers high-priority event names to auto-forward to the SSE stream."""
+        self._sse_passthrough_events.update(event_names)
 
     def register_trusted_namespace(self, namespace):
         """DI Interface: Host OS registers its Tier 2 core namespace for event bypass privileges."""
@@ -51,14 +96,17 @@ class HookRegistry:
             with self._lock:
                 if event_name not in self._hooks:
                     self._hooks[event_name] = []
-
-                # Guardrail: Prevent duplicate registrations from double imports
-                func_file = getattr(func, '__code__', None)
+                # Guardrail: Unwrap decorated callbacks and compare extension identity before dropping duplicates
+                target_func = inspect.unwrap(func)
+                func_ext = getattr(func, '_akasa_ext_name', None) or getattr(target_func, '_akasa_ext_name', None)
+                func_file = getattr(target_func, '__code__', None)
                 func_path = func_file.co_filename if func_file else ''
                 for _, existing_func in self._hooks[event_name]:
-                    existing_file = getattr(existing_func, '__code__', None)
+                    existing_target = inspect.unwrap(existing_func)
+                    existing_ext = getattr(existing_func, '_akasa_ext_name', None) or getattr(existing_target, '_akasa_ext_name', None)
+                    existing_file = getattr(existing_target, '__code__', None)
                     existing_path = existing_file.co_filename if existing_file else ''
-                    if existing_path == func_path and existing_func.__name__ == func.__name__:
+                    if existing_path == func_path and existing_target.__name__ == target_func.__name__ and existing_ext == func_ext:
                         return func
 
                 self._hooks[event_name].append((priority, func))
@@ -67,24 +115,38 @@ class HookRegistry:
         return decorator
     def _is_authorized(self, cb, event_name, workspace_id):
         """Boundary filter: checks if the callback's module is enabled in the active tenant scope."""
-        mod = cb.__module__ or ""
+        target_cb = inspect.unwrap(cb)
+        mod = getattr(target_cb, '__module__', None) or cb.__module__ or ""
         # System lifecycle and infrastructure events always bypass tenant authorization
         if event_name in ['system_shutdown', 'mutate_workspace_config', 'register_core_modules']:
             return True
 
-        if not mod: return True
+        from akasa.utils import load_config as _load_config, is_core_module as _is_core_module, is_extension_enabled as _is_extension_enabled
 
-        # Core system modules (Akasa kernel or explicitly flagged core modules) are always authorized
-        if mod.startswith('akasa.') or getattr(cb, 'is_core', False):
+        # 1. Fast O(1) Explicit Extension Stamp Check (Evaluated BEFORE akasa. module check)
+        stamped_ext = getattr(cb, '_akasa_ext_name', None) or getattr(target_cb, '_akasa_ext_name', None)
+        is_core_flag = getattr(cb, 'is_core', False) or getattr(target_cb, 'is_core', False)
+        if is_core_flag or (stamped_ext and _is_core_module(stamped_ext)):
+            return True
+        if stamped_ext:
+            if event_name == 'system_boot':
+                print(f"⚠️ [Event Bus] Banned hook: Non-core extension '{stamped_ext}' attempted to subscribe to 'system_boot'. Use 'workspace_boot' instead.")
+                return False
+            return _is_extension_enabled(stamped_ext, workspace_id)
+
+        if not mod:
             return True
 
-        # DI: Trusted host OS namespaces bypass tenant authorization (Tier 2 isolation)
+        # 2. Core system modules (Akasa kernel) are always authorized
+        if mod.startswith('akasa.'):
+            return True
+
+        # 3. DI: Trusted host OS namespaces bypass tenant authorization (Tier 2 isolation)
         if any(mod.startswith(ns) for ns in self._trusted_namespaces):
             return True
-        # Inversion of Control: Determine if the module belongs to an enabled extension
-        # by checking if any segment of its import path matches an active extension name.
+
+        # 4. Fallback: Determine if the module belongs to an enabled extension by import path
         ext_name = None
-        from akasa.utils import load_config as _load_config, is_core_module as _is_core_module, is_extension_enabled as _is_extension_enabled
         try:
             enabled_exts = set(_load_config(workspace_id).get("extensions", []))
             for part in mod.split('.'):
@@ -112,8 +174,8 @@ class HookRegistry:
     def emit(self, event_name, *args, **kwargs):
         """Core OS trigger to broadcast payloads to all subscribed extensions."""
         from akasa.events import sse_bus as _sse_bus
-        # Auto-forward high-priority UI signals to the SSE stream
-        if event_name in ('topology_resolved',):
+        # Auto-forward registered high-priority UI signals to the SSE stream
+        if event_name in self._sse_passthrough_events:
             safe_payload = {k: v for k, v in kwargs.items() if isinstance(v, (str, int, float, bool, list, dict))}
             _sse_bus.emit_sse(event_name, safe_payload)
 
@@ -170,6 +232,75 @@ class HookRegistry:
             return results
         finally:
             _event_thread_local.active_events.remove(event_name)
+
+    def emit_first(self, event_name, *args, default=None, predicate: Optional[Callable[[Any], bool]] = None, **kwargs) -> Any:
+        """Evaluates authorized callbacks in priority order and short-circuits on the first matching non-None result."""
+        from akasa.events import sse_bus as _sse_bus
+        if event_name in self._sse_passthrough_events:
+            safe_payload = {k: v for k, v in kwargs.items() if isinstance(v, (str, int, float, bool, list, dict))}
+            _sse_bus.emit_sse(event_name, safe_payload)
+
+        if not hasattr(_event_thread_local, 'active_events'):
+            _event_thread_local.active_events = set()
+        if event_name in _event_thread_local.active_events:
+            return default
+
+        _event_thread_local.active_events.add(event_name)
+        try:
+            workspace_ids = set()
+            origin_ws = kwargs.get('workspace_id')
+            if origin_ws:
+                workspace_ids.add(origin_ws)
+            if self._workspace_router:
+                mapped_res = self._workspace_router(event_name, **kwargs)
+                if mapped_res:
+                    workspace_ids.update(mapped_res)
+            if not workspace_ids:
+                from flask import has_request_context as _has_request_context
+                if _has_request_context():
+                    from akasa.utils import sniff_tenant_id as _sniff_tenant_id
+                    workspace_ids.add(_sniff_tenant_id())
+                else:
+                    workspace_ids.add("default")
+
+            check_fn = predicate if callable(predicate) else (lambda r: r is not None and r != [] and r != {})
+            for wid in workspace_ids:
+                kwargs['workspace_id'] = wid
+                with self._lock:
+                    callbacks = [cb for _, cb in self._hooks.get(event_name, [])]
+                for cb in callbacks:
+                    if not self._is_authorized(cb, event_name, wid):
+                        continue
+                    try:
+                        res = cb(*args, **kwargs)
+                        if check_fn(res):
+                            return res
+                    except Exception as e:
+                        print(f"⚠️ [Event Bus] Error in '{event_name}' callback {cb.__name__}: {e}")
+            return default
+        finally:
+            _event_thread_local.active_events.remove(event_name)
+
+    def emit_merge_dict(self, event_name, *args, **kwargs) -> Dict[str, Any]:
+        """Executes authorized callbacks and merges returned dictionaries (preserving nested None tombstones)."""
+        merged: Dict[str, Any] = {}
+        for res in self.emit(event_name, *args, **kwargs):
+            if isinstance(res, dict):
+                for k, v in res.items():
+                    if isinstance(v, dict) and isinstance(merged.get(k), dict):
+                        merged[k].update(v)
+                    else:
+                        merged[k] = v
+        return merged
+
+    def emit_merge_list(self, event_name, *args, **kwargs) -> List[Any]:
+        """Executes authorized callbacks and flattens returned lists into a single list."""
+        merged: List[Any] = []
+        for res in self.emit(event_name, *args, **kwargs):
+            if isinstance(res, list):
+                merged.extend(res)
+        return merged
+
     def emit_background(self, event_name, *args, **kwargs):
         """Dispatches long-running hooks to a background thread to prevent blocking."""
         workspace_ids = set()

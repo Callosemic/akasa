@@ -7,6 +7,7 @@ import copy
 import json
 import time
 import ctypes
+import socket
 import typing
 import functools
 import threading
@@ -16,6 +17,32 @@ import urllib.parse
 from akasa.uri import AkasaURI
 
 _cwd = os.getcwd()
+_TRUSTED_HOST_SUFFIXES = set()
+
+
+def get_daemon_cwd() -> str:
+    """Returns the anchored working directory of the Akasa daemon."""
+    return _cwd
+
+
+def set_daemon_cwd(new_cwd: str) -> None:
+    """Updates the anchored working directory of the Akasa daemon."""
+    global _cwd
+    _cwd = str(new_cwd)
+
+
+def register_trusted_host_suffix(*suffixes: str) -> None:
+    """DI Interface: Registers trusted reverse-proxy/tunnel hostname suffixes (e.g., '.ts.net')."""
+    for sfx in suffixes:
+        if sfx:
+            _TRUSTED_HOST_SUFFIXES.add(str(sfx))
+
+
+def get_trusted_host_suffixes() -> tuple:
+    """Returns the tuple of registered trusted host suffixes."""
+    return tuple(_TRUSTED_HOST_SUFFIXES)
+
+
 def reclaim_process_memory():
     """Tier 1 Kernel Memory Governance: Forces Python garbage collection and releases free glibc arenas back to the OS."""
     gc.collect()
@@ -23,6 +50,82 @@ def reclaim_process_memory():
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         pass
+
+
+def is_port_listening(port: int, host: str = "127.0.0.1") -> bool:
+    """Checks if a TCP port is actively accepting connections on the given host."""
+    if not port or port <= 0:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.15)
+        return s.connect_ex((host, int(port))) == 0
+
+
+def can_bind_port(port: int, host: str = "0.0.0.0") -> bool:
+    """Checks if a TCP port is free to bind on the given host interface."""
+    if not port or port <= 0:
+        return False
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((host, int(port)))
+            return True
+        except OSError:
+            return False
+
+
+def allocate_ephemeral_port(host: str = "0.0.0.0") -> int:
+    """Asks the OS kernel for an available ephemeral TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return int(s.getsockname()[1])
+def get_system_index_path() -> str:
+    """Returns the canonical path to the daemon's workspaces.json routing index, healing deprecated state if needed."""
+    control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
+    ws_path = Path(_cwd).joinpath(control_dir_name, "workspaces.json")
+    sys_path = Path(_cwd).joinpath(control_dir_name, "system.json")
+    if sys_path.exists():
+        try:
+            sys_data = load_json_config(sys_path.as_posix(), {})
+            sys_ws = sys_data.get("workspaces") if isinstance(sys_data, dict) else None
+            if isinstance(sys_ws, dict) and sys_ws:
+                ws_data = load_json_config(ws_path.as_posix(), {}) if ws_path.exists() else {}
+                cur_ws = ws_data.get("workspaces") if isinstance(ws_data, dict) and not ws_data.get("_deprecated") else {}
+                if not isinstance(cur_ws, dict):
+                    cur_ws = {}
+                if not ws_path.exists() or ws_data.get("_deprecated") or any(k not in cur_ws for k in sys_ws):
+                    merged_ws = {**cur_ws, **sys_ws}
+                    restored = {"workspaces": merged_ws}
+                    active_ws = sys_data.get("active_workspace") or (ws_data.get("active_workspace") if isinstance(ws_data, dict) else None)
+                    if active_ws:
+                        restored["active_workspace"] = active_ws
+                    with open(ws_path.as_posix(), "w", encoding="utf-8") as f:
+                        json.dump(restored, f, indent=2)
+                    _JSON_CACHE.pop(ws_path.as_posix(), None)
+                    _JSON_MTIME.pop(ws_path.as_posix(), None)
+        except Exception:
+            pass
+    if sys_path.exists() and not ws_path.exists():
+        return sys_path.as_posix()
+    return ws_path.as_posix()
+
+
+def get_json_cache_stats() -> dict:
+    """Returns telemetry statistics for the internal JSON configuration cache."""
+    json_cache_bytes = sum(len(v.encode('utf-8')) for v in _JSON_CACHE.values() if isinstance(v, str))
+    return {
+        "json_config_cache_files": len(_JSON_CACHE),
+        "json_config_cache_kb": round(json_cache_bytes / 1024, 2)
+    }
+
+
+def get_kernel_memory_telemetry() -> dict:
+    """Combines VFS read/write cache statistics and JSON config cache statistics into a single telemetry dict."""
+    from akasa.vfs import get_vfs_cache_stats as _get_vfs_cache_stats
+    return {
+        **_get_vfs_cache_stats(),
+        **get_json_cache_stats()
+    }
 
 
 def sniff_tenant_id():
@@ -45,7 +148,7 @@ def get_workspace_physics(workspace_id=None):
     control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
     local_control_dir = Path(_cwd).joinpath(control_dir_name).as_posix()
     default_config = Path(local_control_dir).joinpath("config.json").as_posix()
-    index_path = Path(local_control_dir).joinpath("system.json").as_posix()
+    index_path = get_system_index_path()
     env_config = os.environ.get("AKASA_CONFIG")
     if env_config:
         resolved_cfg = os.path.abspath(os.path.expanduser(env_config))
@@ -94,8 +197,17 @@ def register_core_module(ext_name):
     """DI Interface: Host OS declares its foundational modules."""
     _CORE_MODULES.add(ext_name)
 
+def get_core_modules() -> set:
+    """Returns a copy of the registered foundational core module names."""
+    return set(_CORE_MODULES)
+
 def is_core_module(ext_name):
     return ext_name in _CORE_MODULES
+
+def get_active_modules(workspace_id=None) -> list:
+    """Returns a sorted list of all active modules (registered core modules + enabled workspace extensions)."""
+    cfg = load_config(workspace_id)
+    return sorted(set(_CORE_MODULES) | set(cfg.get("extensions", [])))
 
 def is_extension_enabled(ext_name, workspace_id=None):
     if is_core_module(ext_name):
@@ -242,8 +354,7 @@ def load_config(workspace_id=None):
 
     return cfg
 def get_all_workspace_ids():
-    control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
-    index_path = Path(_cwd).joinpath(control_dir_name, "system.json").as_posix()
+    index_path = get_system_index_path()
     workspace_ids = ["default"]
     if os.path.exists(index_path):
         try:

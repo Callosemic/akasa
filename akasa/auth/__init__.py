@@ -8,7 +8,15 @@ from pathlib import Path
 from cryptography.fernet import Fernet
 from flask import Blueprint, request, jsonify
 import akasa.utils as _akasa_utils
-from akasa.utils import load_config, load_json_config, save_json_config, get_workspace_physics, get_all_workspace_ids, get_tenant_control_dir
+from akasa.utils import (
+    load_config,
+    load_json_config,
+    save_json_config,
+    get_workspace_physics,
+    get_all_workspace_ids,
+    get_tenant_control_dir,
+    get_trusted_host_suffixes,
+)
 from akasa.extension import AkasaExtension
 from akasa.hooks import hooks
 
@@ -42,6 +50,10 @@ def get_master_key():
         return key
 
     return global_key_path.read_bytes()
+
+def ensure_master_key_on_disk() -> bytes:
+    """Synchronously guarantees the Fernet master key exists on disk."""
+    return get_master_key()
 
 def encrypt_secret(val: str) -> str:
     if not val: return val
@@ -154,11 +166,15 @@ def bootstrap():
         # Check for cross-origin browser requests (Localhost Drive-By CSRF prevention)
         origin = request.headers.get('Origin', '')
         referer = request.headers.get('Referer', '')
-
         def is_allowed(url_str):
             try:
                 hostname = urllib.parse.urlparse(url_str).hostname or ""
-                return hostname in ['127.0.0.1', 'localhost'] or hostname.endswith('.ts.net')
+                if hostname in ['127.0.0.1', 'localhost']:
+                    return True
+                trusted_suffixes = get_trusted_host_suffixes()
+                if trusted_suffixes and any(hostname.endswith(sfx) for sfx in trusted_suffixes):
+                    return True
+                return bool(hooks.emit_first('is_trusted_origin', url=url_str, hostname=hostname, predicate=bool))
             except Exception:
                 return False
 
@@ -174,14 +190,20 @@ def bootstrap():
         })
     cfg = load_config()
     # --- ROUTE B: INVERSION OF CONTROL (Zero-Knowledge Identity Protocols) ---
-    for res in hooks.emit('execute_identity_handshake', request=request, client_ip=client_ip, config=cfg):
-        if res and isinstance(res, dict) and res.get("status") == "authenticated":
-            return jsonify({
-                "status": "authenticated", 
-                "token": BOOT_TOKEN, 
-                "method": res.get("method", "hook"),
-                "user": res.get("user")
-            })
+    auth_res = hooks.emit_first(
+        'execute_identity_handshake',
+        request=request,
+        client_ip=client_ip,
+        config=cfg,
+        predicate=lambda r: isinstance(r, dict) and r.get("status") == "authenticated"
+    )
+    if auth_res:
+        return jsonify({
+            "status": "authenticated", 
+            "token": BOOT_TOKEN, 
+            "method": auth_res.get("method", "hook"),
+            "user": auth_res.get("user")
+        })
 
     # --- ROUTE C: PERSISTENT CONFIG TOKEN CHECK ---
     client_token = data.get("token")

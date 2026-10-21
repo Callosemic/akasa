@@ -4,7 +4,7 @@ import time
 import shutil
 import sqlite3
 import threading
-from akasa.utils import get_workspace_physics, get_all_workspace_ids, sniff_tenant_id
+from akasa.utils import get_workspace_physics, get_all_workspace_ids, get_tenant_control_dir, sniff_tenant_id
 from akasa.hooks import hooks
 
 # Thread-local storage guarantees safe connection pooling across the ASGI / Worker matrix
@@ -73,12 +73,76 @@ register_schema('workers', {
         'job_category': "TEXT DEFAULT 'system_background'"
     }
 })
+def provision_workspace_schemas(workspace_id: str) -> None:
+    """Applies all registered declarative SQLite schemas for a specific tenant workspace."""
+    for ext_name, schema in _REGISTERED_SCHEMAS.items():
+        apply_declarative_schema(ext_name, schema, workspace_id)
+
+
+def recover_corrupt_databases(workspace_id: str) -> None:
+    """Self-healing recovery routine: salvages rows from *.db.corrupt_* dumps inside the workspace's cache/db directory."""
+    base_dir = Path(get_tenant_control_dir(workspace_id))
+    cache_db_dir = base_dir.joinpath("cache", "db")
+    if not cache_db_dir.exists() or not cache_db_dir.is_dir():
+        return
+    for item in os.listdir(cache_db_dir.as_posix()):
+        if ".db.corrupt_" in item:
+            ext_name = item.split(".db.corrupt_")[0]
+            target_db_path = cache_db_dir.joinpath(f"{ext_name}.db").as_posix()
+            c_path = cache_db_dir.joinpath(item).as_posix()
+            if not os.path.exists(target_db_path):
+                continue
+            try:
+                conn = sqlite3.connect(target_db_path)
+                conn.execute(f"ATTACH DATABASE '{c_path}' AS corrupt_db")
+                cursor = conn.execute("SELECT name FROM corrupt_db.sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+                tables = [r[0] for r in cursor.fetchall()]
+                recovered_any = False
+                for tbl in tables:
+                    try:
+                        count = conn.execute(f"SELECT COUNT(*) FROM main.{tbl}").fetchone()[0]
+                        if count == 0:
+                            conn.execute(f"INSERT OR IGNORE INTO main.{tbl} SELECT * FROM corrupt_db.{tbl}")
+                            conn.commit()
+                            if conn.changes() > 0:
+                                recovered_any = True
+                                print(f"✨ [DB Recovery] Restored {conn.changes()} rows for '{tbl}' in {ext_name}.db from {item}")
+                    except Exception:
+                        pass
+                conn.execute("DETACH DATABASE corrupt_db")
+                conn.close()
+                if recovered_any:
+                    try:
+                        os.remove(c_path)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f"⚠️ [DB Recovery] Could not recover from {item}: {e}")
+
+
+def migrate_legacy_sqlite_paths(workspace_id: str, db_name: str, table: str, column: str, old_sub: str, new_sub: str) -> None:
+    """Updates legacy substring paths inside a specific workspace SQLite table column if the database exists."""
+    base_dir = Path(get_tenant_control_dir(workspace_id))
+    db_file = base_dir.joinpath("cache", "db", f"{db_name}.db")
+    if not db_file.exists():
+        return
+    try:
+        conn = sqlite3.connect(db_file.as_posix())
+        conn.execute(
+            f"UPDATE {table} SET {column} = REPLACE({column}, ?, ?) WHERE {column} LIKE ?",
+            (old_sub, new_sub, f"%{old_sub}%")
+        )
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+
 @hooks.on('system_boot', priority=90)
 def init_declarative_schemas(**kwargs):
     """Automatically provisions schemas and boots workspaces across all tenants."""
     for ws_id in get_all_workspace_ids():
-        for ext_name, schema in _REGISTERED_SCHEMAS.items():
-            apply_declarative_schema(ext_name, schema, ws_id)
+        provision_workspace_schemas(ws_id)
         hooks.emit('workspace_boot', workspace_id=ws_id)
 @hooks.on('workspace_shutdown')
 def close_workspace_connections(workspace_id=None, **kwargs):
@@ -199,4 +263,13 @@ def get_connection(db_name, workspace_id=None):
         else:
             raise
     _local.connections[workspace_id][db_name] = conn
+    if db_name in _REGISTERED_SCHEMAS and not getattr(conn, '_schema_applied', False):
+        try:
+            for table_name, columns in _REGISTERED_SCHEMAS[db_name].items():
+                col_defs = ", ".join([f"{col} {dtype}" for col, dtype in columns.items()])
+                conn.execute(f"CREATE TABLE IF NOT EXISTS {table_name} ({col_defs})")
+            conn.commit()
+            conn._schema_applied = True
+        except Exception:
+            pass
     return conn

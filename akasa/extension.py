@@ -14,8 +14,10 @@ from flask import Blueprint, request, jsonify
 if TYPE_CHECKING:
     from akasa.types import WorkspaceID, FilePath, VFSStorageEngine, WorkspacePathsDict
 from akasa.db import get_connection, register_schema
+from akasa.events import sse_bus
 from akasa.hooks import hooks
-from akasa.utils import extension_auth, load_config, get_workspace_physics, get_tenant_control_dir, load_json_config, save_json_config, parse_uri
+import akasa.utils as _akasa_utils
+from akasa.utils import extension_auth, load_config, get_workspace_physics, get_tenant_control_dir, load_json_config, save_json_config, parse_uri, get_active_modules
 from akasa.vfs import VFSTransaction, _resolve_physical_path, sync_vfs_barrier as _vfs_sync_barrier
 
 class SettingsUpdateResponse(TypedDict, total=False):
@@ -223,6 +225,21 @@ _REGISTERED_SETTINGS_SCHEMAS = {}
 _WORKSPACES_MIGRATED = False
 MASKED_SECRET_SENTINEL = "••••••••"
 
+
+def get_registered_settings_schemas(workspace_id: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
+    """Evaluates and returns all registered declarative settings schemas for the target workspace."""
+    wid = workspace_id or "default"
+    evaluated: Dict[str, List[Dict[str, Any]]] = {}
+    for ext_id, schema_spec in _REGISTERED_SETTINGS_SCHEMAS.items():
+        if callable(schema_spec):
+            try:
+                evaluated[ext_id] = schema_spec(wid)
+            except Exception:
+                evaluated[ext_id] = []
+        else:
+            evaluated[ext_id] = schema_spec
+    return evaluated
+
 class SettingsManager:
     def __init__(self, ext_name, workspace_id, schema=None):
         self.ext_name = ext_name
@@ -233,31 +250,6 @@ class SettingsManager:
         if schema is None:
             schema = _REGISTERED_SETTINGS_SCHEMAS.get(ext_name)
         self.schema = schema(workspace_id) if callable(schema) else (schema or [])
-        if not _WORKSPACES_MIGRATED:
-            self._migrate_workspaces_to_system()
-
-    def _migrate_workspaces_to_system(self):
-        global _WORKSPACES_MIGRATED
-        _WORKSPACES_MIGRATED = True
-        from akasa.utils import _cwd as __cwd
-        control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
-        system_path = Path(__cwd).joinpath(control_dir_name, "system.json").as_posix()
-        legacy_ws_path = Path(__cwd).joinpath(control_dir_name, "workspaces.json").as_posix()
-
-        if os.path.exists(legacy_ws_path):
-            legacy_data = load_json_config(legacy_ws_path, {})
-            if not legacy_data.get("_deprecated"):
-                system_data = load_json_config(system_path, {})
-
-                if "workspaces" in legacy_data:
-                    system_data["workspaces"] = legacy_data["workspaces"]
-                if "active_workspace" in legacy_data:
-                    system_data["active_workspace"] = legacy_data["active_workspace"]
-
-                save_json_config(system_path, system_data, workspace_id="default")
-
-                # Quietly deprecate the legacy file
-                save_json_config(legacy_ws_path, {"_deprecated": True, "message": "Routing index migrated to system.json natively per Tier 1 hierarchy."}, workspace_id="default")
 
     def _get_field_meta(self, key):
         for field in self.schema:
@@ -265,10 +257,9 @@ class SettingsManager:
                 return field
         return None
     def _resolve_filepath(self, scope):
-        from akasa.utils import _cwd as __cwd
         control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
         if scope == 'daemon':
-            return Path(__cwd).joinpath(control_dir_name, "system.json").as_posix()
+            return Path(_akasa_utils._cwd).joinpath(control_dir_name, "host.json").as_posix()
 
         control_dir = get_tenant_control_dir(self.workspace_id)
         if scope == 'repo':
@@ -299,7 +290,13 @@ class SettingsManager:
                     from akasa.auth import decrypt_secret as _decrypt_secret
                     decrypted = _decrypt_secret(val)
                 elif val:
-                    self.set(key, val, repo=repo)
+                    from akasa.auth import encrypt_secret as _encrypt_secret
+                    enc_val = _encrypt_secret(str(val))
+                    if scope == 'repo' and repo:
+                        data.setdefault(self.ext_name, {}).setdefault(repo, {})[key] = enc_val
+                    else:
+                        data.setdefault(self.ext_name, {})[key] = enc_val
+                    save_json_config(filepath, data, self.workspace_id)
                     decrypted = val
                 if mask_secrets:
                     return MASKED_SECRET_SENTINEL if decrypted else ""
@@ -371,7 +368,6 @@ class SettingsManager:
                 if self.ext_name not in data: data[self.ext_name] = {}
                 data[self.ext_name][key] = value
             save_json_config(filepath, data, self.workspace_id)
-
         hooks.emit('config_mutated', workspace_id=self.workspace_id)
         self._sync_vfs_barrier()
     def get_all(self, repo=None, mask_secrets=False):
@@ -538,11 +534,24 @@ class ExtensionContext:
         self.jobs = JobManager(ext_name, workspace_id, job_id=job_id)
         self.store = StoreManager(workspace_id, ext_name=ext_name)
         self.settings = SettingsManager(ext_name, workspace_id, schema=settings_schema)
-    @property
-    def db(self):
-        """Returns an SQLite connection automatically keyed to the active tenant workspace."""
-        conn = get_connection(self.ext_name, self.workspace_id)
+    def get_db(self, db_name: Optional[str] = None) -> DatabaseWrapper:
+        """Returns a DatabaseWrapper for the specified SQLite database name (defaults to self.ext_name) in the active workspace."""
+        conn = get_connection(db_name or self.ext_name, self.workspace_id)
         return DatabaseWrapper(conn)
+
+    @property
+    def db(self) -> DatabaseWrapper:
+        """Returns an SQLite connection automatically keyed to the active tenant workspace."""
+        return self.get_db(self.ext_name)
+
+    def get_active_modules(self) -> List[str]:
+        """Returns a sorted list of all active core and workspace-enabled extension modules."""
+        return get_active_modules(self.workspace_id)
+
+    def emit_sse(self, event_type: str, payload: Dict[str, Any]) -> None:
+        """Publishes a real-time Server-Sent Event onto the global SSE bus."""
+        sse_bus.emit_sse(event_type, payload)
+
     def get_repo_data_path(self, repo: str, subpath: str = "") -> str:
         """Returns the canonical VFS URI for sovereign extension data inside a target repository."""
         ctrl_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
@@ -597,11 +606,7 @@ class ExtensionContext:
         }
 
         # Agnostically merge domain-specific paths injected by Tier 2 engines
-        path_extensions = hooks.emit('request_paths', workspace_id=self.workspace_id)
-        for p_dict in path_extensions:
-            if p_dict:
-                base_paths.update(p_dict)
-
+        base_paths.update(hooks.emit_merge_dict('request_paths', workspace_id=self.workspace_id))
         return base_paths
     @property
     def config(self):
@@ -618,28 +623,16 @@ class ExtensionContext:
 
     def find_path_candidates(self, query_path, **kwargs):
         """Opt-in candidate discovery for path disambiguation."""
-        results = hooks.emit('find_path_candidates', query_path=query_path, workspace_id=self.workspace_id, **kwargs)
-        return next((r for r in results if r), [])
+        return self.emit_first('find_path_candidates', query_path=query_path, default=[], **kwargs)
 
     def resolve_dag_chain(self, hook_name: str):
         """SDK Helper: Resolves an ordered compilation/execution DAG chain for the current workspace."""
         from akasa.workers import resolve_dag_chain as _resolve_dag_chain
         return _resolve_dag_chain(self, hook_name)
-    @property
-    def manifest(self):
-        """Reads the centralized context manifest statelessly."""
-        if not hasattr(self, '_manifest_cache'):
-            ctx_manifest = next((m for m in hooks.emit('request_manifest', workspace_id=self.workspace_id) if m), {})
-            vfs_manifest = next((m for m in hooks.emit('request_vfs_manifest', workspace_id=self.workspace_id) if m), {})
-            self._manifest_cache = {"vfs": vfs_manifest, "ctx": ctx_manifest}
-        return self._manifest_cache
 
-    def get_manifest_files(self, target_key=None):
-        """SSOT Helper to extract polymorphic lists of files or chunks from the manifest."""
-        chunks = hooks.emit('request_manifest_chunks', target_key=target_key, workspace_id=self.workspace_id)
-        return next((c for c in chunks if c), [])
     def parse_uri(self, path_str):
         return parse_uri(path_str)
+
     def expand_selection(self, items, gather_only=False):
         """
         SSOT: Expands polymorphic frontend selection items into a flat, 
@@ -648,8 +641,13 @@ class ExtensionContext:
         """
         from akasa.uri import AkasaURI as _AkasaURI
 
-        results = hooks.emit('expand_selection', items=items, workspace_id=self.workspace_id, gather_only=gather_only)
-        candidate_list = next((r for r in results if r is not None), None)
+        candidate_list = self.emit_first(
+            'expand_selection',
+            items=items,
+            gather_only=gather_only,
+            default=None,
+            predicate=lambda r: r is not None
+        )
         source_iterable = candidate_list if candidate_list is not None else (items or [])
 
         normalized_files: List[str] = []
@@ -676,32 +674,45 @@ class ExtensionContext:
                             normalized_files.append(str(walked))
                 else:
                     normalized_files.append(str(_AkasaURI(raw_target)))
-
         return list(dict.fromkeys(normalized_files))
-    def save_manifest(self, manifest_data, is_full_compile=False):
-        """Writes updates to the centralized context manifest."""
-        hooks.emit('save_manifest', manifest_data=manifest_data, is_full_compile=is_full_compile, workspace_id=self.workspace_id)
-        if hasattr(self, '_manifest_cache'):
-            del self._manifest_cache
+
     def sync_vfs_barrier(self, timeout=5.0):
         """Halts the current thread until all VFS writes queued prior to this call are physically flushed."""
         _vfs_sync_barrier(self.workspace_id, timeout=timeout)
-
     def emit(self, event_name, *args, **kwargs):
-        """Emits a synchronous event, automatically injecting the tenant's workspace ID."""
-        kwargs['workspace_id'] = self.workspace_id
+        """Emits a synchronous event, automatically injecting the tenant's workspace ID if not explicitly specified."""
+        kwargs.setdefault('workspace_id', self.workspace_id)
         return hooks.emit(event_name, *args, **kwargs)
 
+    def emit_first(self, event_name, *args, default=None, predicate=None, **kwargs):
+        """Emits a short-circuiting query event, automatically injecting the tenant's workspace ID if not explicitly specified."""
+        kwargs.setdefault('workspace_id', self.workspace_id)
+        return hooks.emit_first(event_name, *args, default=default, predicate=predicate, **kwargs)
+
+    def emit_merge_dict(self, event_name, *args, **kwargs) -> Dict[str, Any]:
+        """Emits a dictionary-merging query event, automatically injecting the tenant's workspace ID if not explicitly specified."""
+        kwargs.setdefault('workspace_id', self.workspace_id)
+        return hooks.emit_merge_dict(event_name, *args, **kwargs)
+
+    def emit_merge_list(self, event_name, *args, **kwargs) -> List[Any]:
+        """Emits a list-flattening query event, automatically injecting the tenant's workspace ID if not explicitly specified."""
+        kwargs.setdefault('workspace_id', self.workspace_id)
+        return hooks.emit_merge_list(event_name, *args, **kwargs)
+
     def emit_background(self, event_name, *args, **kwargs):
-        """Emits a background event, automatically injecting the tenant's workspace ID."""
-        kwargs['workspace_id'] = self.workspace_id
+        """Emits a background event, automatically injecting the tenant's workspace ID if not explicitly specified."""
+        kwargs.setdefault('workspace_id', self.workspace_id)
         return hooks.emit_background(event_name, *args, **kwargs)
+
+
 class AkasaExtension:
     """
     Agnostic Blueprint wrapper that enforces tenant isolation, API routing,
     authorization, and SQLite schema migrations for kernel extensions.
     """
-    def __init__(self, name, module_name, title=None, description="", schema=None, core=False, settings_schema=None):
+    context_class = ExtensionContext
+
+    def __init__(self, name, module_name, title=None, description="", schema=None, core=False, settings_schema=None, extra_schemas=None):
         self.name = name
         self.title = title or name.replace('_', ' ').title()
         self.description = description
@@ -709,11 +720,14 @@ class AkasaExtension:
         self.schema = schema or {}
         self.core = core
         self.settings_schema = settings_schema or []
+        self.extra_schemas = extra_schemas or {}
 
         if self.settings_schema:
             _REGISTERED_SETTINGS_SCHEMAS[self.name] = self.settings_schema
         if self.schema:
             register_schema(self.name, self.schema)
+        for db_name, db_schema in self.extra_schemas.items():
+            register_schema(db_name, db_schema)
         # Universal REST endpoints for extension settings management
         @self.route('settings', methods=['GET'], docstring="[sync] Retrieves the current settings for this extension.")
         def get_settings(ctx):
@@ -747,9 +761,45 @@ class AkasaExtension:
             schema = self.settings_schema(ctx.workspace_id) if callable(self.settings_schema) else self.settings_schema
             return jsonify(schema)
 
-    def get_context(self, workspace_id, job_id=None):
+    def register_schema(self, db_name: str, schema_dict: Dict[str, Dict[str, str]]) -> None:
+        """Registers an additional declarative SQLite schema owned by this extension."""
+        register_schema(db_name, schema_dict)
+
+    def get_context(self, workspace_id=None, job_id=None):
         """SDK Factory: Returns a fully hydrated context inherently bound to this extension's schema."""
-        return ExtensionContext(self.name, workspace_id, settings_schema=self.settings_schema, job_id=job_id)
+        wid = workspace_id or _akasa_utils.sniff_tenant_id() or "default"
+        return self.context_class(self.name, wid, settings_schema=self.settings_schema, job_id=job_id)
+
+    def on(self, event_name: str, priority: int = 50):
+        """
+        SDK Hook Decorator: Registers an event listener stamped with this extension's authorization identity.
+        Automatically hydrates and injects `ctx` if the function's first parameter is named `ctx`.
+        """
+        def decorator(func):
+            sig = inspect.signature(func)
+            params = list(sig.parameters.keys())
+            wants_ctx = bool(params and params[0] == 'ctx')
+
+            if wants_ctx:
+                @functools.wraps(func)
+                def wrapper(*args, **kwargs):
+                    if args and isinstance(args[0], ExtensionContext):
+                        return func(*args, **kwargs)
+                    wid = kwargs.get('workspace_id') or _akasa_utils.sniff_tenant_id() or "default"
+                    ctx = self.get_context(wid)
+                    return func(ctx, *args, **kwargs)
+
+                wrapper._akasa_ext_name = self.name
+                wrapper.is_core = self.core
+                hooks.on(event_name, priority=priority)(wrapper)
+                return wrapper
+            else:
+                func._akasa_ext_name = self.name
+                func.is_core = self.core
+                hooks.on(event_name, priority=priority)(func)
+                return func
+        return decorator
+
     def worker(self, task_name):
         """
         SDK Decorator: Automatically wraps a background worker in a safe execution block.
@@ -761,7 +811,7 @@ class AkasaExtension:
             # Do not use functools.wraps here. The metronome relies on inspect.signature
             # to dynamically inject job_id and workspace_id based on the wrapper's exact kwargs.
             def wrapper(job_id=None, workspace_id=None, **kwargs):
-                ctx = ExtensionContext(self.name, workspace_id, settings_schema=self.settings_schema, job_id=job_id)
+                ctx = self.get_context(workspace_id, job_id=job_id)
 
                 # Execute the domain logic
                 if 'job_id' in inspect.signature(f).parameters:
@@ -802,7 +852,7 @@ class AkasaExtension:
         def decorator(f):
             @functools.wraps(f)
             def wrapper(workspace_id, *args, **kwargs):
-                ctx = ExtensionContext(self.name, workspace_id, settings_schema=self.settings_schema)
+                ctx = self.get_context(workspace_id)
                 return f(ctx, *args, **kwargs)
 
             # Use getattr to safely bypass the auth gate for core OS engines

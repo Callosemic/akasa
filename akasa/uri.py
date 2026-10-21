@@ -1,3 +1,4 @@
+import fnmatch
 import urllib.parse
 import posixpath
 import re
@@ -68,9 +69,7 @@ class AkasaURI:
         if not self.path.startswith(base_uri.path):
             raise ValueError("Current URI is not a subpath of the base URI.")
         return self.path[len(base_uri.path):].lstrip('/')
-
     def match(self, pattern: str) -> bool:
-        import fnmatch
         full_str = str(self)
         if fnmatch.fnmatch(full_str, pattern):
             return True

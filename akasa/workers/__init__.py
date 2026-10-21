@@ -171,8 +171,8 @@ def run_parallel(fn, items, max_workers: int = 4) -> list:
     items_list = list(items or [])
     if not items_list:
         return []
-    if len(items_list) == 1:
-        return [fn(items_list[0])]
+    if len(items_list) == 1 or threading.current_thread().name.startswith("Akasa-IO"):
+        return [fn(item) for item in items_list]
     if _io_executor is None:
         _io_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="Akasa-IO")
 

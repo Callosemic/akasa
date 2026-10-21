@@ -4,10 +4,13 @@ import time
 import json
 import shutil
 import queue
+import difflib
+import hashlib
 import traceback
 import threading
 from collections import OrderedDict
 from pathlib import Path
+from typing import Optional, Dict, List, Tuple, Any
 from akasa.hooks import hooks
 from akasa.db import get_connection
 from akasa.uri import AkasaURI
@@ -17,6 +20,258 @@ _VFS_READ_CACHE_BYTES = 0
 _VFS_READ_CACHE_MAX_BYTES = 8 * 1024 * 1024  # 8 MB RAM cache
 _VFS_READ_CACHE_MAX_FILE_BYTES = 1 * 1024 * 1024  # Only cache individual files <= 1 MB
 _VFS_CACHE_LOCK = threading.Lock()
+
+_VFS_TOMBSTONE = object()
+_VFS_PENDING_WRITES: Dict[str, Tuple[int, Any]] = {}
+_VFS_PENDING_SEQ = 0
+
+
+def _stage_pending_write(resolved_path: Optional[str], content_or_tombstone: Any) -> int:
+    """Synchronously stages a pending write or tombstone in RAM before queuing disk I/O."""
+    global _VFS_PENDING_SEQ
+    if not resolved_path:
+        return 0
+    norm_res = Path(resolved_path).as_posix()
+    with _VFS_CACHE_LOCK:
+        _VFS_PENDING_SEQ += 1
+        seq = _VFS_PENDING_SEQ
+        _VFS_PENDING_WRITES[norm_res] = (seq, content_or_tombstone)
+        if content_or_tombstone is _VFS_TOMBSTONE:
+            dir_prefix = norm_res.rstrip('/') + '/'
+            for k in list(_VFS_PENDING_WRITES.keys()):
+                if k.startswith(dir_prefix):
+                    _VFS_PENDING_WRITES[k] = (seq, _VFS_TOMBSTONE)
+        return seq
+
+
+def _clear_pending_write(resolved_path: Optional[str], seq: Optional[int] = None) -> None:
+    """Clears a staged pending write once physical disk commit completes, unless superseded by a newer write."""
+    if not resolved_path:
+        return
+    norm_res = Path(resolved_path).as_posix()
+    with _VFS_CACHE_LOCK:
+        cur = _VFS_PENDING_WRITES.get(norm_res)
+        if cur is not None and (seq is None or cur[0] <= seq):
+            _VFS_PENDING_WRITES.pop(norm_res, None)
+        if seq is not None:
+            dir_prefix = norm_res.rstrip('/') + '/'
+            for k, val in list(_VFS_PENDING_WRITES.items()):
+                if k.startswith(dir_prefix) and val[0] <= seq:
+                    _VFS_PENDING_WRITES.pop(k, None)
+
+
+def has_pending_vfs_write(resolved_path: Optional[str]) -> bool:
+    """Returns True if resolved_path currently has an un-flushed write in _VFS_PENDING_WRITES."""
+    if not resolved_path:
+        return False
+    norm_res = Path(resolved_path).as_posix()
+    with _VFS_CACHE_LOCK:
+        return norm_res in _VFS_PENDING_WRITES
+
+_ANCESTOR_CACHE: Dict[str, "OrderedDict[str, str]"] = OrderedDict()
+_ANCESTOR_LOCK = threading.Lock()
+_MAX_ANCESTORS_PER_FILE = 12
+_MAX_ANCESTOR_FILE_BYTES = 1 * 1024 * 1024  # 1 MB cap
+
+
+def compute_vfs_sha256(text: str) -> str:
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+
+def record_vfs_ancestor(workspace_id: str, filepath_or_resolved: str, text: str, text_hash: Optional[str] = None) -> str:
+    if text is None:
+        return ""
+    h = text_hash or compute_vfs_sha256(text)
+    if len(text.encode('utf-8')) > _MAX_ANCESTOR_FILE_BYTES:
+        return h
+    resolved = (
+        filepath_or_resolved
+        if os.path.isabs(str(filepath_or_resolved))
+        else (_resolve_physical_path(filepath_or_resolved, workspace_id or "default") or str(filepath_or_resolved))
+    )
+    with _ANCESTOR_LOCK:
+        ring = _ANCESTOR_CACHE.get(resolved)
+        if ring is None:
+            ring = OrderedDict()
+            _ANCESTOR_CACHE[resolved] = ring
+        ring[h] = text
+        ring.move_to_end(h)
+        _ANCESTOR_CACHE.move_to_end(resolved)
+        while len(ring) > _MAX_ANCESTORS_PER_FILE:
+            ring.popitem(last=False)
+        while len(_ANCESTOR_CACHE) > 512:
+            _ANCESTOR_CACHE.popitem(last=False)
+    return h
+
+
+def lookup_vfs_ancestor(workspace_id: str, filepath_or_resolved: str, base_hash: Optional[str], fallback_base_content: Optional[str] = None) -> Optional[str]:
+    if not base_hash:
+        return fallback_base_content
+    resolved = (
+        filepath_or_resolved
+        if os.path.isabs(str(filepath_or_resolved))
+        else (_resolve_physical_path(filepath_or_resolved, workspace_id or "default") or str(filepath_or_resolved))
+    )
+    with _ANCESTOR_LOCK:
+        ring = _ANCESTOR_CACHE.get(resolved)
+        if ring and base_hash in ring:
+            return ring[base_hash]
+    if isinstance(fallback_base_content, str):
+        return fallback_base_content
+    return None
+def _relocate_vfs_ancestors(resolved_src: str, resolved_dest: str):
+    if not resolved_src or not resolved_dest:
+        return
+    with _ANCESTOR_LOCK:
+        ring = _ANCESTOR_CACHE.pop(resolved_src, None)
+        if ring is not None:
+            _ANCESTOR_CACHE[resolved_dest] = ring
+            _ANCESTOR_CACHE.move_to_end(resolved_dest)
+
+
+def _extract_diff_hunks(base_lines: List[str], target_lines: List[str]) -> List[Tuple[int, int, List[str]]]:
+    """Returns list of (base_start, base_end, replacement_lines) hunks transforming base_lines -> target_lines."""
+    matcher = difflib.SequenceMatcher(None, base_lines, target_lines, autojunk=False)
+    hunks: List[Tuple[int, int, List[str]]] = []
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == 'equal':
+            continue
+        hunks.append((i1, i2, target_lines[j1:j2]))
+    return hunks
+
+
+def _is_contiguous_line_subslice(needle: List[str], haystack: List[str]) -> bool:
+    if not needle:
+        return False
+    n_len = len(needle)
+    h_len = len(haystack)
+    if n_len > h_len:
+        return False
+    return any(haystack[idx:idx + n_len] == needle for idx in range(h_len - n_len + 1))
+
+
+def _is_subsequence_edit(disk_hunks: List[Tuple[int, int, List[str]]], incoming_hunks: List[Tuple[int, int, List[str]]]) -> bool:
+    """
+    Zombie-ACK Detector:
+    Checks if every hunk in disk_hunks (Base -> Disk V1) shares the same base span and is either identical to
+    or a contiguous line-slice extension within a corresponding hunk in incoming_hunks (Base -> Incoming V2).
+    """
+    if not disk_hunks:
+        return True
+    for d_start, d_end, d_rep in disk_hunks:
+        matched = False
+        for in_start, in_end, in_rep in incoming_hunks:
+            if in_start == d_start and in_end == d_end:
+                if d_rep == in_rep or _is_contiguous_line_subslice(d_rep, in_rep):
+                    matched = True
+                    break
+        if not matched:
+            return False
+    return True
+
+
+def three_way_merge_text(base_text: str, disk_text: str, incoming_text: str) -> Tuple[bool, str]:
+    """
+    Deterministic 3-Way Text Merger (Base -> Disk vs. Base -> Incoming).
+    Returns (is_clean_merge: bool, merged_text: str).
+    """
+    if disk_text == incoming_text:
+        return True, incoming_text
+    if disk_text == base_text:
+        return True, incoming_text
+    if incoming_text == base_text:
+        return True, disk_text
+
+    base_norm = base_text.replace('\r\n', '\n')
+    disk_norm = disk_text.replace('\r\n', '\n')
+    inc_norm = incoming_text.replace('\r\n', '\n')
+
+    if disk_norm == inc_norm:
+        return True, incoming_text
+    if disk_norm == base_norm:
+        return True, incoming_text
+    if inc_norm == base_norm:
+        return True, disk_text
+
+    base_lines = base_norm.split('\n')
+    disk_lines = disk_norm.split('\n')
+    inc_lines = inc_norm.split('\n')
+
+    disk_hunks = _extract_diff_hunks(base_lines, disk_lines)
+    inc_hunks = _extract_diff_hunks(base_lines, inc_lines)
+
+    # 1. Zombie-ACK Fast Path: Disk V1 is an earlier snapshot of the exact same edit stream in Incoming V2
+    if _is_subsequence_edit(disk_hunks, inc_hunks):
+        return True, incoming_text
+
+    # 2. Pure-Python 3-Way Hunk Merger (handles arbitrary non-overlapping & identical hunks)
+    out_lines: List[str] = []
+    base_cursor = 0
+    idx_d = 0
+    idx_i = 0
+    clean_hunk_merge = True
+
+    while idx_d < len(disk_hunks) or idx_i < len(inc_hunks):
+        d_hunk = disk_hunks[idx_d] if idx_d < len(disk_hunks) else None
+        i_hunk = inc_hunks[idx_i] if idx_i < len(inc_hunks) else None
+
+        if d_hunk and not i_hunk:
+            d_s, d_e, d_rep = d_hunk
+            out_lines.extend(base_lines[base_cursor:d_s])
+            out_lines.extend(d_rep)
+            base_cursor = d_e
+            idx_d += 1
+        elif i_hunk and not d_hunk:
+            i_s, i_e, i_rep = i_hunk
+            out_lines.extend(base_lines[base_cursor:i_s])
+            out_lines.extend(i_rep)
+            base_cursor = i_e
+            idx_i += 1
+        else:
+            d_s, d_e, d_rep = d_hunk
+            i_s, i_e, i_rep = i_hunk
+
+            if d_s == i_s and d_e == i_e and d_rep == i_rep:
+                out_lines.extend(base_lines[base_cursor:d_s])
+                out_lines.extend(d_rep)
+                base_cursor = d_e
+                idx_d += 1
+                idx_i += 1
+            elif d_e < i_s or (d_e == i_s and (d_s < d_e or i_s < i_e)):
+                out_lines.extend(base_lines[base_cursor:d_s])
+                out_lines.extend(d_rep)
+                base_cursor = d_e
+                idx_d += 1
+            elif i_e < d_s or (i_e == d_s and (i_s < i_e or d_s < d_e)):
+                out_lines.extend(base_lines[base_cursor:i_s])
+                out_lines.extend(i_rep)
+                base_cursor = i_e
+                idx_i += 1
+            else:
+                clean_hunk_merge = False
+                break
+    if clean_hunk_merge:
+        out_lines.extend(base_lines[base_cursor:])
+        merged_str = '\n'.join(out_lines)
+        if '\r\n' in disk_text and '\r\n' not in merged_str:
+            merged_str = merged_str.replace('\n', '\r\n')
+        return True, merged_str
+
+    return False, incoming_text
+def get_vfs_cache_stats() -> dict:
+    """Returns public telemetry statistics for the VFS read cache and write queue."""
+    with _VFS_CACHE_LOCK:
+        files_count = len(_VFS_READ_CACHE)
+        mb_used = round(_VFS_READ_CACHE_BYTES / (1024 * 1024), 2)
+        pending_count = len(_VFS_PENDING_WRITES)
+    return {
+        "vfs_read_cache_files": files_count,
+        "vfs_read_cache_mb": mb_used,
+        "vfs_pending_overlay_files": pending_count,
+        "vfs_write_queue_depth": _VFS_WRITE_QUEUE.qsize()
+    }
+
+
 def _cache_get(resolved_path: str, st=None):
     """Returns cached file text if physical (mtime_ns, size) matches; otherwise None."""
     global _VFS_READ_CACHE_BYTES
@@ -59,25 +314,42 @@ def _cache_put(resolved_path: str, content: str, st=None):
             _VFS_READ_CACHE_BYTES -= evicted[2]
         _VFS_READ_CACHE[resolved_path] = (st.st_mtime_ns, st.st_size, content_bytes, content)
         _VFS_READ_CACHE_BYTES += content_bytes
-def _cache_evict(resolved_path: str):
+    record_vfs_ancestor("default", resolved_path, content)
+
+
+def evict_vfs_cache(resolved_path: str, preserve_ancestors: bool = False):
     global _VFS_READ_CACHE_BYTES
     if not resolved_path:
         return
+    dir_prefix = resolved_path.rstrip('/') + '/'
     with _VFS_CACHE_LOCK:
         old = _VFS_READ_CACHE.pop(resolved_path, None)
         if old:
             _VFS_READ_CACHE_BYTES -= old[2]
-        dir_prefix = resolved_path.rstrip('/') + '/'
         child_keys = [k for k in _VFS_READ_CACHE.keys() if k.startswith(dir_prefix)]
         for k in child_keys:
             entry = _VFS_READ_CACHE.pop(k, None)
             if entry:
                 _VFS_READ_CACHE_BYTES -= entry[2]
+    if not preserve_ancestors:
+        with _ANCESTOR_LOCK:
+            _ANCESTOR_CACHE.pop(resolved_path, None)
+            anc_children = [k for k in _ANCESTOR_CACHE.keys() if k.startswith(dir_prefix)]
+            for k in anc_children:
+                _ANCESTOR_CACHE.pop(k, None)
 
+_cache_evict = evict_vfs_cache
 def _is_file_identical(resolved_path: str, content: str) -> bool:
-    """Fast-path idempotency check: single stat + RAM cache check before touching disk."""
+    """Fast-path idempotency check: pending overlay + single stat + RAM cache check before touching disk."""
     if not resolved_path:
         return False
+    norm_res = Path(resolved_path).as_posix()
+    with _VFS_CACHE_LOCK:
+        pending = _VFS_PENDING_WRITES.get(norm_res)
+        if pending is not None:
+            if pending[1] is _VFS_TOMBSTONE:
+                return False
+            return pending[1] == content
     try:
         st = os.stat(resolved_path)
     except OSError:
@@ -202,6 +474,12 @@ def _resolve_physical_path(filepath, workspace_id, is_absolute_artifact=False):
 
     return driver.resolve(uri, workspace_id, physical_target)
 
+
+def resolve_physical_path(filepath, workspace_id="default", is_absolute_artifact=False):
+    """Public SSOT gateway for resolving a canonical URI to its physical host path."""
+    return _resolve_physical_path(filepath, workspace_id, is_absolute_artifact=is_absolute_artifact)
+
+
 _VFS_WRITE_QUEUE = queue.Queue()
 _VFS_WORKER_THREAD = None
 _VFS_SHUTDOWN_SIGNAL = threading.Event()
@@ -243,6 +521,7 @@ def _vfs_commit_worker():
                     continue
                 elif action == "delete":
                     resolved_path = _resolve_physical_path(filepath, workspace_id, data.get("is_absolute_artifact"))
+                    p_seq = data.get("_pending_seq")
 
                     try: hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=filepath, resolved_path=resolved_path, content="", data=data)
                     except Exception: pass
@@ -252,6 +531,7 @@ def _vfs_commit_worker():
                             shutil.rmtree(resolved_path)
                         else:
                             os.remove(resolved_path)
+                    _clear_pending_write(resolved_path, p_seq)
                     ignore_ledger = bool(data.get("is_absolute_artifact") or data.get("ignore_ledger"))
                     if not ignore_ledger:
                         db_conn = get_connection("workers", workspace_id=workspace_id)
@@ -263,6 +543,7 @@ def _vfs_commit_worker():
                     hooks.emit('vfs_mutated', workspace_id=workspace_id, mutations=[{"filepath": filepath, "operation": "delete", "ignore_ledger": ignore_ledger}])
                 elif action == "move":
                     dest_path = data.get("dest_path")
+                    p_seq = data.get("_pending_seq")
                     resolved_src = _resolve_physical_path(filepath, workspace_id, data.get("is_absolute_artifact"))
                     resolved_dest = _resolve_physical_path(dest_path, workspace_id, data.get("is_absolute_artifact"))
 
@@ -270,12 +551,14 @@ def _vfs_commit_worker():
                         hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=filepath, resolved_path=resolved_src, content="", data=data)
                         hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=dest_path, resolved_path=resolved_dest, content="", data=data)
                     except Exception: pass
-
                     if resolved_src and resolved_dest and os.path.exists(resolved_src):
-                        _cache_evict(resolved_src)
-                        _cache_evict(resolved_dest)
+                        _relocate_vfs_ancestors(resolved_src, resolved_dest)
+                        _cache_evict(resolved_src, preserve_ancestors=True)
+                        _cache_evict(resolved_dest, preserve_ancestors=True)
                         os.makedirs(Path(resolved_dest).parent, exist_ok=True)
                         shutil.move(resolved_src, resolved_dest)
+                        _clear_pending_write(resolved_src, p_seq)
+                        _clear_pending_write(resolved_dest, p_seq)
 
                         ignore_ledger = bool(data.get("is_absolute_artifact") or data.get("ignore_ledger"))
                         if not ignore_ledger:
@@ -290,10 +573,12 @@ def _vfs_commit_worker():
                             )
                             db_conn.commit()
                         hooks.emit('vfs_mutated', workspace_id=workspace_id, mutations=[
-                            {"filepath": filepath, "operation": "delete", "ignore_ledger": ignore_ledger},
-                            {"filepath": dest_path, "operation": "save", "ignore_ledger": ignore_ledger}
+                            {"filepath": filepath, "operation": "delete", "relocated_to": dest_path, "ignore_ledger": ignore_ledger},
+                            {"filepath": dest_path, "operation": "save", "relocated_from": filepath, "ignore_ledger": ignore_ledger}
                         ])
                     else:
+                        _clear_pending_write(resolved_src, p_seq)
+                        _clear_pending_write(resolved_dest, p_seq)
                         print(f"❌ [VFS Pipeline] Move aborted: Source file missing on disk ({filepath})")
                 elif action == "bulk":
                     operations = data.get("operations", [])
@@ -306,6 +591,7 @@ def _vfs_commit_worker():
                         op_type = op_item.get("action")
                         src_fp = op_item.get("filepath", "")
                         dst_fp = op_item.get("dest_path", "")
+                        op_seq = op_item.get("_pending_seq")
                         ignore_ledger = bool(op_item.get("is_absolute_artifact") or op_item.get("ignore_ledger"))
 
                         if op_type == "delete" and src_fp:
@@ -320,6 +606,7 @@ def _vfs_commit_worker():
                                     shutil.rmtree(resolved_path)
                                 else:
                                     os.remove(resolved_path)
+                            _clear_pending_write(resolved_path, op_seq)
                             if not ignore_ledger:
                                 ledger_rows.append((src_fp, 'deleted', now_ts))
                             emitted_mutations.append({"filepath": src_fp, "operation": "delete", "ignore_ledger": ignore_ledger})
@@ -332,15 +619,18 @@ def _vfs_commit_worker():
                             except Exception:
                                 pass
                             if resolved_src and resolved_dest and os.path.exists(resolved_src):
-                                _cache_evict(resolved_src)
-                                _cache_evict(resolved_dest)
+                                _relocate_vfs_ancestors(resolved_src, resolved_dest)
+                                _cache_evict(resolved_src, preserve_ancestors=True)
+                                _cache_evict(resolved_dest, preserve_ancestors=True)
                                 os.makedirs(Path(resolved_dest).parent, exist_ok=True)
                                 shutil.move(resolved_src, resolved_dest)
                                 if not ignore_ledger:
                                     ledger_rows.append((src_fp, 'deleted', now_ts))
                                     ledger_rows.append((dst_fp, 'added', now_ts))
-                                emitted_mutations.append({"filepath": src_fp, "operation": "delete", "ignore_ledger": ignore_ledger})
-                                emitted_mutations.append({"filepath": dst_fp, "operation": "save", "ignore_ledger": ignore_ledger})
+                                emitted_mutations.append({"filepath": src_fp, "operation": "delete", "relocated_to": dst_fp, "ignore_ledger": ignore_ledger})
+                                emitted_mutations.append({"filepath": dst_fp, "operation": "save", "relocated_from": src_fp, "ignore_ledger": ignore_ledger})
+                            _clear_pending_write(resolved_src, op_seq)
+                            _clear_pending_write(resolved_dest, op_seq)
 
                         elif op_type == "save" and src_fp:
                             save_res = execute_vfs_save_physical(workspace_id, src_fp, op_item.get("content", ""), op_item, defer_events=True)
@@ -389,14 +679,25 @@ def stop_vfs_pipeline(**kwargs):
 def execute_vfs_move(workspace_id, filepath, dest_path):
     if str(filepath).startswith("ws://") or str(dest_path).startswith("ws://"):
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}, 403
+    resolved_src = _resolve_physical_path(filepath, workspace_id)
+    resolved_dest = _resolve_physical_path(dest_path, workspace_id)
+    src_text = None
+    if resolved_src:
+        with VFSTransaction(workspace_id) as vfs:
+            src_text = vfs.read(filepath)
+    seq = _stage_pending_write(resolved_src, _VFS_TOMBSTONE)
+    if resolved_dest and src_text is not None:
+        seq = _stage_pending_write(resolved_dest, src_text)
     _ensure_vfs_worker_alive()
-    _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "move", "dest_path": dest_path}))
+    _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "move", "dest_path": dest_path, "_pending_seq": seq}))
     return {"status": "accepted", "message": f"File move queued."}, 202
 def execute_vfs_delete(workspace_id, filepath):
     if str(filepath).startswith("ws://"):
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}, 403
+    resolved_path = _resolve_physical_path(filepath, workspace_id)
+    seq = _stage_pending_write(resolved_path, _VFS_TOMBSTONE)
     _ensure_vfs_worker_alive()
-    _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "delete"}))
+    _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "delete", "_pending_seq": seq}))
     return {"status": "accepted", "message": f"File deletion queued."}, 202
 
 def execute_vfs_bulk(workspace_id, operations):
@@ -406,27 +707,58 @@ def execute_vfs_bulk(workspace_id, operations):
         dest = op.get("dest_path", "")
         if str(fp).startswith("ws://") or str(dest).startswith("ws://"):
             continue
-        sanitized.append(op)
+        op_copy = dict(op)
+        act = op_copy.get("action", "save")
+        is_abs = op_copy.get("is_absolute_artifact")
+        if act == "delete" and fp:
+            res_p = _resolve_physical_path(fp, workspace_id, is_abs)
+            op_copy["_pending_seq"] = _stage_pending_write(res_p, _VFS_TOMBSTONE)
+        elif act == "move" and fp and dest:
+            res_s = _resolve_physical_path(fp, workspace_id, is_abs)
+            res_d = _resolve_physical_path(dest, workspace_id, is_abs)
+            src_text = None
+            if res_s:
+                with VFSTransaction(workspace_id) as vfs:
+                    src_text = vfs.read(fp, is_absolute_artifact=bool(is_abs))
+            seq = _stage_pending_write(res_s, _VFS_TOMBSTONE)
+            if res_d and src_text is not None:
+                seq = _stage_pending_write(res_d, src_text)
+            op_copy["_pending_seq"] = seq
+        elif act == "save" and fp:
+            res_p = _resolve_physical_path(fp, workspace_id, is_abs)
+            op_copy["_pending_seq"] = _stage_pending_write(res_p, op_copy.get("content", ""))
+        sanitized.append(op_copy)
     _ensure_vfs_worker_alive()
     _VFS_WRITE_QUEUE.put((workspace_id, "", "", {"action": "bulk", "operations": sanitized}))
     return {"status": "accepted", "message": f"Bulk operation ({len(sanitized)} item(s)) queued.", "operations": sanitized}, 202
 def execute_vfs_save(workspace_id, filepath, content, data=None):
-    if data is None:
-        data = {}
+    data = dict(data or {})
     if str(filepath).startswith("ws://"):
         print(f"🛑 [VFS Security] Write dropped: Virtual mount '{filepath}' is strictly read-only.")
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}
+    resolved_path = _resolve_physical_path(filepath, workspace_id, data.get("is_absolute_artifact"))
     # Pre-flight Volume Validation
     if not data.get("is_absolute_artifact"):
-        if not _resolve_physical_path(filepath, workspace_id):
+        if not resolved_path:
             print(f"⚠️ [VFS] Save dropped: Volume for '{filepath}' is not mounted.")
             return {"status": "error", "message": f"Volume for '{filepath}' is not mounted."}
+
+    action = data.get("action", "save")
+    if action == "delete":
+        data["_pending_seq"] = _stage_pending_write(resolved_path, _VFS_TOMBSTONE)
+    elif action == "save":
+        if data.get("delete_source") and data["delete_source"] != filepath:
+            old_res = _resolve_physical_path(data["delete_source"], workspace_id, data.get("is_absolute_artifact"))
+            _stage_pending_write(old_res, _VFS_TOMBSTONE)
+        data["_pending_seq"] = _stage_pending_write(resolved_path, content)
+        record_vfs_ancestor(workspace_id, resolved_path or filepath, content)
 
     _ensure_vfs_worker_alive()
     _VFS_WRITE_QUEUE.put((workspace_id, filepath, content, data))
     return {"status": "accepted", "message": f"File {filepath} queued for atomic background commit."}
 def execute_vfs_save_physical(workspace_id, filepath, content, data, defer_events=False):
     resolved_path = _resolve_physical_path(filepath, workspace_id, data.get("is_absolute_artifact"))
+    p_seq = data.get("_pending_seq") if isinstance(data, dict) else None
 
     try:
         hooks.emit('pre_file_save', workspace_id=workspace_id, filepath=filepath, resolved_path=resolved_path, content=content, data=data)
@@ -438,8 +770,8 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data, defer_event
         return None
 
     is_new = not os.path.exists(resolved_path)
-    # Idempotency Gatekeeper: Fast-path size + RAM cache check before touching disk
-    if not is_new and not data.get("delete_source"):
+    # Idempotency Gatekeeper: Fast-path size + RAM cache check before touching disk (bypassed if staged in pending overlay)
+    if not is_new and not data.get("delete_source") and p_seq is None:
         if _is_file_identical(resolved_path, content):
             if os.environ.get("AKASA_DEBUG") == "1":
                 print(f"💽 [VFS TELEMETRY] Silent drop (idempotent): {filepath}")
@@ -448,13 +780,17 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data, defer_event
     if os.environ.get("AKASA_DEBUG") == "1":
         print(f"💽 [VFS TELEMETRY] Writing to disk: {filepath}")
 
-    target_dir = Path(resolved_path).parent.as_posix()
-    if target_dir:
-        os.makedirs(target_dir, exist_ok=True)
-    with open(resolved_path, 'w', encoding='utf-8') as f:
-        f.write(content)
-    _cache_put(resolved_path, content)
+    try:
+        target_dir = Path(resolved_path).parent.as_posix()
+        if target_dir:
+            os.makedirs(target_dir, exist_ok=True)
+        with open(resolved_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+        _cache_put(resolved_path, content)
+    finally:
+        _clear_pending_write(resolved_path, p_seq)
 
+    saved_hash = compute_vfs_sha256(content)
     now_ts = time.time()
     ignore_ledger = bool(data.get("is_absolute_artifact") or data.get("ignore_ledger"))
     ledger_rows = []
@@ -462,14 +798,22 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data, defer_event
 
     if not ignore_ledger:
         ledger_rows.append((filepath, 'modified' if not is_new else 'added', now_ts))
-
     delete_source = data.get("delete_source")
-    if delete_source:
+    relocated_from = None
+    if delete_source and delete_source != filepath:
         old_abs_path = _resolve_physical_path(delete_source, workspace_id, data.get("is_absolute_artifact"))
+        _clear_pending_write(old_abs_path, p_seq)
         if old_abs_path and os.path.exists(old_abs_path) and os.path.abspath(old_abs_path) != os.path.abspath(resolved_path):
+            _relocate_vfs_ancestors(old_abs_path, resolved_path)
             _cache_evict(old_abs_path)
             os.remove(old_abs_path)
-            emitted_mutations.append({"filepath": delete_source, "operation": "delete", "ignore_ledger": ignore_ledger})
+            relocated_from = delete_source
+            emitted_mutations.append({
+                "filepath": delete_source,
+                "operation": "delete",
+                "relocated_to": filepath,
+                "ignore_ledger": ignore_ledger
+            })
             try:
                 parent_dir = Path(old_abs_path).parent.as_posix()
                 while parent_dir and os.path.isdir(parent_dir) and not os.listdir(parent_dir):
@@ -480,7 +824,10 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data, defer_event
             if not ignore_ledger:
                 ledger_rows.append((delete_source, 'deleted', now_ts))
 
-    emitted_mutations.append({"filepath": filepath, "operation": "save", "ignore_ledger": ignore_ledger})
+    save_mut = {"filepath": filepath, "operation": "save", "base_hash": saved_hash, "ignore_ledger": ignore_ledger}
+    if relocated_from:
+        save_mut["relocated_from"] = relocated_from
+    emitted_mutations.append(save_mut)
 
     if defer_events:
         return ledger_rows, emitted_mutations
@@ -497,37 +844,82 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data, defer_event
     hooks.emit('vfs_mutated', workspace_id=workspace_id, mutations=emitted_mutations)
     return None
 class VFSTransaction:
-    """Provides atomic-style batching and async queue dispatch for file mutations."""
+    """Provides dual-mode immediate queue dispatch and atomic buffered context-manager transactions for VFS mutations."""
     def __init__(self, workspace_id):
         self.workspace_id = workspace_id
         self._buffer = []
         self._in_transaction = False
+
     def save(self, filepath, content, data=None):
-        data = data or {}
+        data = dict(data or {})
         if not data.get("is_absolute_artifact") and filepath and "://" not in str(filepath):
             raise ValueError(f"Non-canonical URI rejected by VFS save (missing scheme:// prefix): '{filepath}'")
         resolved = _resolve_physical_path(filepath, self.workspace_id, data.get("is_absolute_artifact"))
         if not data.get("is_absolute_artifact") and not resolved:
             print(f"⚠️ [VFS] Transaction dropped: Volume for '{filepath}' is not mounted.")
-            return
+            return {"status": "error", "message": f"Volume for '{filepath}' is not mounted."}
         if self._in_transaction:
             self._buffer.append((filepath, content, data))
-            return
+            return {"status": "buffered", "message": f"File {filepath} buffered in transaction."}
         # Pre-flight Idempotency Gatekeeper: fast-path size + RAM cache check
         if not data.get("delete_source") and resolved and _is_file_identical(resolved, content):
-            return
-        execute_vfs_save(self.workspace_id, filepath, content, data)
+            return {"status": "accepted", "message": f"File {filepath} unchanged (idempotent)."}
+        return execute_vfs_save(self.workspace_id, filepath, content, data)
 
     def delete(self, filepath, data=None):
         """Ergonomic wrapper for queuing an atomic VFS deletion."""
-        data = data or {}
+        data = dict(data or {})
         if not data.get("is_absolute_artifact") and filepath and "://" not in str(filepath):
             raise ValueError(f"Non-canonical URI rejected by VFS delete (missing scheme:// prefix): '{filepath}'")
         data["action"] = "delete"
         if self._in_transaction:
             self._buffer.append((filepath, "", data))
-        else:
-            execute_vfs_save(self.workspace_id, filepath, "", data)
+            return {"status": "buffered", "message": "File deletion buffered."}, 202
+        if data.get("ignore_ledger") or data.get("is_absolute_artifact"):
+            res = execute_vfs_save(self.workspace_id, filepath, "", data)
+            return res, 202
+        return execute_vfs_delete(self.workspace_id, filepath)
+
+    def move(self, filepath, dest_path, data=None):
+        """Ergonomic wrapper for queuing an atomic VFS move."""
+        data = dict(data or {})
+        if not data.get("is_absolute_artifact") and (
+            (filepath and "://" not in str(filepath)) or (dest_path and "://" not in str(dest_path))
+        ):
+            raise ValueError(f"Non-canonical URI rejected by VFS move (missing scheme:// prefix): '{filepath}' -> '{dest_path}'")
+        data["action"] = "move"
+        data["dest_path"] = dest_path
+        if self._in_transaction:
+            self._buffer.append((filepath, "", data))
+            return {"status": "buffered", "message": "File move buffered."}, 202
+        return execute_vfs_move(self.workspace_id, filepath, dest_path)
+
+    def bulk(self, operations: List[Dict[str, Any]]):
+        """Queues a batch of VFS operations (move, delete, save) in a single atomic commit."""
+        if self._in_transaction:
+            for op in (operations or []):
+                act = op.get("action", "save")
+                fp = op.get("filepath", "")
+                content = op.get("content", "")
+                op_copy = dict(op)
+                self._buffer.append((fp, content, op_copy))
+            return {"status": "buffered", "operations": operations}, 202
+        return execute_vfs_bulk(self.workspace_id, operations)
+
+    def evict_cache(self, resolved_path: str, preserve_ancestors: bool = False) -> None:
+        evict_vfs_cache(resolved_path, preserve_ancestors=preserve_ancestors)
+
+    def compute_sha256(self, text: str) -> str:
+        return compute_vfs_sha256(text)
+
+    def record_ancestor(self, filepath: str, text: str, text_hash: Optional[str] = None) -> str:
+        return record_vfs_ancestor(self.workspace_id, filepath, text, text_hash=text_hash)
+
+    def lookup_ancestor(self, filepath: str, base_hash: Optional[str], fallback_base_content: Optional[str] = None) -> Optional[str]:
+        return lookup_vfs_ancestor(self.workspace_id, filepath, base_hash, fallback_base_content=fallback_base_content)
+
+    def three_way_merge(self, base_text: str, disk_text: str, incoming_text: str) -> Tuple[bool, str]:
+        return three_way_merge_text(base_text, disk_text, incoming_text)
     def read(self, filepath, is_absolute_artifact=False):
         """Safely resolves and reads a file's contents with a single stat syscall."""
         if not is_absolute_artifact and filepath and "://" not in str(filepath):
@@ -538,10 +930,17 @@ class VFSTransaction:
                     if buf_data.get("action") == "delete":
                         return None
                     return buf_content
-
         resolved = _resolve_physical_path(filepath, self.workspace_id, is_absolute_artifact)
         if not resolved:
             return None
+
+        norm_res = Path(resolved).as_posix()
+        with _VFS_CACHE_LOCK:
+            pending = _VFS_PENDING_WRITES.get(norm_res)
+            if pending is not None:
+                if pending[1] is _VFS_TOMBSTONE:
+                    return None
+                return pending[1]
 
         try:
             st = os.stat(resolved)
@@ -591,7 +990,7 @@ class VFSTransaction:
             return
         for root, dirs, files in os.walk(resolved_dir):
             # Inversion of Control: Host application defines standard noise to ignore
-            ignored_dirs = next((res for res in hooks.emit('request_vfs_ignore_dirs', workspace_id=self.workspace_id) if res), [])
+            ignored_dirs = hooks.emit_first('request_vfs_ignore_dirs', workspace_id=self.workspace_id, default=[])
             dirs[:] = [d for d in dirs if d not in ignored_dirs]
             for file in files:
                 if exts and not any(file.endswith(ext) for ext in exts):

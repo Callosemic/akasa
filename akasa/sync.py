@@ -77,15 +77,7 @@ def get_system_deltas(workspace_id=None, since_ts=0.0):
     pending_modules = pipeline_state["pending_modules"]
 
     # 3. Collect Signatures via Event Bus
-    signatures = {}
-    hook_responses = hooks.emit('register_manifest_signatures', workspace_id=wid, since_ts=since_ts)
-    for res in hook_responses:
-        if isinstance(res, dict):
-            for domain, sigs in res.items():
-                if domain not in signatures:
-                    signatures[domain] = {}
-                if isinstance(sigs, dict):
-                    signatures[domain].update(sigs)
+    signatures = hooks.emit_merge_dict('register_manifest_signatures', workspace_id=wid, since_ts=since_ts)
     return {
         "timestamp": now,
         "backend_boot_ts": KERNEL_BOOT_TS,
