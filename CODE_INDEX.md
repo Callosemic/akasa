@@ -9,9 +9,9 @@ akasa/
 ├── CODE_INDEX.md                   # Architectural directory map and module overview
 ├── README.md                       # Core substrate documentation and usage guide
 ├── akasa/                          # Central kernel package root
-│   ├── __init__.py                 # Fitness test suite entry point and runner
+│   ├── __init__.py                 # Unit test package initialization
 │   ├── auth/                       # Authentication blueprint, token exchange, and Fernet encryption
-│   │   └── __init__.py             # Fitness test suite entry point and runner
+│   │   └── __init__.py             # Unit test package initialization
 │   ├── db.py                       # Thread-local SQLite connection pool and WAL schema migrations
 │   ├── events.py                   # Thread-safe SSE event bus and client queue manager
 │   ├── extension.py                # Extension SDK context wrappers, SettingsManager, and JobManager
@@ -24,7 +24,7 @@ akasa/
 │   ├── utils.py                    # Dynamic workspace physics, JSON config helpers, and macro tools
 │   ├── vfs.py                      # Virtual File System, volume router, and async write queue
 │   └── workers/                    # Metronome worker engine and job ledger
-│       └── __init__.py             # Fitness test suite entry point and runner
+│       └── __init__.py             # Unit test package initialization
 ├── docs/                           # Architectural documentation and standards
 │   ├── 00_index.md                 # Master documentation index
 │   ├── 01_engineering_standards.md # Core engineering standards and audit guardrails
@@ -36,12 +36,18 @@ akasa/
 │       ├── 0004_vfs_bulk_mutation_batching_and_atomic_consolidation.md # ADR 0004 specification
 │       ├── 0005_parallel_dag_orchestration_vfs_ram_caching_and_inter_workspace_routing.md # ADR 0005 specification
 │       ├── 0006_resource_governance_bounded_executors_and_secret_lifecycle.md # ADR 0006 specification
-│       └── 0007_kernel_bootloader_vfs_3way_merge_and_substrate_purity.md # [comment required]
+│       ├── 0007_kernel_bootloader_vfs_3way_merge_and_substrate_purity.md # ADR 0007 kernel bootloader, 3-way VFS merge, and substrate purity specification
+│       └── 0008_microbatched_vfs_dual_pool_workers_and_ipc_gateway.md # ADR 0008 micro-batched VFS commits, dual-pool workers, signature validation, and IPC gateway specification
 ├── pyproject.toml                  # Build system specification and dependencies
-└── tests/                          # Architectural fitness tests and AST validators
+└── tests/                          # Architectural fitness tests and unit test suite
     ├── fitness/                    # Fitness rule package directory
-    │   ├── __init__.py             # Fitness test suite entry point and runner
+    │   ├── __init__.py             # Unit test package initialization
     │   ├── core.py                 # Shared fitness test state, path collection, and violation reporter
     │   └── rules_python.py         # AST visitor rules enforcing Tier 1 substrate purity and guardrails
-    └── fitness_functions.py        # CLI executable entry point for fitness validation
+    ├── fitness_functions.py        # CLI executable entry point for fitness validation
+    ├── run_unit_tests.py           # CLI runner for Akasa kernel behavioral unit tests
+    └── unit/                       # Behavioral unit tests for the Akasa kernel
+        ├── __init__.py             # Unit test package initialization
+        ├── test_kernel_hardening.py # Unit tests for RFC 0048 VFS micro-batching, idempotency, slotted AkasaURI, hook auth caching, and SQLite PRAGMAs
+        └── test_worker_contracts.py # Unit tests for signature-driven worker validation, DAG chains, and envelope isolation
 ```

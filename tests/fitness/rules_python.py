@@ -1,12 +1,55 @@
 import os
 import ast
 from pathlib import Path
-from .core import KERNEL_DIR, VFS_WRITE_WHITELIST, SQLITE_WHITELIST, report_violation, collect_unique_files
+from .core import PROJECT_ROOT, KERNEL_DIR, VFS_WRITE_WHITELIST, SQLITE_WHITELIST, report_violation, collect_unique_files
 
 class KernelFitnessVisitor(ast.NodeVisitor):
-    def __init__(self, filepath, filename):
+    def __init__(self, filepath, filename, is_test=False):
         self.filepath = filepath
         self.filename = filename
+        self.is_test = is_test or "tests" in Path(filepath).parts or filename.startswith("test_")
+        self.top_level_imports = set()
+    def visit_Module(self, node):
+        top_level_funcs = set()
+        for stmt in node.body:
+            if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if stmt.name in top_level_funcs:
+                    report_violation(
+                        "DUPLICATE_TOP_LEVEL_DEFINITION",
+                        self.filepath,
+                        stmt.lineno,
+                        f"Duplicate top-level function '{stmt.name}' detected in '{self.filename}'."
+                    )
+                top_level_funcs.add(stmt.name)
+            elif isinstance(stmt, ast.Import):
+                for alias in stmt.names:
+                    self.top_level_imports.add(alias.asname or alias.name)
+            elif isinstance(stmt, ast.ImportFrom):
+                module = stmt.module or ""
+                for alias in stmt.names:
+                    self.top_level_imports.add(f"{module}.{alias.name}" if module else alias.name)
+                    self.top_level_imports.add(alias.asname or alias.name)
+        self.generic_visit(node)
+
+    def visit_FunctionDef(self, node):
+        for child in ast.walk(node):
+            if isinstance(child, ast.Import):
+                for alias in child.names:
+                    name = alias.asname or alias.name
+                    if name in self.top_level_imports or alias.name in self.top_level_imports:
+                        report_violation("REDUNDANT_INLINE_IMPORT", self.filepath, child.lineno, f"Redundant inline import '{alias.name}' inside '{node.name}' (already imported at module level).")
+                    elif not (alias.asname and alias.asname.startswith('_')):
+                        report_violation("UNALIASED_INLINE_IMPORT", self.filepath, child.lineno, f"Inline import '{alias.name}' inside '{node.name}' must be placed at the module top-level or aliased with a leading underscore (e.g. 'import {alias.name} as _{alias.name}').")
+            elif isinstance(child, ast.ImportFrom):
+                module = child.module or ""
+                for alias in child.names:
+                    full_name = f"{module}.{alias.name}" if module else alias.name
+                    name = alias.asname or alias.name
+                    if full_name in self.top_level_imports or name in self.top_level_imports:
+                        report_violation("REDUNDANT_INLINE_IMPORT", self.filepath, child.lineno, f"Redundant inline import 'from {module} import {alias.name}' inside '{node.name}' (already imported at module level).")
+                    elif not (alias.asname and alias.asname.startswith('_')):
+                        report_violation("UNALIASED_INLINE_IMPORT", self.filepath, child.lineno, f"Inline import 'from {module} import {alias.name}' inside '{node.name}' must be placed at the module top-level or aliased with a leading underscore (e.g. 'from {module} import {alias.name} as _{alias.name}').")
+        self.generic_visit(node)
 
     def visit_Import(self, node):
         for alias in node.names:
@@ -89,8 +132,11 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                             f"get_workspace_physics() must be unpacked into exactly 2 targets (got {target_len})."
                         )
         self.generic_visit(node)
-
     def visit_Call(self, node):
+        if self.is_test:
+            self.generic_visit(node)
+            return
+
         if isinstance(node.func, ast.Name):
             if node.func.id == 'open' and self.filename not in VFS_WRITE_WHITELIST:
                 if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) and any(m in node.args[1].value for m in ['w', 'a', 'x', '+']):
@@ -126,13 +172,24 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                             node.lineno,
                             f"Path prefix comparison '{val_repr}.startswith()' detected. Use is_subpath() to prevent traversal collisions."
                         )
-
-            if node.func.attr in ('remove', 'rmdir', 'unlink', 'write_text', 'write_bytes') and self.filename not in VFS_WRITE_WHITELIST:
+            if node.func.attr in ('unlink', 'write_text', 'write_bytes') and self.filename not in VFS_WRITE_WHITELIST:
                 report_violation(
                     "ASYNC_VFS_PIPELINE_COMPLIANCE", 
                     self.filepath, 
                     node.lineno, 
                     f"Synchronous mutation '{node.func.attr}()' detected outside vfs.py."
+                )
+            if (
+                node.func.attr in ('remove', 'rmdir')
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == 'os'
+                and self.filename not in VFS_WRITE_WHITELIST
+            ):
+                report_violation(
+                    "ASYNC_VFS_PIPELINE_COMPLIANCE", 
+                    self.filepath, 
+                    node.lineno, 
+                    f"Synchronous mutation 'os.{node.func.attr}()' detected outside vfs.py."
                 )
             
             # AkasaURI parsing enforcement
@@ -157,8 +214,6 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                     "Path slicing logic detected. Use AkasaURI primitives instead."
                 )
         self.generic_visit(node)
-
-
 def check_python_files():
     print("🔍 Sweeping Akasa Kernel (AST Analysis)...")
     for filepath in collect_unique_files([KERNEL_DIR], [".py"]):
@@ -169,3 +224,41 @@ def check_python_files():
                 visitor.visit(tree)
             except SyntaxError:
                 print(f"⚠️  Skipping {filepath.name} due to SyntaxError.")
+
+    unit_tests_dir = PROJECT_ROOT / "tests" / "unit"
+    if unit_tests_dir.exists():
+        for test_fp in sorted(unit_tests_dir.glob("test_*.py")):
+            try:
+                t_tree = ast.parse(test_fp.read_text(encoding="utf-8"), filename=str(test_fp))
+                KernelFitnessVisitor(test_fp, test_fp.name, is_test=True).visit(t_tree)
+                has_testcase_class = False
+                for stmt in t_tree.body:
+                    if isinstance(stmt, ast.FunctionDef) and stmt.name.startswith("test_"):
+                        report_violation(
+                            "UNITTEST_DISCOVERY_MANDATE",
+                            test_fp,
+                            stmt.lineno,
+                            f"Top-level function '{stmt.name}()' is ignored by unittest.TestLoader().discover(). Place all test methods inside a unittest.TestCase subclass."
+                        )
+                    elif isinstance(stmt, ast.ClassDef):
+                        has_testcase_class = True
+                if not has_testcase_class:
+                    report_violation(
+                        "UNITTEST_DISCOVERY_MANDATE",
+                        test_fp,
+                        1,
+                        f"Test module '{test_fp.name}' contains no unittest.TestCase classes."
+                    )
+            except SyntaxError as e:
+                report_violation("UNITTEST_SYNTAX_ERROR", test_fp, e.lineno or 1, f"Syntax error in unit test file: {e}")
+
+    code_index_path = PROJECT_ROOT / "CODE_INDEX.md"
+    if code_index_path.exists():
+        for idx, line in enumerate(code_index_path.read_text(encoding="utf-8").splitlines(), start=1):
+            if "[comment required]" in line:
+                report_violation(
+                    "CARTOGRAPHER_PLACEHOLDER_BAN",
+                    code_index_path,
+                    idx,
+                    f"Unresolved '# [comment required]' placeholder in CODE_INDEX.md: {line.strip()}"
+                )

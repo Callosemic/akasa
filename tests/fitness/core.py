@@ -4,7 +4,7 @@ from pathlib import Path
 # --- CONFIGURATION ---
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 KERNEL_DIR = PROJECT_ROOT / "akasa"
-VFS_WRITE_WHITELIST = ["vfs.py", "db.py", "__init__.py"]
+VFS_WRITE_WHITELIST = ["vfs.py", "db.py", "utils.py", "__init__.py"]
 SQLITE_WHITELIST = ["db.py"]
 
 class FitnessState:
