@@ -234,6 +234,7 @@ def get_connection(db_name, workspace_id=None):
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA temp_store=MEMORY;")
         conn.execute("PRAGMA cache_size=-2000;")
         conn.commit()
         return conn

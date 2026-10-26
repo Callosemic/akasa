@@ -74,6 +74,15 @@ class HookRegistry:
         self._trusted_namespaces = set()
         self._extension_namespaces = set()
         self._sse_passthrough_events = set()
+        self._auth_cache = {}
+
+    def clear_auth_cache(self, workspace_id=None):
+        """Purges memoized hook authorization decisions when workspace configuration mutates."""
+        with self._lock:
+            if workspace_id:
+                self._auth_cache = {k: v for k, v in self._auth_cache.items() if k[2] != workspace_id}
+            else:
+                self._auth_cache.clear()
 
     def register_sse_passthrough(self, *event_names):
         """DI Interface: Host OS registers high-priority event names to auto-forward to the SSE stream."""
@@ -81,11 +90,15 @@ class HookRegistry:
 
     def register_trusted_namespace(self, namespace):
         """DI Interface: Host OS registers its Tier 2 core namespace for event bypass privileges."""
-        self._trusted_namespaces.add(namespace)
+        with self._lock:
+            self._trusted_namespaces.add(namespace)
+            self._auth_cache.clear()
 
     def register_extension_namespace(self, namespace):
         """DI Interface: Host OS registers its Tier 3 extension namespace."""
-        self._extension_namespaces.add(namespace)
+        with self._lock:
+            self._extension_namespaces.add(namespace)
+            self._auth_cache.clear()
 
     def set_workspace_router(self, router_func):
         """Dependency Injection: Allows the host OS to define spatial routing."""
@@ -165,14 +178,27 @@ class HookRegistry:
                 return True
             print(f"⚠️ [Event Bus] Banned hook: Non-core extension '{mod}' attempted to subscribe to 'system_boot'. Use 'workspace_boot' instead.")
             return False
-
         # Cross-reference extension engines against the central SSOT
         if ext_name:
             return _is_extension_enabled(ext_name, workspace_id)
 
         return True
+    def _is_authorized_cached(self, cb, event_name, workspace_id):
+        if event_name in ('config_mutated', 'system_shutdown', 'mutate_workspace_config', 'register_core_modules'):
+            return True
+        cache_key = (cb, event_name, workspace_id)
+        cached = self._auth_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        decision = self._is_authorized(cb, event_name, workspace_id)
+        with self._lock:
+            self._auth_cache[cache_key] = decision
+        return decision
+
     def emit(self, event_name, *args, **kwargs):
         """Core OS trigger to broadcast payloads to all subscribed extensions."""
+        if event_name == 'config_mutated':
+            self.clear_auth_cache(kwargs.get('workspace_id'))
         from akasa.events import sse_bus as _sse_bus
         # Auto-forward registered high-priority UI signals to the SSE stream
         if event_name in self._sse_passthrough_events:
@@ -211,9 +237,8 @@ class HookRegistry:
                 kwargs['workspace_id'] = wid
                 with self._lock:
                     callbacks = [cb for _, cb in self._hooks.get(event_name, [])]
-
                 for cb in callbacks:
-                    if not self._is_authorized(cb, event_name, wid):
+                    if not self._is_authorized_cached(cb, event_name, wid):
                         continue
                     try:
                         t0 = time.time()
@@ -269,7 +294,7 @@ class HookRegistry:
                 with self._lock:
                     callbacks = [cb for _, cb in self._hooks.get(event_name, [])]
                 for cb in callbacks:
-                    if not self._is_authorized(cb, event_name, wid):
+                    if not self._is_authorized_cached(cb, event_name, wid):
                         continue
                     try:
                         res = cb(*args, **kwargs)
@@ -300,9 +325,30 @@ class HookRegistry:
             if isinstance(res, list):
                 merged.extend(res)
         return merged
+    def sync_event_bus_barrier(self, timeout: float = 5.0) -> bool:
+        """Waits for all currently queued Akasa-EventBus background hook tasks to complete."""
+        done_events = [threading.Event() for _ in range(4)]
+        try:
+            for ev in done_events:
+                self._bg_executor.submit(ev.set)
+        except RuntimeError:
+            return True
+        deadline = time.time() + timeout
+        for ev in done_events:
+            remaining = max(0.01, deadline - time.time())
+            if not ev.wait(timeout=remaining):
+                return False
+        return True
 
     def emit_background(self, event_name, *args, **kwargs):
         """Dispatches long-running hooks to a background thread to prevent blocking."""
+        if event_name == 'config_mutated':
+            self.clear_auth_cache(kwargs.get('workspace_id'))
+        from akasa.events import sse_bus as _sse_bus
+        if event_name in self._sse_passthrough_events:
+            safe_payload = {k: v for k, v in kwargs.items() if isinstance(v, (str, int, float, bool, list, dict))}
+            _sse_bus.emit_sse(event_name, safe_payload)
+
         workspace_ids = set()
         origin_ws = kwargs.get('workspace_id')
         if origin_ws:
@@ -321,25 +367,28 @@ class HookRegistry:
                 workspace_ids.add(_sniff_tenant_id())
             else:
                 workspace_ids.add("default")
-
         def _run_hooks():
-            for wid in workspace_ids:
-                kwargs['workspace_id'] = wid
-                with self._lock:
-                    callbacks = [cb for _, cb in self._hooks.get(event_name, [])]
-
-                for cb in callbacks:
-                    if not self._is_authorized(cb, event_name, wid):
-                        continue
-                    try:
-                        cb(*args, **kwargs)
-                    except Exception as e:
-                        print(f"⚠️ [Event Bus] Error in async '{event_name}' callback {cb.__name__}: {e}")
+            from akasa.db import close_thread_connections as _close_thread_connections
+            try:
+                for wid in workspace_ids:
+                    kwargs['workspace_id'] = wid
+                    with self._lock:
+                        callbacks = [cb for _, cb in self._hooks.get(event_name, [])]
+                    for cb in callbacks:
+                        if not self._is_authorized_cached(cb, event_name, wid):
+                            continue
                         try:
-                            if event_name != 'system_error':
-                                safe_payload = {k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v for k, v in kwargs.items()}
-                                self.emit_background('system_error', source=f"AsyncHook:{event_name}:{cb.__name__}", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=json.dumps(safe_payload), workspace_id=wid)
-                        except Exception: pass
+                            cb(*args, **kwargs)
+                        except Exception as e:
+                            print(f"⚠️ [Event Bus] Error in async '{event_name}' callback {cb.__name__}: {e}")
+                            try:
+                                if event_name != 'system_error':
+                                    safe_payload = {k: str(v) if not isinstance(v, (str, int, float, bool, type(None))) else v for k, v in kwargs.items()}
+                                    self.emit_background('system_error', source=f"AsyncHook:{event_name}:{cb.__name__}", error_type=type(e).__name__, message=str(e), traceback=traceback.format_exc(), payload=json.dumps(safe_payload), workspace_id=wid)
+                            except Exception:
+                                pass
+            finally:
+                _close_thread_connections()
 
         with self._lock:
             has_callbacks = bool(self._hooks.get(event_name, []))

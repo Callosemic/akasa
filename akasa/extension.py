@@ -1,4 +1,5 @@
 import os
+import re
 import uuid
 import json
 import time
@@ -8,8 +9,8 @@ import traceback
 import threading
 import functools
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Dict, Any, List, TypedDict
-from flask import Blueprint, request, jsonify
+from typing import TYPE_CHECKING, Optional, Dict, Any, List, TypedDict, Callable
+from flask import Blueprint, Response, request, jsonify, has_request_context
 
 if TYPE_CHECKING:
     from akasa.types import WorkspaceID, FilePath, VFSStorageEngine, WorkspacePathsDict
@@ -17,7 +18,19 @@ from akasa.db import get_connection, register_schema
 from akasa.events import sse_bus
 from akasa.hooks import hooks
 import akasa.utils as _akasa_utils
-from akasa.utils import extension_auth, load_config, get_workspace_physics, get_tenant_control_dir, load_json_config, save_json_config, parse_uri, get_active_modules
+from akasa.utils import (
+    extension_auth,
+    load_config,
+    get_control_dir_name,
+    get_workspace_physics,
+    get_tenant_control_dir,
+    get_daemon_host_config_path,
+    load_json_config,
+    save_json_config,
+    parse_uri,
+    get_active_modules,
+    is_extension_enabled,
+)
 from akasa.vfs import VFSTransaction, _resolve_physical_path, sync_vfs_barrier as _vfs_sync_barrier
 
 class SettingsUpdateResponse(TypedDict, total=False):
@@ -25,15 +38,18 @@ class SettingsUpdateResponse(TypedDict, total=False):
     requires_refresh: bool
     job_id: str
     error: str
-
 class JobManager:
-    def __init__(self, ext_name, workspace_id, job_id=None):
+    def __init__(self, ext_name, workspace_id, job_id=None, root_job_id=None, chain_state=None, chain_history=None):
         self.ext_name = ext_name
         self.workspace_id = workspace_id
         self.current_job_id = job_id
+        self.root_job_id = root_job_id or job_id
+        self.chain_state = dict(chain_state) if isinstance(chain_state, dict) else {}
+        self.chain_history = list(chain_history) if isinstance(chain_history, list) else []
 
     def submit(self, task_name, coalesce=False, job_category="system_background", job_id=None, **kwargs):
-        from akasa.workers import submit_immediate_job as _submit_immediate_job
+        from akasa.workers import submit_immediate_job as _submit_immediate_job, validate_worker_kwargs as _validate_worker_kwargs
+        _validate_worker_kwargs(self.ext_name, task_name, kwargs, allow_extra=False)
         job_prefix = self.ext_name[:3].lower()
         resolved_id = job_id or f"{job_prefix}_{uuid.uuid4().hex[:8]}"
         args_json = json.dumps(kwargs)
@@ -42,8 +58,9 @@ class JobManager:
         )
 
     def submit_one_shot(self, task_name, delay_ms, job_id=None, **kwargs):
-        from akasa.workers import submit_one_shot_job as _submit_one_shot_job
+        from akasa.workers import submit_one_shot_job as _submit_one_shot_job, validate_worker_kwargs as _validate_worker_kwargs
         kwargs.pop("job_category", None)
+        _validate_worker_kwargs(self.ext_name, task_name, kwargs, allow_extra=False)
         job_prefix = self.ext_name[:3].lower()
         resolved_id = job_id or f"{job_prefix}_{uuid.uuid4().hex[:8]}"
         args_json = json.dumps(kwargs)
@@ -52,8 +69,9 @@ class JobManager:
 
     def schedule(self, task_name, interval_ms, jitter_ms=0, job_id=None, **kwargs):
         """SDK Helper: Schedules a recurring task in the Metronome ledger."""
-        from akasa.workers import submit_job as _submit_job
+        from akasa.workers import submit_job as _submit_job, validate_worker_kwargs as _validate_worker_kwargs
         kwargs.pop("job_category", None)
+        _validate_worker_kwargs(self.ext_name, task_name, kwargs, allow_extra=False)
         job_prefix = self.ext_name[:3].lower()
         resolved_id = job_id or f"{job_prefix}_{uuid.uuid4().hex[:8]}"
         args_json = json.dumps(kwargs)
@@ -127,11 +145,16 @@ class JobManager:
             (self.ext_name, task_name)
         ).fetchone()
         return bool(row)
-
-    def find_active_pipeline_job(self, worker_names: List[str], force_full: bool = False, window_sec: float = 300.0) -> Optional[str]:
-        """SDK Helper: Checks if any of the given pipeline worker names are actively running and compatible with force_full."""
+    def find_active_pipeline_job(
+        self,
+        worker_names: List[str],
+        predicate: Optional[Callable[[Dict[str, Any]], bool]] = None,
+        window_sec: float = 300.0,
+    ) -> Optional[str]:
+        """SDK Helper: Checks if any of the given pipeline worker names are actively running and satisfy the optional predicate."""
         if not worker_names:
             return None
+
         conn = get_connection("workers", workspace_id=self.workspace_id)
         cutoff = time.time() - window_sec
         placeholders = ", ".join(["?"] * len(worker_names))
@@ -141,8 +164,8 @@ class JobManager:
         ).fetchone()
         if existing_job:
             try:
-                job_args = json.loads(existing_job['args_json'])
-                if job_args.get("force_full") or not force_full:
+                job_args = json.loads(existing_job['args_json'] or "{}")
+                if predicate is None or predicate(job_args):
                     return existing_job['id']
             except Exception:
                 pass
@@ -222,8 +245,54 @@ class JobManager:
             from akasa.workers import update_immediate_job_meta as _update_immediate_job_meta
             _update_immediate_job_meta(self.current_job_id, meta_dict, workspace_id=self.workspace_id)
 _REGISTERED_SETTINGS_SCHEMAS = {}
+_CAPABILITY_REGISTRY: Dict[str, Dict[str, Any]] = {}
+_EXTENSION_INSTANCES: Dict[str, "AkasaExtension"] = {}
 _WORKSPACES_MIGRATED = False
 MASKED_SECRET_SENTINEL = "••••••••"
+
+
+def get_registered_capabilities() -> Dict[str, Dict[str, Any]]:
+    """Returns a shallow copy of the global transport-agnostic capability registry."""
+    return dict(_CAPABILITY_REGISTRY)
+
+
+def _extract_http_request_payload(extra_kwargs: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Merges query parameters, form fields, JSON body, and URL path variables into a single dict."""
+    merged: Dict[str, Any] = {}
+    if has_request_context():
+        try:
+            for k, v in request.args.items():
+                merged[k] = v
+        except Exception:
+            pass
+        try:
+            if request.form:
+                for k, v in request.form.items():
+                    merged[k] = v
+        except Exception:
+            pass
+        try:
+            body = request.get_json(silent=True)
+            if isinstance(body, dict):
+                merged.update(body)
+        except Exception:
+            pass
+    if extra_kwargs:
+        merged.update(extra_kwargs)
+    return merged
+def _marshal_http_return(result: Any):
+    """Marshals pure Python dict/list/tuple/str capability returns into valid Flask HTTP responses."""
+    if isinstance(result, Response):
+        return result
+    if isinstance(result, tuple):
+        body = result[0]
+        rest = result[1:]
+        if isinstance(body, (dict, list)):
+            return (jsonify(body), *rest)
+        return result
+    if isinstance(result, (dict, list)):
+        return jsonify(result)
+    return result
 
 
 def get_registered_settings_schemas(workspace_id: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
@@ -257,9 +326,8 @@ class SettingsManager:
                 return field
         return None
     def _resolve_filepath(self, scope):
-        control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
         if scope == 'daemon':
-            return Path(_akasa_utils._cwd).joinpath(control_dir_name, "host.json").as_posix()
+            return get_daemon_host_config_path()
 
         control_dir = get_tenant_control_dir(self.workspace_id)
         if scope == 'repo':
@@ -282,7 +350,6 @@ class SettingsManager:
             ext_secrets = data.get(self.ext_name, {})
             if scope == 'repo' and repo:
                 ext_secrets = ext_secrets.get(repo, {})
-
             if key in ext_secrets:
                 val = ext_secrets[key]
                 decrypted = val
@@ -526,14 +593,107 @@ class DatabaseWrapper:
         self._conn.commit()
 class ExtensionContext:
     """Pre-scoped context object injected into all SDK routes."""
-    def __init__(self, ext_name, workspace_id, settings_schema=None, job_id=None):
+    def __init__(self, ext_name, workspace_id, settings_schema=None, job_id=None, root_job_id=None, chain_state=None, chain_history=None, payload=None):
         self.ext_name = ext_name
         self.workspace_id = workspace_id
         self.vfs = VFSTransaction(workspace_id)
         self.req = request
-        self.jobs = JobManager(ext_name, workspace_id, job_id=job_id)
+        self._payload = dict(payload) if isinstance(payload, dict) else None
+        self.jobs = JobManager(
+            ext_name,
+            workspace_id,
+            job_id=job_id,
+            root_job_id=root_job_id,
+            chain_state=chain_state,
+            chain_history=chain_history,
+        )
         self.store = StoreManager(workspace_id, ext_name=ext_name)
         self.settings = SettingsManager(ext_name, workspace_id, schema=settings_schema)
+    @property
+    def method(self) -> str:
+        """Returns the active HTTP method ('GET', 'POST', etc.) or 'CALL' when invoked via ctx.call()."""
+        if has_request_context():
+            try:
+                return str(request.method or "GET").upper()
+            except Exception:
+                return "GET"
+        return "CALL"
+
+    @property
+    def payload(self) -> Dict[str, Any]:
+        """Returns the unified input dictionary across HTTP query/JSON/path params and in-process ctx.call()."""
+        if self._payload is not None:
+            return self._payload
+        self._payload = _extract_http_request_payload()
+        return self._payload
+
+    def call(self, capability: str, wait: bool = True, timeout: float = 60.0, **kwargs) -> Any:
+        """
+        In-Process Zero-Copy IPC Gateway:
+        Invokes a registered capability ('<ext>.<action>') within the active workspace tenant boundary,
+        automatically awaiting 202 background jobs when wait=True.
+        """
+        cap_key = str(capability or "").strip()
+        spec = _CAPABILITY_REGISTRY.get(cap_key)
+        if not spec:
+            alt_key = cap_key.replace("/", ".")
+            spec = _CAPABILITY_REGISTRY.get(alt_key)
+        if not spec:
+            raise KeyError(f"Capability '{capability}' is not registered in the Akasa capability registry.")
+
+        target_ext = spec["ext_name"]
+        if not spec.get("core", False) and not is_extension_enabled(target_ext, self.workspace_id):
+            raise PermissionError(f"403 Forbidden: Extension '{target_ext}' is not enabled in workspace '{self.workspace_id}'.")
+
+        ext_obj = _EXTENSION_INSTANCES.get(target_ext)
+        call_payload = dict(kwargs)
+        target_ctx = (
+            ext_obj.get_context(self.workspace_id, payload=call_payload)
+            if ext_obj
+            else ExtensionContext(target_ext, self.workspace_id, payload=call_payload)
+        )
+
+        handler = spec["handler"]
+        sig = inspect.signature(handler)
+        accepted_kwargs = {}
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
+        for k, v in call_payload.items():
+            if k == "ctx":
+                continue
+            if accepts_var_kw or k in sig.parameters:
+                accepted_kwargs[k] = v
+
+        raw_res = handler(target_ctx, **accepted_kwargs)
+        status_code = 200
+        body = raw_res
+
+        if isinstance(raw_res, tuple):
+            body = raw_res[0]
+            if len(raw_res) > 1 and isinstance(raw_res[1], int):
+                status_code = raw_res[1]
+        if isinstance(body, Response):
+            status_code = body.status_code
+            parsed_json = body.get_json(silent=True)
+            body = parsed_json if parsed_json is not None else body.get_data(as_text=True)
+
+        if status_code >= 400:
+            err_msg = body.get("error") if isinstance(body, dict) else str(body)
+            raise RuntimeError(f"Capability '{capability}' failed (HTTP {status_code}): {err_msg}")
+
+        if wait and status_code == 202 and isinstance(body, dict) and body.get("job_id"):
+            job_id = body["job_id"]
+            settled = target_ctx.jobs.wait_for(job_id=job_id, timeout=timeout)
+            if not settled:
+                raise TimeoutError(f"Capability '{capability}' timed out waiting for job '{job_id}' ({timeout}s).")
+            job_state = target_ctx.jobs.get_status(job_id) or {}
+            if job_state.get("status") == "failed":
+                raise RuntimeError(job_state.get("message") or f"Background job '{job_id}' failed.")
+            artifact = job_state.get("artifact")
+            if isinstance(artifact, dict) and artifact:
+                return artifact
+            return job_state
+
+        return body
     def get_db(self, db_name: Optional[str] = None) -> DatabaseWrapper:
         """Returns a DatabaseWrapper for the specified SQLite database name (defaults to self.ext_name) in the active workspace."""
         conn = get_connection(db_name or self.ext_name, self.workspace_id)
@@ -551,10 +711,9 @@ class ExtensionContext:
     def emit_sse(self, event_type: str, payload: Dict[str, Any]) -> None:
         """Publishes a real-time Server-Sent Event onto the global SSE bus."""
         sse_bus.emit_sse(event_type, payload)
-
     def get_repo_data_path(self, repo: str, subpath: str = "") -> str:
         """Returns the canonical VFS URI for sovereign extension data inside a target repository."""
-        ctrl_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
+        ctrl_name = get_control_dir_name()
         clean_sub = str(subpath).lstrip('/')
         base = f"vfs://{repo}/{ctrl_name}-data/{self.ext_name}"
         return f"{base}/{clean_sub}" if clean_sub else base
@@ -615,8 +774,10 @@ class ExtensionContext:
     @property
     def exec(self):
         """Returns a sandboxed ProcessManager keyed to the active tenant workspace."""
-        from akasa.process import ProcessManager as _ProcessManager
-        return _ProcessManager(self.workspace_id)
+        if not hasattr(self, "_exec_manager") or self._exec_manager is None:
+            from akasa.process import ProcessManager as _ProcessManager
+            self._exec_manager = _ProcessManager(self.workspace_id)
+        return self._exec_manager
     def resolve_path(self, filepath):
         """Safely anchors a relative path to the physical workspace bounds."""
         return _resolve_physical_path(filepath, self.workspace_id)
@@ -721,6 +882,7 @@ class AkasaExtension:
         self.core = core
         self.settings_schema = settings_schema or []
         self.extra_schemas = extra_schemas or {}
+        _EXTENSION_INSTANCES[self.name] = self
 
         if self.settings_schema:
             _REGISTERED_SETTINGS_SCHEMAS[self.name] = self.settings_schema
@@ -731,16 +893,16 @@ class AkasaExtension:
         # Universal REST endpoints for extension settings management
         @self.route('settings', methods=['GET'], docstring="[sync] Retrieves the current settings for this extension.")
         def get_settings(ctx):
-            repo = ctx.req.args.get('repo')
-            return jsonify(ctx.settings.get_all(repo=repo, mask_secrets=True))
+            repo = ctx.payload.get('repo')
+            return ctx.settings.get_all(repo=repo, mask_secrets=True)
         @self.route('settings', methods=['POST'], response_schema=SettingsUpdateResponse, docstring="[sync] Updates the settings for this extension.")
         def update_settings(ctx):
             try:
-                repo = ctx.req.args.get('repo') or (ctx.req.json.get('_repo') if ctx.req.json else None)
-                ctx.settings.update(ctx.req.json or {}, repo=repo)
+                repo = ctx.payload.get('repo') or ctx.payload.get('_repo')
+                ctx.settings.update(ctx.payload or {}, repo=repo)
             except Exception as e:
                 print(f"Settings Save Error: {traceback.format_exc()}")
-                return jsonify({"status": "error", "error": f"Internal save error: {str(e)}"}), 500
+                return {"status": "error", "error": f"Internal save error: {str(e)}"}, 500
             # Emit a strictly scoped event for this specific extension
             results = ctx.emit(f'{self.name}_settings_updated')
 
@@ -755,20 +917,28 @@ class AkasaExtension:
             payload = {"status": "success", "requires_refresh": requires_refresh}
             if job_id:
                 payload["job_id"] = job_id
-            return jsonify(payload)
+            return payload
         @self.route('settings/schema', methods=['GET'], docstring="[sync] Retrieves the declarative settings schema for this extension.")
         def get_settings_schema(ctx):
             schema = self.settings_schema(ctx.workspace_id) if callable(self.settings_schema) else self.settings_schema
-            return jsonify(schema)
+            return schema
 
     def register_schema(self, db_name: str, schema_dict: Dict[str, Dict[str, str]]) -> None:
         """Registers an additional declarative SQLite schema owned by this extension."""
         register_schema(db_name, schema_dict)
-
-    def get_context(self, workspace_id=None, job_id=None):
+    def get_context(self, workspace_id=None, job_id=None, root_job_id=None, chain_state=None, chain_history=None, payload=None):
         """SDK Factory: Returns a fully hydrated context inherently bound to this extension's schema."""
         wid = workspace_id or _akasa_utils.sniff_tenant_id() or "default"
-        return self.context_class(self.name, wid, settings_schema=self.settings_schema, job_id=job_id)
+        return self.context_class(
+            self.name,
+            wid,
+            settings_schema=self.settings_schema,
+            job_id=job_id,
+            root_job_id=root_job_id,
+            chain_state=chain_state,
+            chain_history=chain_history,
+            payload=payload,
+        )
 
     def on(self, event_name: str, priority: int = 50):
         """
@@ -799,26 +969,61 @@ class AkasaExtension:
                 hooks.on(event_name, priority=priority)(func)
                 return func
         return decorator
-
     def worker(self, task_name):
         """
         SDK Decorator: Automatically wraps a background worker in a safe execution block.
-        Injects the ExtensionContext, catches exceptions, and updates the immediate_jobs ledger.
+        Injects the ExtensionContext, isolates pipeline envelope state onto ctx.jobs,
+        and forwards only accepted parameters to the worker function.
         """
         def decorator(f):
             from akasa.workers import register_callback as _register_callback
 
+            f_sig = inspect.signature(f)
+            f_params = set(f_sig.parameters.keys()) - {"ctx"}
+            accepts_var_kw = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in f_sig.parameters.values()
+            )
+            envelope_keys = {"root_job_id", "chain_state", "chain_history", "_workspace_id", "_chain", "_dag_root_id", "_dag_step_id"}
             # Do not use functools.wraps here. The metronome relies on inspect.signature
             # to dynamically inject job_id and workspace_id based on the wrapper's exact kwargs.
             def wrapper(job_id=None, workspace_id=None, **kwargs):
-                ctx = self.get_context(workspace_id, job_id=job_id)
+                if isinstance(job_id, ExtensionContext):
+                    ctx = job_id
+                    actual_job_id = kwargs.pop("job_id", ctx.jobs.current_job_id)
+                    actual_ws_id = workspace_id or ctx.workspace_id
+                    if "chain_state" in kwargs and isinstance(kwargs["chain_state"], dict):
+                        ctx.jobs.chain_state = dict(kwargs["chain_state"])
+                    if "chain_history" in kwargs and isinstance(kwargs["chain_history"], list):
+                        ctx.jobs.chain_history = list(kwargs["chain_history"])
+                    if "root_job_id" in kwargs and kwargs["root_job_id"]:
+                        ctx.jobs.root_job_id = kwargs["root_job_id"]
+                else:
+                    actual_job_id = job_id
+                    actual_ws_id = workspace_id
+                    root_job_id = kwargs.get("root_job_id") or actual_job_id
+                    chain_state = kwargs.get("chain_state")
+                    chain_history = kwargs.get("chain_history")
+                    ctx = self.get_context(
+                        actual_ws_id,
+                        job_id=actual_job_id,
+                        root_job_id=root_job_id,
+                        chain_state=chain_state,
+                        chain_history=chain_history,
+                    )
 
-                # Execute the domain logic
-                if 'job_id' in inspect.signature(f).parameters:
-                    kwargs['job_id'] = job_id
-                return f(ctx, **kwargs)
+                call_kwargs = {}
+                for k, v in kwargs.items():
+                    if k in envelope_keys and k not in f_params:
+                        continue
+                    if accepts_var_kw or k in f_params:
+                        call_kwargs[k] = v
+                if "job_id" in f_params:
+                    call_kwargs["job_id"] = actual_job_id
+                if "workspace_id" in f_params:
+                    call_kwargs["workspace_id"] = actual_ws_id
+                return f(ctx, **call_kwargs)
 
-            _register_callback(self.name, task_name, wrapper)
+            _register_callback(self.name, task_name, wrapper, raw_func=f)
             return wrapper
         return decorator
     def route(self, rule, request_schema=None, response_schema=None, **options):
@@ -848,12 +1053,30 @@ class AkasaExtension:
                 "response_schema": res_sch,
                 "docstring": docstring
             }
+        cap_action = re.sub(r'/<[^>]+>', '', clean_rule).strip('/').replace('/', '.')
+        cap_id = f"{self.name}.{cap_action}" if cap_action else self.name
+        methods_list = [m.upper() for m in options.get('methods', ['GET'])]
 
         def decorator(f):
+            _CAPABILITY_REGISTRY[cap_id] = {
+                "id": cap_id,
+                "ext_name": self.name,
+                "action": cap_action,
+                "rule": full_rule,
+                "methods": methods_list,
+                "request_schema": request_schema,
+                "response_schema": response_schema,
+                "docstring": docstring,
+                "core": bool(getattr(self, 'core', False)),
+                "handler": f,
+            }
+
             @functools.wraps(f)
             def wrapper(workspace_id, *args, **kwargs):
-                ctx = self.get_context(workspace_id)
-                return f(ctx, *args, **kwargs)
+                req_payload = _extract_http_request_payload(kwargs)
+                ctx = self.get_context(workspace_id, payload=req_payload)
+                result = f(ctx, *args, **kwargs)
+                return _marshal_http_return(result)
 
             # Use getattr to safely bypass the auth gate for core OS engines
             if not getattr(self, 'core', False):

@@ -7,7 +7,8 @@ import random
 import inspect
 import traceback
 import threading
-from typing import TypedDict, List, Dict, Any, Optional, Literal
+import typing
+from typing import TypedDict, List, Dict, Any, Optional, Literal, Union
 from concurrent.futures import ThreadPoolExecutor
 from akasa.db import get_connection, apply_declarative_schema, evict_cached_connection, close_thread_connections, _REGISTERED_SCHEMAS
 from akasa.hooks import hooks
@@ -74,6 +75,7 @@ def resolve_dag_chain(ctx, hook_name: str) -> List[Dict[str, Any]]:
 
     return ordered_steps
 _executor = None
+_interactive_executor = None
 _io_executor = None
 _metronome_thread = None
 _shutdown_event = threading.Event()
@@ -83,6 +85,164 @@ _active_job_lock = threading.Lock()
 _dag_coordinators: Dict[str, Dict[str, Any]] = {}
 _dag_lock = threading.Lock()
 _callbacks = {}
+_callback_specs: Dict[str, Dict[str, Any]] = {}
+_ENVELOPE_KEYS = frozenset({
+    "_workspace_id",
+    "_chain",
+    "_dag_root_id",
+    "_dag_step_id",
+    "root_job_id",
+    "chain_history",
+    "chain_state",
+})
+
+
+def _check_type_match(val: Any, expected_type: Any) -> bool:
+    """Recursively validates a runtime value against a Python type annotation, guarding bool vs int."""
+    if expected_type is Any or expected_type is inspect.Parameter.empty:
+        return True
+    if expected_type is None or expected_type is type(None):
+        return val is None
+
+    origin = typing.get_origin(expected_type)
+    args = typing.get_args(expected_type)
+
+    if origin is Union:
+        return any(_check_type_match(val, arg) for arg in args)
+
+    if origin is Literal:
+        return any(val == arg and type(val) is type(arg) for arg in args)
+
+    if expected_type is bool:
+        return isinstance(val, bool)
+
+    if expected_type is int:
+        return isinstance(val, int) and not isinstance(val, bool)
+
+    if expected_type is float:
+        return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+    if expected_type in (str, bytes):
+        return isinstance(val, expected_type)
+
+    if origin in (list, List) or expected_type in (list, List):
+        if not isinstance(val, list):
+            return False
+        if args:
+            return all(_check_type_match(item, args[0]) for item in val)
+        return True
+    if origin in (set, tuple) or expected_type in (set, tuple):
+        if not isinstance(val, (list, tuple, set)):
+            return False
+        if args:
+            if len(args) == 2 and args[1] is Ellipsis:
+                return all(_check_type_match(item, args[0]) for item in val)
+            if origin is tuple and Ellipsis not in args:
+                val_seq = list(val)
+                if len(val_seq) != len(args):
+                    return False
+                return all(_check_type_match(item, arg_t) for item, arg_t in zip(val_seq, args))
+            if len(args) == 1:
+                return all(_check_type_match(item, args[0]) for item in val)
+        return True
+
+    if origin in (dict, Dict) or expected_type in (dict, Dict):
+        if not isinstance(val, dict):
+            return False
+        if len(args) == 2:
+            k_type, v_type = args
+            return all(_check_type_match(k, k_type) and _check_type_match(v, v_type) for k, v in val.items())
+        return True
+
+    if isinstance(expected_type, type):
+        if hasattr(expected_type, "__annotations__") and issubclass(expected_type, dict):
+            return isinstance(val, dict)
+        return isinstance(val, expected_type)
+
+    return True
+
+
+def _format_type_name(tp: Any) -> str:
+    origin = typing.get_origin(tp)
+    if origin is not None:
+        return str(tp).replace("typing.", "")
+    return getattr(tp, "__name__", str(tp))
+
+
+def validate_worker_kwargs(ext_name: str, callback_name: str, kwargs: Dict[str, Any], allow_extra: bool = False) -> None:
+    """
+    Synchronously validates worker keyword arguments against the registered function signature
+    and type annotations, and verifies strict JSON serializability.
+    """
+    clean_kwargs = {k: v for k, v in (kwargs or {}).items() if k not in _ENVELOPE_KEYS}
+    try:
+        json.dumps(clean_kwargs)
+    except TypeError as e:
+        raise TypeError(
+            f"Worker '{ext_name}:{callback_name}' arguments must be strictly JSON-serializable: {e}"
+        ) from e
+
+    key = f"{ext_name}:{callback_name}"
+    spec = _callback_specs.get(key)
+    if not spec:
+        return
+
+    params = spec["params"]
+    hints = spec["hints"]
+    has_var_kw = spec["has_var_kw"]
+
+    if not allow_extra and not has_var_kw:
+        unknown = [k for k in clean_kwargs if k not in params]
+        if unknown:
+            raise TypeError(
+                f"Worker '{key}' got unexpected keyword argument(s): {', '.join( sorted(unknown) )}"
+            )
+
+    for arg_name, arg_val in clean_kwargs.items():
+        if arg_name in hints:
+            expected = hints[arg_name]
+            if not _check_type_match(arg_val, expected):
+                raise TypeError(
+                    f"Worker '{key}' parameter '{arg_name}' expected {_format_type_name(expected)}, "
+                    f"got {type(arg_val).__name__}"
+                )
+
+
+def validate_dag_chain_kwargs(steps: List[Dict[str, Any]], kwargs: Dict[str, Any]) -> None:
+    """Validates shared pipeline kwargs across all steps in a DAG chain."""
+    clean_kwargs = {k: v for k, v in (kwargs or {}).items() if k not in _ENVELOPE_KEYS}
+    try:
+        json.dumps(clean_kwargs)
+    except TypeError as e:
+        raise TypeError(f"DAG chain arguments must be strictly JSON-serializable: {e}") from e
+
+    if not steps:
+        return
+
+    accepted_union = set()
+    any_has_var_kw = False
+    has_registered_specs = False
+
+    for s in steps:
+        ext_name = s.get("ext_name", "")
+        worker_name = s.get("worker_name", "")
+        validate_worker_kwargs(ext_name, worker_name, clean_kwargs, allow_extra=True)
+        spec = _callback_specs.get(f"{ext_name}:{worker_name}")
+        if spec:
+            has_registered_specs = True
+            accepted_union.update(spec["params"].keys())
+            if spec["has_var_kw"]:
+                any_has_var_kw = True
+        else:
+            any_has_var_kw = True
+
+    if has_registered_specs and not any_has_var_kw:
+        unknown = [k for k in clean_kwargs if k not in accepted_union]
+        if unknown:
+            raise TypeError(
+                f"DAG chain got unexpected keyword argument(s) not accepted by any step: {', '.join(sorted(unknown))}"
+            )
+
 
 def start_dag_chain(steps: List[Dict[str, Any]], workspace_id: str, on_complete_hook: Optional[str] = None, job_category: str = "system_background", **kwargs) -> Optional[str]:
     """
@@ -91,6 +251,8 @@ def start_dag_chain(steps: List[Dict[str, Any]], workspace_id: str, on_complete_
     """
     if not steps:
         return None
+
+    validate_dag_chain_kwargs(steps, kwargs)
 
     step_map = {}
     for idx, s in enumerate(steps):
@@ -141,10 +303,6 @@ def start_dag_chain(steps: List[Dict[str, Any]], workspace_id: str, on_complete_
             "history": [],
             "chain_state": dict(kwargs.get("chain_state", {}))
         }
-
-    def safe_serializer(obj):
-        return str(obj)
-
     first_dispatched_id = None
     for sid in ready_ids:
         step = step_map[sid]
@@ -157,7 +315,7 @@ def start_dag_chain(steps: List[Dict[str, Any]], workspace_id: str, on_complete_
         step_kwargs["root_job_id"] = root_job_id
         step_kwargs["chain_history"] = []
         step_kwargs["chain_state"] = dict(kwargs.get("chain_state", {}))
-        args_json = json.dumps(step_kwargs, default=safe_serializer)
+        args_json = json.dumps(step_kwargs)
         submit_immediate_job(jid, step["ext_name"], step["worker_name"], args_json, workspace_id=workspace_id, coalesce=False, job_category=job_category)
 
     return first_dispatched_id
@@ -220,11 +378,36 @@ def _merge_state_deltas(target_state: Dict[str, Any], deltas: Dict[str, Any]) ->
                 target_state[k] = v
         else:
             target_state[k] = v
-
-
-def register_callback(ext_name, callback_name, func):
+def register_callback(ext_name, callback_name, func, raw_func=None):
     """Extensions register their background functions here to be triggered by the Metronome."""
-    _callbacks[f"{ext_name}:{callback_name}"] = func
+    key = f"{ext_name}:{callback_name}"
+    _callbacks[key] = func
+    target = raw_func or inspect.unwrap(func)
+    try:
+        sig = inspect.signature(target)
+        params = {}
+        has_var_kw = False
+        for idx, (p_name, p_obj) in enumerate(sig.parameters.items()):
+            if idx == 0 and p_name == "ctx":
+                continue
+            if p_obj.kind == inspect.Parameter.VAR_KEYWORD:
+                has_var_kw = True
+            elif p_obj.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+                params[p_name] = p_obj
+        try:
+            hints = typing.get_type_hints(target)
+        except Exception:
+            hints = getattr(target, "__annotations__", {}) or {}
+        _callback_specs[key] = {
+            "params": params,
+            "hints": {k: v for k, v in hints.items() if k != "return" and k != "ctx"},
+            "has_var_kw": has_var_kw,
+            "raw_func": target,
+        }
+    except Exception:
+        pass
+
+
 def _prepare_job_payload(args_json, workspace_id):
     if not workspace_id:
         workspace_id = sniff_tenant_id()
@@ -232,15 +415,14 @@ def _prepare_job_payload(args_json, workspace_id):
     _init_worker_schema(workspace_id)
     conn = get_connection("workers", workspace_id=workspace_id)
     now = time.time()
-    try:
-        args_payload = args_json if isinstance(args_json, dict) else json.loads(args_json)
-        if "_workspace_id" not in args_payload:
-            args_payload["_workspace_id"] = workspace_id
-        args_json = json.dumps(args_payload)
-    except Exception:
-        if isinstance(args_json, dict):
-            args_json = json.dumps(args_json)
-    return workspace_id, conn, now, args_json
+    if isinstance(args_json, dict):
+        args_payload = dict(args_json)
+    else:
+        args_payload = json.loads(args_json or "{}")
+    if isinstance(args_payload, dict) and "_workspace_id" not in args_payload:
+        args_payload["_workspace_id"] = workspace_id
+    serialized_json = json.dumps(args_payload)
+    return workspace_id, conn, now, serialized_json
 def submit_job(job_id, ext_name, callback_name, interval_ms, args_json="{}", jitter_ms=0, workspace_id=None):
     """
     Schedules a recurring background task in the SQLite Ledger.
@@ -342,15 +524,18 @@ def submit_immediate_job(job_id, ext_name, callback_name, args_json="{}", worksp
         ).fetchone()
         if existing:
             return existing['id']
-
     # Seed the initial artifact with chain context so the UI knows its place in the pipeline
     initial_artifact = {}
+    is_dag_or_chain = False
     try:
         parsed_args = json.loads(args_json)
-        if 'chain_history' in parsed_args:
-            initial_artifact['chain_history'] = parsed_args['chain_history']
-        if 'root_job_id' in parsed_args:
-            initial_artifact['root_job_id'] = parsed_args['root_job_id']
+        if isinstance(parsed_args, dict):
+            if '_dag_root_id' in parsed_args or '_chain' in parsed_args:
+                is_dag_or_chain = True
+            if 'chain_history' in parsed_args:
+                initial_artifact['chain_history'] = parsed_args['chain_history']
+            if 'root_job_id' in parsed_args:
+                initial_artifact['root_job_id'] = parsed_args['root_job_id']
     except Exception:
         pass
     conn.execute("""
@@ -361,10 +546,11 @@ def submit_immediate_job(job_id, ext_name, callback_name, args_json="{}", worksp
     with _active_job_lock:
         _active_job_events[(workspace_id, job_id)] = threading.Event()
     if not _shutdown_event.is_set():
-        if _executor is None:
+        if _executor is None or _interactive_executor is None:
             start_workers()
+        target_pool = _interactive_executor if (not is_dag_or_chain and job_category == "ui_blocking") else _executor
         try:
-            _executor.submit(_execute_immediate_job, job_id, ext_name, callback_name, args_json, workspace_id)
+            target_pool.submit(_execute_immediate_job, job_id, ext_name, callback_name, args_json, workspace_id)
         except RuntimeError as e:
             with _active_job_lock:
                 ev = _active_job_events.pop((workspace_id, job_id), None)
@@ -565,11 +751,9 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
                         complete_hook = coord["on_complete_hook"]
                     _dag_coordinators.pop(dag_root_id, None)
 
-        def safe_serializer(obj):
-            return str(obj)
-
         for jid, step_def, step_kw in to_dispatch:
-            next_args_json = json.dumps(step_kw, default=safe_serializer)
+            validate_worker_kwargs(step_def['ext_name'], step_def['worker_name'], step_kw, allow_extra=True)
+            next_args_json = json.dumps(step_kw)
             submit_immediate_job(jid, step_def['ext_name'], step_def['worker_name'], next_args_json, workspace_id=target_ws, job_category=job_cat)
             hooks.emit_background('job_baton_passed', workspace_id=target_ws, root_job_id=dag_root_id, previous_job_id=job_id, next_job_id=jid, ext_name=step_def['ext_name'])
         if should_fire_complete and complete_hook:
@@ -593,10 +777,8 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
         next_kwargs['root_job_id'] = root_job_id
         next_kwargs['chain_history'] = history
         next_kwargs['chain_state'] = chain_state
-        # Serialize safely, stringifying any non-serializable objects injected by previous steps
-        def safe_serializer(obj):
-            return str(obj)
-        next_args_json = json.dumps(next_kwargs, default=safe_serializer)
+        validate_worker_kwargs(next_step['ext_name'], next_step['worker_name'], next_kwargs, allow_extra=True)
+        next_args_json = json.dumps(next_kwargs)
         prefix = next_step['ext_name'][:3].lower()
         next_job_id = f"{prefix}_{uuid.uuid4().hex[:8]}"
 
@@ -843,11 +1025,13 @@ def _init_worker_schema(workspace_id="default"):
         _INITIALIZED_WORKSPACES.add(workspace_id)
 @hooks.on('system_boot', priority=10)
 def start_workers(**kwargs):
-    global _executor, _metronome_thread
-    if _executor is not None and _metronome_thread is not None and _metronome_thread.is_alive():
+    global _executor, _interactive_executor, _metronome_thread
+    if _executor is not None and _interactive_executor is not None and _metronome_thread is not None and _metronome_thread.is_alive():
         return
     if _executor is None:
         _executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="Akasa-Worker")
+    if _interactive_executor is None:
+        _interactive_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="Akasa-Interactive")
     for ws_id in get_all_workspace_ids():
         _init_worker_schema(ws_id)
         # Clean up ghost jobs strictly once during the OS boot sequence
@@ -868,7 +1052,7 @@ def start_workers(**kwargs):
     print("⚙️  Stateless Worker Metronome Online.")
 @hooks.on('system_shutdown')
 def stop_workers(**kwargs):
-    global _executor, _io_executor
+    global _executor, _interactive_executor, _io_executor
     print("🛑 Suspending Worker Metronome...")
     _shutdown_event.set()
     with _metronome_wakeup:
@@ -876,6 +1060,9 @@ def stop_workers(**kwargs):
     if _executor:
         _executor.shutdown(wait=False)
         _executor = None
+    if _interactive_executor:
+        _interactive_executor.shutdown(wait=False)
+        _interactive_executor = None
     if _io_executor:
         _io_executor.shutdown(wait=False)
         _io_executor = None

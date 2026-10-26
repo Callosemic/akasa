@@ -1,41 +1,71 @@
 import fnmatch
-import urllib.parse
 import posixpath
-import re
+
 
 class AkasaURI:
     """
     Zero-knowledge Universal Resource Identifier. 
     Strictly handles RFC 3986 parsing and POSIX path normalization.
     """
+    __slots__ = ('scheme', 'volume', 'path', 'is_dir', '_cached_str')
+
     def __init__(self, raw_path: str):
         if not raw_path:
-            raw_path = ""
-            
-        clean_path = str(raw_path).replace('\\', '/').strip()
-        
-        if "://" in clean_path:
-            scheme_part, rest = clean_path.split("://", 1)
-            rest = re.sub(r'/+', '/', rest)
-            clean_path = f"{scheme_part}://{rest}"
-        else:
-            clean_path = re.sub(r'/+', '/', clean_path)
+            self.scheme = ""
+            self.volume = ""
+            self.path = ""
+            self.is_dir = False
+            self._cached_str = ""
+            return
 
-        parsed = urllib.parse.urlparse(clean_path)
-        
-        self.scheme = parsed.scheme if parsed.scheme else ""
-        self.volume = parsed.netloc if parsed.netloc else ""
-        
+        clean_path = str(raw_path).replace('\\', '/').strip()
+        if not clean_path:
+            self.scheme = ""
+            self.volume = ""
+            self.path = ""
+            self.is_dir = False
+            self._cached_str = ""
+            return
+
         self.is_dir = clean_path.endswith('/')
-        raw_internal = parsed.path
-        
-        normalized_path = posixpath.normpath(raw_internal)
-        if normalized_path in ('.', '/'):
-            normalized_path = ""
-            
-        self.path = normalized_path.lstrip('/')
+
+        if "://" not in clean_path:
+            self.scheme = ""
+            self.volume = ""
+            stripped = clean_path.lstrip('/')
+            normalized_path = posixpath.normpath(stripped) if stripped else ""
+            self.path = "" if normalized_path in ('', '.', '/') else normalized_path
+            if self.is_dir and self.path and not self.path.endswith('/'):
+                self.path += '/'
+            self._cached_str = self.path if self.path else ("/" if self.is_dir else "")
+            return
+
+        scheme_part, rest = clean_path.split("://", 1)
+        self.scheme = scheme_part.lower()
+        rest_stripped = rest.lstrip('/')
+        if '/' in rest_stripped:
+            vol_part, rel_part = rest_stripped.split('/', 1)
+            self.volume = vol_part
+            rel_stripped = rel_part.lstrip('/')
+            normalized_path = posixpath.normpath(rel_stripped) if rel_stripped else ""
+            self.path = "" if normalized_path in ('', '.', '/') else normalized_path
+        else:
+            self.volume = rest_stripped
+            self.path = ""
+
         if self.is_dir and self.path and not self.path.endswith('/'):
             self.path += '/'
+
+        base = f"{self.scheme}://{self.volume}" if self.volume else f"{self.scheme}://"
+        if self.path:
+            self._cached_str = f"{base}/{self.path}"
+        else:
+            self._cached_str = f"{base}/" if self.is_dir else base
+    @property
+    def parts(self) -> tuple:
+        if not self.path or self.path == '/':
+            return ()
+        return tuple(p for p in self.path.strip('/').split('/') if p)
 
     @property
     def basename(self) -> str:
@@ -62,13 +92,16 @@ class AkasaURI:
         base = f"{self.scheme}://{self.volume}" if self.scheme else self.volume
         full = f"{base}/{new_path}" if base else new_path
         return self.__class__(full)
-
     def relative_to(self, base_uri: 'AkasaURI') -> str:
         if self.scheme != base_uri.scheme or self.volume != base_uri.volume:
             raise ValueError(f"URIs do not share the same scheme and volume: '{self.scheme}://{self.volume}' vs '{base_uri.scheme}://{base_uri.volume}'")
-        if not self.path.startswith(base_uri.path):
-            raise ValueError("Current URI is not a subpath of the base URI.")
-        return self.path[len(base_uri.path):].lstrip('/')
+        base_clean = base_uri.path.rstrip('/')
+        self_clean = self.path.rstrip('/')
+        if base_clean:
+            if self_clean != base_clean and not self_clean.startswith(base_clean + '/'):
+                raise ValueError("Current URI is not a subpath of the base URI.")
+            return self.path[len(base_clean):].lstrip('/')
+        return self.path.lstrip('/')
     def match(self, pattern: str) -> bool:
         full_str = str(self)
         if fnmatch.fnmatch(full_str, pattern):
@@ -76,20 +109,8 @@ class AkasaURI:
         if fnmatch.fnmatch(self.path, pattern):
             return True
         return False
-
     def __str__(self) -> str:
-        if self.scheme:
-            base = f"{self.scheme}://{self.volume}" if self.volume else f"{self.scheme}://"
-            if self.path:
-                return f"{base}/{self.path}"
-            return f"{base}/" if self.is_dir else base
-        elif self.volume:
-            base = self.volume
-            if self.path:
-                return f"{base}/{self.path}"
-            return f"{base}/" if self.is_dir else base
-        else:
-            return self.path if self.path else ("/" if self.is_dir else "")
+        return self._cached_str
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}('{str(self)}')"

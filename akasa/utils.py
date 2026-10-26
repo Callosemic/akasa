@@ -15,16 +15,63 @@ import posixpath
 import unicodedata
 import urllib.parse
 from akasa.uri import AkasaURI
-
 _cwd = os.getcwd()
 _TRUSTED_HOST_SUFFIXES = set()
+_HEAL_LOCAL = threading.local()
 
 
+def get_control_dir_name() -> str:
+    """SSOT for resolving the active host control directory name (defaults to '.akasa')."""
+    return os.environ.get("AKASA_CONTROL_DIR", ".akasa")
+
+
+def atomic_write_bytes(filepath: str, data: bytes, mode: typing.Optional[int] = None) -> None:
+    """
+    Atomically writes bytes to filepath using a dot-prefixed sibling temporary file,
+    os.fsync, permission preservation, and os.replace.
+    """
+    target = Path(filepath)
+    parent = target.parent
+    os.makedirs(parent.as_posix(), exist_ok=True)
+
+    existing_mode = mode
+    if existing_mode is None and target.exists():
+        try:
+            existing_mode = target.stat().st_mode & 0o777
+        except OSError:
+            existing_mode = None
+
+    tmp_name = f".tmp_{os.getpid()}_{threading.get_ident()}_{target.name}"
+    tmp_path = parent.joinpath(tmp_name)
+    try:
+        with open(tmp_path.as_posix(), "wb") as f:
+            f.write(data)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        if existing_mode is not None:
+            try:
+                os.chmod(tmp_path.as_posix(), existing_mode)
+            except OSError:
+                pass
+        os.replace(tmp_path.as_posix(), target.as_posix())
+    except Exception:
+        if tmp_path.exists():
+            try:
+                os.remove(tmp_path.as_posix())
+            except OSError:
+                pass
+        raise
+
+
+def atomic_write_text(filepath: str, content: str, encoding: str = "utf-8", mode: typing.Optional[int] = None) -> None:
+    """Atomically writes UTF-8 text to filepath via atomic_write_bytes."""
+    atomic_write_bytes(filepath, content.encode(encoding), mode=mode)
 def get_daemon_cwd() -> str:
     """Returns the anchored working directory of the Akasa daemon."""
     return _cwd
-
-
 def set_daemon_cwd(new_cwd: str) -> None:
     """Updates the anchored working directory of the Akasa daemon."""
     global _cwd
@@ -32,7 +79,7 @@ def set_daemon_cwd(new_cwd: str) -> None:
 
 
 def register_trusted_host_suffix(*suffixes: str) -> None:
-    """DI Interface: Registers trusted reverse-proxy/tunnel hostname suffixes (e.g., '.ts.net')."""
+    """DI Interface: Registers trusted reverse-proxy/tunnel hostname suffixes (e.g., '.internal.net')."""
     for sfx in suffixes:
         if sfx:
             _TRUSTED_HOST_SUFFIXES.add(str(sfx))
@@ -79,35 +126,100 @@ def allocate_ephemeral_port(host: str = "0.0.0.0") -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind((host, 0))
         return int(s.getsockname()[1])
-def get_system_index_path() -> str:
-    """Returns the canonical path to the daemon's workspaces.json routing index, healing deprecated state if needed."""
-    control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
-    ws_path = Path(_cwd).joinpath(control_dir_name, "workspaces.json")
-    sys_path = Path(_cwd).joinpath(control_dir_name, "system.json")
-    if sys_path.exists():
-        try:
-            sys_data = load_json_config(sys_path.as_posix(), {})
-            sys_ws = sys_data.get("workspaces") if isinstance(sys_data, dict) else None
-            if isinstance(sys_ws, dict) and sys_ws:
-                ws_data = load_json_config(ws_path.as_posix(), {}) if ws_path.exists() else {}
-                cur_ws = ws_data.get("workspaces") if isinstance(ws_data, dict) and not ws_data.get("_deprecated") else {}
-                if not isinstance(cur_ws, dict):
-                    cur_ws = {}
-                if not ws_path.exists() or ws_data.get("_deprecated") or any(k not in cur_ws for k in sys_ws):
-                    merged_ws = {**cur_ws, **sys_ws}
-                    restored = {"workspaces": merged_ws}
-                    active_ws = sys_data.get("active_workspace") or (ws_data.get("active_workspace") if isinstance(ws_data, dict) else None)
-                    if active_ws:
-                        restored["active_workspace"] = active_ws
-                    with open(ws_path.as_posix(), "w", encoding="utf-8") as f:
-                        json.dump(restored, f, indent=2)
+def heal_daemon_config_files(remove_legacy_system_json: bool = False) -> typing.Tuple[str, str]:
+    """
+    Kernel-level daemon config healer:
+    Synchronizes any legacy system.json into workspaces.json (multi-tenant routing index)
+    and host.json (daemon-scoped settings). Optionally removes system.json once split.
+    Returns (workspaces_index_path, host_config_path).
+    """
+    control_dir_name = get_control_dir_name()
+    base_dir = Path(_cwd).joinpath(control_dir_name)
+    ws_path = base_dir.joinpath("workspaces.json")
+    host_path = base_dir.joinpath("host.json")
+    sys_path = base_dir.joinpath("system.json")
+
+    if getattr(_HEAL_LOCAL, "active", False):
+        return ws_path.as_posix(), host_path.as_posix()
+
+    _HEAL_LOCAL.active = True
+    try:
+        if sys_path.exists():
+            try:
+                sys_data = load_json_config(sys_path.as_posix(), {})
+                if isinstance(sys_data, dict):
+                    sys_ws = sys_data.get("workspaces")
+                    existing_ws_data = load_json_config(ws_path.as_posix(), {}) if ws_path.exists() else {}
+                    cur_ws = (
+                        existing_ws_data.get("workspaces")
+                        if isinstance(existing_ws_data, dict) and not existing_ws_data.get("_deprecated")
+                        else {}
+                    )
+                    if not isinstance(cur_ws, dict):
+                        cur_ws = {}
+
+                    if isinstance(sys_ws, dict) and (
+                        not ws_path.exists()
+                        or existing_ws_data.get("_deprecated")
+                        or any(k not in cur_ws for k in sys_ws)
+                    ):
+                        merged_ws = {"default": {"config_path": "config.json"}, **cur_ws, **sys_ws}
+                        active_ws = (
+                            sys_data.get("active_workspace")
+                            or (existing_ws_data.get("active_workspace") if isinstance(existing_ws_data, dict) else None)
+                            or "default"
+                        )
+                        restored = {"workspaces": merged_ws, "active_workspace": active_ws}
+                        atomic_write_text(ws_path.as_posix(), json.dumps(restored, indent=2), encoding="utf-8")
+                        _JSON_CACHE.pop(ws_path.as_posix(), None)
+                        _JSON_MTIME.pop(ws_path.as_posix(), None)
+
+                    host_keys = {k: v for k, v in sys_data.items() if k not in ("workspaces", "active_workspace")}
+                    if host_keys and (remove_legacy_system_json or not host_path.exists()):
+                        host_data = load_json_config(host_path.as_posix(), {}) if host_path.exists() else {}
+                        merged_host = {**host_keys, **host_data} if host_path.exists() else host_keys
+                        atomic_write_text(host_path.as_posix(), json.dumps(merged_host, indent=2), encoding="utf-8")
+                        _JSON_CACHE.pop(host_path.as_posix(), None)
+                        _JSON_MTIME.pop(host_path.as_posix(), None)
+
+                    if remove_legacy_system_json:
+                        try:
+                            os.remove(sys_path.as_posix())
+                        except OSError:
+                            pass
+                        _JSON_CACHE.pop(sys_path.as_posix(), None)
+                        _JSON_MTIME.pop(sys_path.as_posix(), None)
+            except Exception:
+                pass
+        elif ws_path.exists():
+            try:
+                existing_ws_data = load_json_config(ws_path.as_posix(), {})
+                if isinstance(existing_ws_data, dict) and existing_ws_data.get("_deprecated"):
+                    restored_default = {
+                        "workspaces": {"default": {"config_path": "config.json"}},
+                        "active_workspace": "default",
+                    }
+                    atomic_write_text(ws_path.as_posix(), json.dumps(restored_default, indent=2), encoding="utf-8")
                     _JSON_CACHE.pop(ws_path.as_posix(), None)
                     _JSON_MTIME.pop(ws_path.as_posix(), None)
-        except Exception:
-            pass
-    if sys_path.exists() and not ws_path.exists():
-        return sys_path.as_posix()
-    return ws_path.as_posix()
+            except Exception:
+                pass
+    finally:
+        _HEAL_LOCAL.active = False
+
+    return ws_path.as_posix(), host_path.as_posix()
+
+
+def get_system_index_path() -> str:
+    """Returns the canonical path to the daemon's workspaces.json routing index."""
+    ws_path, _ = heal_daemon_config_files(remove_legacy_system_json=True)
+    return ws_path
+
+
+def get_daemon_host_config_path() -> str:
+    """Returns the canonical path to the daemon's host.json settings file."""
+    _, host_path = heal_daemon_config_files(remove_legacy_system_json=True)
+    return host_path
 
 
 def get_json_cache_stats() -> dict:
@@ -145,7 +257,7 @@ def get_tenant_control_dir(workspace_id=None):
 def get_workspace_physics(workspace_id=None):
     if not workspace_id:
         workspace_id = sniff_tenant_id()
-    control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
+    control_dir_name = get_control_dir_name()
     local_control_dir = Path(_cwd).joinpath(control_dir_name).as_posix()
     default_config = Path(local_control_dir).joinpath("config.json").as_posix()
     index_path = get_system_index_path()
@@ -533,11 +645,9 @@ def resolve_sandbox_path(filepath, workspace_id=None):
     if not is_subpath(resolved, ws_root_path):
         return ws_root_path.as_posix()
     return resolved.as_posix()
-
-
 def resolve_system_artifact_path(filepath, workspace_id):
     cfg_path, _ = get_workspace_physics(workspace_id)
-    control_dir_name = os.environ.get("AKASA_CONTROL_DIR", ".akasa")
+    control_dir_name = get_control_dir_name()
 
     active_control_base = Path(cfg_path).parent.resolve()
     default_control_base = Path(_cwd).joinpath(control_dir_name).resolve()

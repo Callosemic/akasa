@@ -30,11 +30,14 @@ def execute_binary(cmd, cwd=None, env=None, check=False, capture_output=True, te
         module_name = bin_name.replace('-', '_')
         full_cmd = [sys.executable, '-m', module_name] + cmd_args[1:]
 
+    child_env = dict(os.environ) if env is None else dict(env)
+    child_env.pop("AKASA_BOOT_TOKEN", None)
+
     if popen:
         return subprocess.Popen(
             full_cmd,
             cwd=cwd,
-            env=env,
+            env=child_env,
             text=text,
             **kwargs
         )
@@ -42,7 +45,7 @@ def execute_binary(cmd, cwd=None, env=None, check=False, capture_output=True, te
     return subprocess.run(
         full_cmd,
         cwd=cwd,
-        env=env,
+        env=child_env,
         check=check,
         capture_output=capture_output,
         text=text,

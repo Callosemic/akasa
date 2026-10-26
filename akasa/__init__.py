@@ -1,4 +1,5 @@
 import os
+import hmac
 import queue
 import threading
 from typing import Optional, Iterable, Tuple
@@ -120,23 +121,21 @@ def init_app(
             response.headers["Pragma"] = "no-cache"
             response.headers["Expires"] = "0"
             return response
-
     @app.before_request
     def _akasa_enforce_token_gate():
-        path = request.path
+        req_route = request.path
         if (
-            path in allowed_routes
-            or (allowed_prefixes and path.startswith(allowed_prefixes))
-            or (allowed_suffixes and path.endswith(allowed_suffixes))
+            req_route in allowed_routes
+            or (allowed_prefixes and req_route.startswith(allowed_prefixes))
+            or (allowed_suffixes and req_route.endswith(allowed_suffixes))
         ):
             return None
-
         client_token = (
             request.headers.get(token_header)
             or request.headers.get("X-Akasa-Token")
             or request.args.get("token")
         )
-        if not client_token or client_token != _BOOT_TOKEN:
+        if not client_token or not hmac.compare_digest(str(client_token), str(_BOOT_TOKEN)):
             return jsonify({"error": "401 Unauthorized: Invalid or missing execution credentials."}), 401
         return None
 
@@ -188,8 +187,8 @@ def reset_state(cwd: Optional[str] = None, control_dir: Optional[str] = None) ->
     from akasa.db import close_thread_connections as _close_thread_connections
     import akasa.vfs as _akasa_vfs
     import akasa.workers as _akasa_workers
-
     _close_thread_connections()
+    hooks.clear_auth_cache()
     _akasa_utils._JSON_CACHE.clear()
     _akasa_utils._JSON_MTIME.clear()
     _akasa_utils.load_config.clear_all()
@@ -203,8 +202,8 @@ def reset_state(cwd: Optional[str] = None, control_dir: Optional[str] = None) ->
 
     with _akasa_workers._SCHEMA_INIT_LOCK:
         _akasa_workers._INITIALIZED_WORKSPACES.clear()
-
     if cwd is not None:
+        _akasa_utils._in_test_sandbox = True
         _akasa_utils.set_daemon_cwd(cwd)
     if control_dir is not None:
         os.environ["AKASA_CONTROL_DIR"] = control_dir
