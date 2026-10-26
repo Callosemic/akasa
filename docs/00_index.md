@@ -16,3 +16,4 @@ This directory contains the core architectural specifications, integration contr
 * **[ADR 0005: Parallel DAG Orchestration, In-Memory VFS Read Caching, and Inter-Workspace Routing](./adrs/0005_parallel_dag_orchestration_vfs_ram_caching_and_inter_workspace_routing.md)**
 * **[ADR 0006: Kernel Resource Governance, Bounded Thread Pools, and Secret Masking Lifecycle](./adrs/0006_resource_governance_bounded_executors_and_secret_lifecycle.md)**
 * **[ADR 0007: Kernel Bootloader Lifecycle, Causal 3-Way Merging, Substrate Purity, and Self-Healing Persistence](./adrs/0007_kernel_bootloader_vfs_3way_merge_and_substrate_purity.md)**
+* **[ADR 0008: Micro-Batched VFS Commits, Dual-Pool Worker Scheduling, Signature-Driven Type Validation, and Zero-Copy IPC Gateway](./adrs/0008_microbatched_vfs_dual_pool_workers_and_ipc_gateway.md)**

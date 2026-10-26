@@ -112,6 +112,9 @@ ext_bp = AkasaExtension(
 4.2 ExtensionContext (ctx)
  * Identity & Configuration:
    * ctx.ext_name: str, ctx.workspace_id: str, ctx.req: flask.Request
+   * ctx.method: str ('GET', 'POST', or 'CALL' when invoked via in-process IPC).
+   * ctx.payload: Dict[str, Any] (unified dictionary across query parameters, JSON body, path arguments, and in-process kwargs).
+   * ctx.call(capability: str, wait: bool = True, timeout: float = 60.0, **kwargs) -> Any: In-process zero-copy IPC gateway invoking registered capabilities (`<ext>.<action>`) with automatic 202 background job awaiting.
    * ctx.config -> Dict[str, Any]: Cached tenant config.json (hydrated via mutate_workspace_config).
    * ctx.paths -> Dict[str, str]: Contains config_path, control_dir, workspace_root, data_dir, cache_dir, artifacts_base, plus any paths injected via request_paths.
    * ctx.get_repo_data_path(repo: str, subpath: str = "") -> str: Returns vfs://<repo>/<control_dir>-data/<ext_name>[/<subpath>].
@@ -137,7 +140,7 @@ ext_bp = AkasaExtension(
    * .map_parallel(fn, items) -> list: Executes fn across items on the bounded 4-worker Akasa-IO pool with automatic SQLite connection cleanup.
    * .wait_for(prefix=None, job_id=None, timeout=10.0) -> bool
    * .is_in_flight(task_name=None, prefix=None, args_like=None, window_sec=None) -> bool
-   * .find_active_pipeline_job(worker_names: List[str], force_full: bool = False, window_sec: float = 300.0) -> Optional[str]
+   * .find_active_pipeline_job(worker_names: List[str], predicate: Optional[Callable[[Dict[str, Any]], bool]] = None, window_sec: float = 300.0) -> Optional[str]
    * .get_scheduled_args(job_id) -> Optional[Dict[str, Any]]
    * .get_status(job_id) -> Optional[Dict[str, Any]]
    * .get_recent_logs(limit=20) -> List[Dict[str, Any]]
@@ -163,8 +166,10 @@ ext_bp = AkasaExtension(
    * ctx.emit_background(event_name, *args, **kwargs)
 5. URI, VFS Concurrency & Telemetry Primitives
  * AkasaURI(raw_path: str) (akasa.uri):
-   * Attributes: .scheme, .volume, .path, .is_dir, .basename, .parent -> AkasaURI.
+   * Attributes: .scheme, .volume, .path, .is_dir, .basename, .parts: tuple, .parent -> AkasaURI (backed by `__slots__`).
    * Methods: .join(child_path: str) -> AkasaURI, .relative_to(base_uri: AkasaURI) -> str, .match(pattern: str) -> bool.
+ * Event Bus Barrier (akasa.hooks):
+   * hooks.sync_event_bus_barrier(timeout: float = 5.0) -> bool: Awaits completion of all queued background event bus handlers.
  * VFS OCC & 3-Way Merge (akasa.vfs):
    * compute_vfs_sha256(text: str) -> str
    * record_vfs_ancestor(workspace_id: str, filepath_or_resolved: str, text: str, text_hash: Optional[str] = None) -> str
