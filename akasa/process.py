@@ -32,8 +32,10 @@ def execute_binary(cmd, cwd=None, env=None, check=False, capture_output=True, te
 
     child_env = dict(os.environ) if env is None else dict(env)
     child_env.pop("AKASA_BOOT_TOKEN", None)
-
     if popen:
+        if capture_output:
+            kwargs.setdefault("stdout", subprocess.PIPE)
+            kwargs.setdefault("stderr", subprocess.PIPE)
         return subprocess.Popen(
             full_cmd,
             cwd=cwd,

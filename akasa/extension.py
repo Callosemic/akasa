@@ -11,27 +11,65 @@ import functools
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, TypedDict, Callable
 from flask import Blueprint, Response, request, jsonify, has_request_context
-
 if TYPE_CHECKING:
     from akasa.types import WorkspaceID, FilePath, VFSStorageEngine, WorkspacePathsDict
-from akasa.db import get_connection, register_schema
+from akasa.uri import AkasaURI
+from akasa.context import (
+    execution_frame,
+    get_current_frame,
+    sniff_tenant_id,
+    get_control_dir_name,
+    parse_uri,
+    atomic_write_text,
+)
 from akasa.events import sse_bus
 from akasa.hooks import hooks
-import akasa.utils as _akasa_utils
-from akasa.utils import (
-    extension_auth,
+from akasa.db import get_connection, register_schema
+from akasa.vfs import VFSTransaction, _resolve_physical_path, sync_vfs_barrier as _vfs_sync_barrier
+from akasa.state import (
     load_config,
-    get_control_dir_name,
     get_workspace_physics,
     get_tenant_control_dir,
     get_daemon_host_config_path,
     load_json_config,
     save_json_config,
-    parse_uri,
     get_active_modules,
     is_extension_enabled,
 )
-from akasa.vfs import VFSTransaction, _resolve_physical_path, sync_vfs_barrier as _vfs_sync_barrier
+from akasa.process import ProcessManager
+from akasa.workers import (
+    submit_immediate_job,
+    submit_one_shot_job,
+    submit_job,
+    validate_worker_kwargs,
+    register_ephemeral_artifact,
+    start_dag_chain,
+    run_parallel,
+    wait_for_jobs,
+    cancel_job,
+    pause_job,
+    resume_job,
+    update_immediate_job_status,
+    update_immediate_job_meta,
+    resolve_dag_chain,
+    register_callback,
+)
+import akasa.auth as _akasa_auth
+import akasa.utils as _akasa_utils
+from akasa.auth import encrypt_secret, decrypt_secret, get_master_key
+
+
+def extension_auth(ext_name: str):
+    """HTTP route decorator verifying that ext_name is enabled in the target workspace."""
+    def decorator(f):
+        @functools.wraps(f)
+        def decorated_function(*args, **kwargs):
+            ws_id = kwargs.get('workspace_id') or sniff_tenant_id()
+            if not is_extension_enabled(ext_name, ws_id):
+                return jsonify({"error": f"403 Forbidden: Extension '{ext_name}' is not enabled in this workspace."}), 403
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
 class SettingsUpdateResponse(TypedDict, total=False):
     status: str
@@ -46,42 +84,46 @@ class JobManager:
         self.root_job_id = root_job_id or job_id
         self.chain_state = dict(chain_state) if isinstance(chain_state, dict) else {}
         self.chain_history = list(chain_history) if isinstance(chain_history, list) else []
-
     def submit(self, task_name, coalesce=False, job_category="system_background", job_id=None, **kwargs):
-        from akasa.workers import submit_immediate_job as _submit_immediate_job, validate_worker_kwargs as _validate_worker_kwargs
-        _validate_worker_kwargs(self.ext_name, task_name, kwargs, allow_extra=False)
+        validate_worker_kwargs(self.ext_name, task_name, kwargs, allow_extra=False)
         job_prefix = self.ext_name[:3].lower()
         resolved_id = job_id or f"{job_prefix}_{uuid.uuid4().hex[:8]}"
         args_json = json.dumps(kwargs)
-        return _submit_immediate_job(
+        return submit_immediate_job(
             resolved_id, self.ext_name, task_name, args_json, self.workspace_id, coalesce=coalesce, job_category=job_category
         )
 
     def submit_one_shot(self, task_name, delay_ms, job_id=None, **kwargs):
-        from akasa.workers import submit_one_shot_job as _submit_one_shot_job, validate_worker_kwargs as _validate_worker_kwargs
         kwargs.pop("job_category", None)
-        _validate_worker_kwargs(self.ext_name, task_name, kwargs, allow_extra=False)
+        validate_worker_kwargs(self.ext_name, task_name, kwargs, allow_extra=False)
         job_prefix = self.ext_name[:3].lower()
         resolved_id = job_id or f"{job_prefix}_{uuid.uuid4().hex[:8]}"
         args_json = json.dumps(kwargs)
-        _submit_one_shot_job(resolved_id, self.ext_name, task_name, delay_ms, args_json, self.workspace_id)
+        submit_one_shot_job(resolved_id, self.ext_name, task_name, delay_ms, args_json, self.workspace_id)
         return resolved_id
 
     def schedule(self, task_name, interval_ms, jitter_ms=0, job_id=None, **kwargs):
         """SDK Helper: Schedules a recurring task in the Metronome ledger."""
-        from akasa.workers import submit_job as _submit_job, validate_worker_kwargs as _validate_worker_kwargs
         kwargs.pop("job_category", None)
-        _validate_worker_kwargs(self.ext_name, task_name, kwargs, allow_extra=False)
+        validate_worker_kwargs(self.ext_name, task_name, kwargs, allow_extra=False)
         job_prefix = self.ext_name[:3].lower()
         resolved_id = job_id or f"{job_prefix}_{uuid.uuid4().hex[:8]}"
         args_json = json.dumps(kwargs)
-        _submit_job(resolved_id, self.ext_name, task_name, interval_ms, args_json, jitter_ms=jitter_ms, workspace_id=self.workspace_id)
+        submit_job(resolved_id, self.ext_name, task_name, interval_ms, args_json, jitter_ms=jitter_ms, workspace_id=self.workspace_id)
         return resolved_id
-
     def register_ephemeral(self, filepath, ttl_seconds=3600, owner=None):
         """SDK Helper: Registers a temporary file artifact for automatic TTL garbage collection."""
-        from akasa.workers import register_ephemeral_artifact as _register_ephemeral_artifact
-        _register_ephemeral_artifact(filepath, owner or self.ext_name, ttl_seconds, workspace_id=self.workspace_id)
+        register_ephemeral_artifact(filepath, owner or self.ext_name, ttl_seconds, workspace_id=self.workspace_id)
+
+    def write_scratch(self, filename: str, content: str, ttl_seconds: int = 3600, owner: Optional[str] = None) -> str:
+        """Atomically writes an ephemeral scratch buffer inside the tenant cache directory and registers it for TTL cleanup."""
+        control_dir = get_tenant_control_dir(self.workspace_id)
+        scratch_dir = Path(control_dir).joinpath("cache", self.ext_name, "scratch")
+        clean_name = Path(filename).name
+        scratch_file = scratch_dir.joinpath(clean_name).as_posix()
+        atomic_write_text(scratch_file, content)
+        register_ephemeral_artifact(scratch_file, owner or f"{self.ext_name}_scratch", ttl_seconds, workspace_id=self.workspace_id)
+        return scratch_file
 
     def get_ephemerals(self, owner=None) -> List[str]:
         """SDK Helper: Returns all active ephemeral artifact filepaths for the workspace (or specific owner)."""
@@ -100,24 +142,23 @@ class JobManager:
         conn.commit()
     def submit_chain(self, steps, on_complete_hook=None, job_category="system_background", **kwargs):
         """SDK Helper: Automatically constructs and dispatches a parallel-capable DAG background job chain."""
-        if not steps: return None
-        from akasa.workers import start_dag_chain as _start_dag_chain
-        return _start_dag_chain(
+        if not steps:
+            return None
+        return start_dag_chain(
             steps,
             self.workspace_id,
             on_complete_hook=on_complete_hook,
             job_category=job_category,
             **kwargs
         )
+
     def map_parallel(self, fn, items) -> list:
         """SDK Helper: Executes fn(item) across items using the shared bounded kernel I/O pool."""
-        from akasa.workers import run_parallel as _run_parallel
-        return _run_parallel(fn, items)
+        return run_parallel(fn, items)
 
     def wait_for(self, prefix: str = None, job_id: str = None, timeout: float = 10.0) -> bool:
         """SDK Helper: Blocks until matching in-flight immediate jobs complete via in-memory threading.Event."""
-        from akasa.workers import wait_for_jobs as _wait_for_jobs
-        return _wait_for_jobs(self.workspace_id, prefix=prefix, job_id=job_id, timeout=timeout)
+        return wait_for_jobs(self.workspace_id, prefix=prefix, job_id=job_id, timeout=timeout)
 
     def is_in_flight(self, task_name=None, prefix=None, args_like=None, window_sec=None):
         """SDK Helper: Checks if a specific background worker task (or ID prefix) is currently queued, processing, or within a debounce window."""
@@ -220,30 +261,25 @@ class JobManager:
                 "updated_at": row['updated_at']
             })
         return logs
-
     def cancel(self, job_id):
         """SDK Helper: Cancels a scheduled background job in the Metronome ledger."""
-        from akasa.workers import cancel_job as _cancel_job
-        return _cancel_job(job_id, workspace_id=self.workspace_id)
+        return cancel_job(job_id, workspace_id=self.workspace_id)
 
     def pause(self, job_id):
         """SDK Helper: Freezes a scheduled background job in the Metronome ledger."""
-        from akasa.workers import pause_job as _pause_job
-        return _pause_job(job_id, workspace_id=self.workspace_id)
+        return pause_job(job_id, workspace_id=self.workspace_id)
 
     def resume(self, job_id, reset_timer=True):
         """SDK Helper: Restores a paused background job in the Metronome ledger."""
-        from akasa.workers import resume_job as _resume_job
-        return _resume_job(job_id, workspace_id=self.workspace_id, reset_timer=reset_timer)
+        return resume_job(job_id, workspace_id=self.workspace_id, reset_timer=reset_timer)
+
     def update_progress(self, message, artifact=None):
         if self.current_job_id:
-            from akasa.workers import update_immediate_job_status as _update_immediate_job_status
-            _update_immediate_job_status(self.current_job_id, 'processing', message, artifact, workspace_id=self.workspace_id)
+            update_immediate_job_status(self.current_job_id, 'processing', message, artifact, workspace_id=self.workspace_id)
 
     def update_meta(self, meta_dict):
         if self.current_job_id:
-            from akasa.workers import update_immediate_job_meta as _update_immediate_job_meta
-            _update_immediate_job_meta(self.current_job_id, meta_dict, workspace_id=self.workspace_id)
+            update_immediate_job_meta(self.current_job_id, meta_dict, workspace_id=self.workspace_id)
 _REGISTERED_SETTINGS_SCHEMAS = {}
 _CAPABILITY_REGISTRY: Dict[str, Dict[str, Any]] = {}
 _EXTENSION_INSTANCES: Dict[str, "AkasaExtension"] = {}
@@ -354,11 +390,9 @@ class SettingsManager:
                 val = ext_secrets[key]
                 decrypted = val
                 if isinstance(val, str) and val.startswith("v1:"):
-                    from akasa.auth import decrypt_secret as _decrypt_secret
-                    decrypted = _decrypt_secret(val)
+                    decrypted = decrypt_secret(val)
                 elif val:
-                    from akasa.auth import encrypt_secret as _encrypt_secret
-                    enc_val = _encrypt_secret(str(val))
+                    enc_val = encrypt_secret(str(val))
                     if scope == 'repo' and repo:
                         data.setdefault(self.ext_name, {}).setdefault(repo, {})[key] = enc_val
                     else:
@@ -393,13 +427,11 @@ class SettingsManager:
 
         scope = field.get('scope', 'workspace')
         is_secure = field.get('secure', False)
-
         if is_secure:
             if value == MASKED_SECRET_SENTINEL:
                 return
             if value:
-                from akasa.auth import encrypt_secret as _encrypt_secret
-                value = _encrypt_secret(value)
+                value = encrypt_secret(value)
             control_dir = get_tenant_control_dir(self.workspace_id)
             filepath = Path(control_dir).joinpath(self.secrets_filename).as_posix()
             data = load_json_config(filepath, {})
@@ -446,23 +478,24 @@ class SettingsManager:
         return result
     def update(self, payload_dict, repo=None):
         control_dir = get_tenant_control_dir(self.workspace_id)
-        daemon_path = self._resolve_filepath('daemon')
-        ws_path = self._resolve_filepath('workspace')
-        repo_path = self._resolve_filepath('repo')
-        secrets_path = Path(control_dir).joinpath(self.secrets_filename).as_posix()
-
-        # Load memory buffers
-        buffers = {
-            'daemon': load_json_config(daemon_path, {}),
-            'workspace': load_json_config(ws_path, {}),
-            'repo': load_json_config(repo_path, {}),
-            'secure': load_json_config(secrets_path, {})
+        scope_paths = {
+            'daemon': self._resolve_filepath('daemon'),
+            'workspace': self._resolve_filepath('workspace'),
+            'repo': self._resolve_filepath('repo'),
+            'secure': Path(control_dir).joinpath(self.secrets_filename).as_posix(),
         }
+        buffers: Dict[str, dict] = {}
         dirty = set()
+
+        def _get_buffer(target_scope: str) -> dict:
+            if target_scope not in buffers:
+                buffers[target_scope] = load_json_config(scope_paths[target_scope], {})
+            return buffers[target_scope]
 
         for field in self.schema:
             k = field.get('id')
-            if not k or k not in payload_dict: continue
+            if not k or k not in payload_dict:
+                continue
 
             val = payload_dict[k]
             scope = field.get('scope', 'workspace')
@@ -472,38 +505,42 @@ class SettingsManager:
                 if val == MASKED_SECRET_SENTINEL:
                     continue
                 if val:
-                    from akasa.auth import encrypt_secret as _encrypt_secret
-                    val = _encrypt_secret(val)
-                if self.ext_name not in buffers['secure']: buffers['secure'][self.ext_name] = {}
+                    val = encrypt_secret(val)
+                sec_buf = _get_buffer('secure')
+                if self.ext_name not in sec_buf:
+                    sec_buf[self.ext_name] = {}
                 if scope == 'repo' and repo:
-                    if repo not in buffers['secure'][self.ext_name]: buffers['secure'][self.ext_name][repo] = {}
-                    buffers['secure'][self.ext_name][repo][k] = val
+                    if repo not in sec_buf[self.ext_name]:
+                        sec_buf[self.ext_name][repo] = {}
+                    sec_buf[self.ext_name][repo][k] = val
                 else:
-                    buffers['secure'][self.ext_name][k] = val
+                    sec_buf[self.ext_name][k] = val
                 dirty.add('secure')
             else:
-                target = buffers[scope]
+                target = _get_buffer(scope)
                 if scope == 'daemon':
                     if k in target and not isinstance(target[k], dict):
                         target[k] = val
                     else:
-                        if self.ext_name not in target: target[self.ext_name] = {}
+                        if self.ext_name not in target:
+                            target[self.ext_name] = {}
                         target[self.ext_name][k] = val
                 elif scope == 'repo':
                     if repo:
-                        if repo not in target: target[repo] = {}
-                        if self.ext_name not in target[repo]: target[repo][self.ext_name] = {}
+                        if repo not in target:
+                            target[repo] = {}
+                        if self.ext_name not in target[repo]:
+                            target[repo][self.ext_name] = {}
                         target[repo][self.ext_name][k] = val
                 else:
-                    if self.ext_name not in target: target[self.ext_name] = {}
+                    if self.ext_name not in target:
+                        target[self.ext_name] = {}
                     target[self.ext_name][k] = val
                 dirty.add(scope)
 
         # Commit dirty buffers exactly once
-        if 'daemon' in dirty: save_json_config(daemon_path, buffers['daemon'], self.workspace_id)
-        if 'workspace' in dirty: save_json_config(ws_path, buffers['workspace'], self.workspace_id)
-        if 'repo' in dirty: save_json_config(repo_path, buffers['repo'], self.workspace_id)
-        if 'secure' in dirty: save_json_config(secrets_path, buffers['secure'], self.workspace_id)
+        for dirty_scope in dirty:
+            save_json_config(scope_paths[dirty_scope], buffers[dirty_scope], self.workspace_id)
         if dirty:
             self._sync_vfs_barrier()
             hooks.emit('config_mutated', workspace_id=self.workspace_id)
@@ -612,6 +649,9 @@ class ExtensionContext:
     @property
     def method(self) -> str:
         """Returns the active HTTP method ('GET', 'POST', etc.) or 'CALL' when invoked via ctx.call()."""
+        frame = get_current_frame()
+        if frame is not None and frame.method:
+            return frame.method
         if has_request_context():
             try:
                 return str(request.method or "GET").upper()
@@ -652,8 +692,19 @@ class ExtensionContext:
             if ext_obj
             else ExtensionContext(target_ext, self.workspace_id, payload=call_payload)
         )
-
-        handler = spec["handler"]
+        method_override = str(call_payload.pop("_method", "") or "").upper()
+        handlers_by_method = spec.get("handlers_by_method") or {}
+        if method_override and method_override in handlers_by_method:
+            handler = handlers_by_method[method_override]
+        elif len(handlers_by_method) > 1:
+            if call_payload and "POST" in handlers_by_method:
+                handler = handlers_by_method["POST"]
+            elif not call_payload and "GET" in handlers_by_method:
+                handler = handlers_by_method["GET"]
+            else:
+                handler = spec["handler"]
+        else:
+            handler = spec["handler"]
         sig = inspect.signature(handler)
         accepted_kwargs = {}
         accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
@@ -662,8 +713,8 @@ class ExtensionContext:
                 continue
             if accepts_var_kw or k in sig.parameters:
                 accepted_kwargs[k] = v
-
-        raw_res = handler(target_ctx, **accepted_kwargs)
+        with execution_frame(workspace_id=self.workspace_id, transport="IPC", method=method_override or "CALL", payload=call_payload):
+            raw_res = handler(target_ctx, **accepted_kwargs)
         status_code = 200
         body = raw_res
 
@@ -775,9 +826,9 @@ class ExtensionContext:
     def exec(self):
         """Returns a sandboxed ProcessManager keyed to the active tenant workspace."""
         if not hasattr(self, "_exec_manager") or self._exec_manager is None:
-            from akasa.process import ProcessManager as _ProcessManager
-            self._exec_manager = _ProcessManager(self.workspace_id)
+            self._exec_manager = ProcessManager(self.workspace_id)
         return self._exec_manager
+
     def resolve_path(self, filepath):
         """Safely anchors a relative path to the physical workspace bounds."""
         return _resolve_physical_path(filepath, self.workspace_id)
@@ -788,8 +839,7 @@ class ExtensionContext:
 
     def resolve_dag_chain(self, hook_name: str):
         """SDK Helper: Resolves an ordered compilation/execution DAG chain for the current workspace."""
-        from akasa.workers import resolve_dag_chain as _resolve_dag_chain
-        return _resolve_dag_chain(self, hook_name)
+        return resolve_dag_chain(self, hook_name)
 
     def parse_uri(self, path_str):
         return parse_uri(path_str)
@@ -800,8 +850,6 @@ class ExtensionContext:
         deduplicated, and stable-sorted list of physical or logical filepaths.
         Enforces a strict List[str] return contract with native VFS directory expansion fallback.
         """
-        from akasa.uri import AkasaURI as _AkasaURI
-
         candidate_list = self.emit_first(
             'expand_selection',
             items=items,
@@ -817,7 +865,7 @@ class ExtensionContext:
                 raw_str = entry.strip()
                 if not raw_str:
                     continue
-                uri_obj = _AkasaURI(raw_str)
+                uri_obj = AkasaURI(raw_str)
                 if uri_obj.is_dir:
                     for walked in self.vfs.walk(str(uri_obj).rstrip('/')):
                         if not str(walked).endswith(('.gitkeep', '.keep')):
@@ -834,7 +882,7 @@ class ExtensionContext:
                         if not str(walked).endswith(('.gitkeep', '.keep')):
                             normalized_files.append(str(walked))
                 else:
-                    normalized_files.append(str(_AkasaURI(raw_target)))
+                    normalized_files.append(str(AkasaURI(raw_target)))
         return list(dict.fromkeys(normalized_files))
 
     def sync_vfs_barrier(self, timeout=5.0):
@@ -928,7 +976,7 @@ class AkasaExtension:
         register_schema(db_name, schema_dict)
     def get_context(self, workspace_id=None, job_id=None, root_job_id=None, chain_state=None, chain_history=None, payload=None):
         """SDK Factory: Returns a fully hydrated context inherently bound to this extension's schema."""
-        wid = workspace_id or _akasa_utils.sniff_tenant_id() or "default"
+        wid = workspace_id or sniff_tenant_id() or "default"
         return self.context_class(
             self.name,
             wid,
@@ -955,7 +1003,7 @@ class AkasaExtension:
                 def wrapper(*args, **kwargs):
                     if args and isinstance(args[0], ExtensionContext):
                         return func(*args, **kwargs)
-                    wid = kwargs.get('workspace_id') or _akasa_utils.sniff_tenant_id() or "default"
+                    wid = kwargs.get('workspace_id') or sniff_tenant_id() or "default"
                     ctx = self.get_context(wid)
                     return func(ctx, *args, **kwargs)
 
@@ -976,8 +1024,6 @@ class AkasaExtension:
         and forwards only accepted parameters to the worker function.
         """
         def decorator(f):
-            from akasa.workers import register_callback as _register_callback
-
             f_sig = inspect.signature(f)
             f_params = set(f_sig.parameters.keys()) - {"ctx"}
             accepts_var_kw = any(
@@ -1022,8 +1068,7 @@ class AkasaExtension:
                 if "workspace_id" in f_params:
                     call_kwargs["workspace_id"] = actual_ws_id
                 return f(ctx, **call_kwargs)
-
-            _register_callback(self.name, task_name, wrapper, raw_func=f)
+            register_callback(self.name, task_name, wrapper, raw_func=f)
             return wrapper
         return decorator
     def route(self, rule, request_schema=None, response_schema=None, **options):
@@ -1053,34 +1098,67 @@ class AkasaExtension:
                 "response_schema": res_sch,
                 "docstring": docstring
             }
+        path_params = [m[1] for m in re.findall(r'<([^>:]+:)?([^>]+)>', clean_rule)]
         cap_action = re.sub(r'/<[^>]+>', '', clean_rule).strip('/').replace('/', '.')
         cap_id = f"{self.name}.{cap_action}" if cap_action else self.name
         methods_list = [m.upper() for m in options.get('methods', ['GET'])]
 
         def decorator(f):
+            existing_spec = _CAPABILITY_REGISTRY.get(cap_id)
+            handlers_by_method = dict(existing_spec.get("handlers_by_method", {})) if existing_spec else {}
+            for m_up in methods_list:
+                handlers_by_method[m_up] = f
+            merged_methods = list(dict.fromkeys((existing_spec.get("methods", []) if existing_spec else []) + methods_list))
+            merged_req_schema = request_schema or (existing_spec.get("request_schema") if existing_spec else None)
+            merged_res_schema = response_schema or (existing_spec.get("response_schema") if existing_spec else None)
+            merged_doc = docstring or (existing_spec.get("docstring") if existing_spec else None)
+            merged_path_params = list(dict.fromkeys((existing_spec.get("path_params", []) if existing_spec else []) + path_params))
+
             _CAPABILITY_REGISTRY[cap_id] = {
                 "id": cap_id,
                 "ext_name": self.name,
                 "action": cap_action,
                 "rule": full_rule,
-                "methods": methods_list,
-                "request_schema": request_schema,
-                "response_schema": response_schema,
-                "docstring": docstring,
+                "methods": merged_methods,
+                "path_params": merged_path_params,
+                "request_schema": merged_req_schema,
+                "response_schema": merged_res_schema,
+                "docstring": merged_doc,
                 "core": bool(getattr(self, 'core', False)),
                 "handler": f,
+                "handlers_by_method": handlers_by_method,
             }
-
             @functools.wraps(f)
             def wrapper(workspace_id, *args, **kwargs):
                 req_payload = _extract_http_request_payload(kwargs)
-                ctx = self.get_context(workspace_id, payload=req_payload)
-                result = f(ctx, *args, **kwargs)
-                return _marshal_http_return(result)
-
+                http_method = str(request.method or "GET").upper() if has_request_context() else "GET"
+                with execution_frame(workspace_id=workspace_id, transport="HTTP", method=http_method, payload=req_payload):
+                    ctx = self.get_context(workspace_id, payload=req_payload)
+                    result = f(ctx, *args, **kwargs)
+                    return _marshal_http_return(result)
             # Use getattr to safely bypass the auth gate for core OS engines
             if not getattr(self, 'core', False):
                 wrapper = extension_auth(self.name)(wrapper)
             self.bp.route(full_rule, **options)(wrapper)
             return wrapper
         return decorator
+
+
+_akasa_utils.extension_auth = extension_auth
+
+_akasa_auth.security_bp = AkasaExtension(
+    'security',
+    _akasa_auth.__name__,
+    title="Security & Encryption",
+    description="Local encryption key management.",
+    core=True,
+    settings_schema=lambda ws: [{
+        "id": "master_fernet_key",
+        "label": "Master Encryption Key (Fernet)",
+        "type": "text",
+        "scope": "daemon",
+        "secure": False,
+        "default": get_master_key().decode('utf-8'),
+        "description": "This global key encrypts your secrets.json. It is stored securely in your user home directory. If you move this workspace to another machine, you must copy this key to the new machine."
+    }]
+)

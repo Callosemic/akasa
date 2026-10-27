@@ -8,22 +8,22 @@ import urllib.parse
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Blueprint, request, jsonify
-import akasa.utils as _akasa_utils
-from akasa.utils import (
-    load_config,
-    load_json_config,
-    save_json_config,
+import akasa.context as _akasa_context
+from akasa.context import (
     get_daemon_cwd,
     get_control_dir_name,
-    get_workspace_physics,
-    get_all_workspace_ids,
-    get_tenant_control_dir,
-    get_daemon_host_config_path,
     get_trusted_host_suffixes,
     atomic_write_bytes,
 )
-from akasa.extension import AkasaExtension
 from akasa.hooks import hooks
+from akasa.state import (
+    load_config,
+    load_json_config,
+    save_json_config,
+    get_all_workspace_ids,
+    get_tenant_control_dir,
+    get_daemon_host_config_path,
+)
 
 auth_bp = Blueprint('auth', __name__)
 def _resolve_global_key_path(control_dir_name: str) -> Path:
@@ -31,7 +31,7 @@ def _resolve_global_key_path(control_dir_name: str) -> Path:
     override = os.environ.get("AKASA_MASTER_KEY_PATH")
     if override:
         return Path(override)
-    if os.environ.get("PYTEST_CURRENT_TEST") or getattr(_akasa_utils, "_in_test_sandbox", False):
+    if os.environ.get("PYTEST_CURRENT_TEST") or getattr(_akasa_context, "_in_test_sandbox", False):
         return Path(get_daemon_cwd()).joinpath(control_dir_name, "master_key.txt")
     return Path.home().joinpath(control_dir_name, "master_key.txt")
 def get_master_key():
@@ -158,22 +158,12 @@ def rotate_master_key(new_key_str: str) -> bool:
     target_path = local_key_path if local_key_path.exists() else global_key_path
     atomic_write_bytes(target_path.as_posix(), clean_key.encode('utf-8'), mode=0o600)
     return True
+security_bp = None
 
 
-security_bp = AkasaExtension(
-    'security', __name__, title="Security & Encryption", 
-    description="Local encryption key management.",
-    core=True,
-    settings_schema=lambda ws: [{
-        "id": "master_fernet_key",
-        "label": "Master Encryption Key (Fernet)",
-        "type": "text",
-        "scope": "daemon",
-        "secure": False,
-        "default": get_master_key().decode('utf-8'),
-        "description": "This global key encrypts your secrets.json. It is stored securely in your user home directory. If you move this workspace to another machine, you must copy this key to the new machine."
-    }]
-)
+def get_security_blueprint():
+    """Returns the core security AkasaExtension blueprint bound by Ring 4 extension initialization."""
+    return security_bp
 @hooks.on('security_settings_updated')
 def _on_security_settings_updated(workspace_id=None, **kwargs):
     sys_path = get_daemon_host_config_path()

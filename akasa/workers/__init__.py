@@ -10,9 +10,12 @@ import threading
 import typing
 from typing import TypedDict, List, Dict, Any, Optional, Literal, Union
 from concurrent.futures import ThreadPoolExecutor
-from akasa.db import get_connection, apply_declarative_schema, evict_cached_connection, close_thread_connections, _REGISTERED_SCHEMAS
+from akasa.context import execution_frame, sniff_tenant_id, reclaim_process_memory
+from akasa.events import sse_bus
 from akasa.hooks import hooks
-from akasa.utils import get_workspace_physics, sniff_tenant_id, get_all_workspace_ids, is_extension_enabled, reclaim_process_memory
+from akasa.db import get_connection, apply_declarative_schema, evict_cached_connection, close_thread_connections, _REGISTERED_SCHEMAS
+from akasa.vfs import execute_vfs_delete
+from akasa.state import get_workspace_physics, get_all_workspace_ids, is_extension_enabled
 
 class ChainStepSchema(TypedDict, total=False):
     id: str
@@ -603,14 +606,10 @@ def update_immediate_job_status(job_id, status, message=None, artifact=None, wor
         job_category = 'system_background'
 
     conn.commit()
-
     try:
-        from akasa.events import sse_bus as _sse_bus
-        from akasa.sync import get_active_pipeline_modules as _get_active_pipeline_modules
+        pipeline_state = get_active_pipeline_modules(workspace_id=workspace_id)
 
-        pipeline_state = _get_active_pipeline_modules(workspace_id=workspace_id)
-
-        _sse_bus.emit_sse('job_progress', {
+        sse_bus.emit_sse('job_progress', {
             "id": job_id,
             "job_id": job_id,
             "ext_name": ext_name,
@@ -659,7 +658,8 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
             if 'job_id' in sig.parameters:
                 kwargs['job_id'] = job_id
 
-            result = func(**kwargs)
+            with execution_frame(workspace_id=target_ws, transport="WORKER", job_id=job_id):
+                result = func(**kwargs)
             if isinstance(result, str):
                 step_msg = result
             elif isinstance(result, dict):
@@ -844,9 +844,8 @@ def sweep_ephemeral_artifacts(workspace_id="default"):
     cursor = conn.execute("SELECT id, filepath FROM ephemeral_artifacts WHERE expires_at < ?", (now,))
     for row in cursor.fetchall():
         try:
-            from akasa.vfs import execute_vfs_delete as _execute_vfs_delete
             if os.path.exists(row['filepath']):
-                _execute_vfs_delete(workspace_id, row['filepath'])
+                execute_vfs_delete(workspace_id, row['filepath'])
             conn.execute("DELETE FROM ephemeral_artifacts WHERE id=?", (row['id'],))
         except Exception as e:
             print(f"⚠️ Failed to garbage collect ephemeral artifact {row['filepath']}: {e}")
@@ -900,7 +899,8 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
                 kwargs['workspace_id'] = target_ws
             if 'job_id' in sig.parameters and 'job_id' not in kwargs:
                 kwargs['job_id'] = job_id
-            func(**kwargs)
+            with execution_frame(workspace_id=target_ws, transport="WORKER", job_id=job_id):
+                func(**kwargs)
         except Exception as e:
             print(f"❌ [Worker] Job {job_id} failed on workspace context [{target_ws}]: {e}")
             try:
@@ -982,6 +982,63 @@ def _metronome_loop():
 
 _INITIALIZED_WORKSPACES = set()
 _SCHEMA_INIT_LOCK = threading.Lock()
+def get_active_pipeline_modules(workspace_id=None) -> Dict[str, Any]:
+    """
+    Fast, single-query helper returning active_modules, pending_modules, and is_pipeline_active
+    without scanning vfs_event_log or firing manifest signature hooks.
+    """
+    wid = workspace_id or sniff_tenant_id() or "default"
+    now = time.time()
+    conn = get_connection("workers", workspace_id=wid)
+    cutoff_ts = now - 300.0
+    active_job_rows = conn.execute(
+        "SELECT ext_name, callback_name, args_json FROM immediate_jobs WHERE status IN ('pending', 'processing') AND job_category = 'ui_blocking' AND updated_at > ?",
+        (cutoff_ts,)
+    ).fetchall()
+
+    active_modules_set = set()
+    pending_modules_set = set()
+    is_pipeline_active = False
+    for r in active_job_rows:
+        ext_name = r['ext_name']
+        if ext_name:
+            active_modules_set.add(ext_name)
+        try:
+            args = json.loads(r['args_json'] or "{}")
+            if '_chain' in args or 'chain_history' in args or args.get('is_pipeline'):
+                is_pipeline_active = True
+            for step in args.get('_chain', {}).get('steps', []):
+                if step.get('ext_name'):
+                    pending_modules_set.add(step['ext_name'])
+            dag_root = args.get('_dag_root_id')
+            if dag_root:
+                is_pipeline_active = True
+                with _dag_lock:
+                    coord = _dag_coordinators.get(dag_root)
+                    if coord:
+                        for pid in coord.get("pending", set()):
+                            p_ext = coord["step_map"].get(pid, {}).get("ext_name")
+                            if p_ext:
+                                pending_modules_set.add(p_ext)
+        except Exception:
+            pass
+
+    active_modules = list(active_modules_set)
+    pending_modules = [m for m in pending_modules_set if m not in active_modules_set]
+    return {
+        "is_pipeline_active": is_pipeline_active,
+        "active_modules": active_modules,
+        "pending_modules": pending_modules
+    }
+
+
+def reset() -> None:
+    """Clears initialized workspace schema watermarks and active DAG state for isolated test harnesses."""
+    with _SCHEMA_INIT_LOCK:
+        _INITIALIZED_WORKSPACES.clear()
+    with _dag_lock:
+        _dag_coordinators.clear()
+
 
 @hooks.on('workspace_shutdown')
 def _evict_initialized_workspace(workspace_id=None, **kwargs):

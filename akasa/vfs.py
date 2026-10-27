@@ -10,11 +10,25 @@ import traceback
 import threading
 from collections import OrderedDict
 from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Any
+from typing import Optional, Dict, List, Tuple, Any, Callable
+from akasa.context import parse_uri, is_subpath, atomic_write_text
 from akasa.hooks import hooks
-from akasa.db import get_connection
+from akasa.db import (
+    get_connection,
+    _get_tenant_control_dir as get_tenant_control_dir,
+    _get_all_workspace_ids as get_all_workspace_ids,
+)
 from akasa.uri import AkasaURI
-from akasa.utils import resolve_system_artifact_path, parse_uri, get_tenant_control_dir, get_all_workspace_ids, is_subpath, atomic_write_text
+
+_ARTIFACT_PATH_RESOLVER: Optional[Callable[[str, Optional[str]], str]] = None
+
+
+def set_vfs_artifact_path_resolver(resolver_fn: Callable[[str, Optional[str]], str]) -> None:
+    """DI Interface: Ring 2 state module binds resolve_system_artifact_path so vfs.py has zero upward dependencies."""
+    global _ARTIFACT_PATH_RESOLVER
+    _ARTIFACT_PATH_RESOLVER = resolver_fn
+
+
 _VFS_READ_CACHE = OrderedDict()
 _VFS_READ_CACHE_BYTES = 0
 _VFS_READ_CACHE_MAX_BYTES = 8 * 1024 * 1024  # 8 MB RAM cache
@@ -58,8 +72,6 @@ def _clear_pending_write(resolved_path: Optional[str], seq: Optional[int] = None
             for k, val in list(_VFS_PENDING_WRITES.items()):
                 if k.startswith(dir_prefix) and val[0] <= seq:
                     _VFS_PENDING_WRITES.pop(k, None)
-
-
 def has_pending_vfs_write(resolved_path: Optional[str]) -> bool:
     """Returns True if resolved_path currently has an un-flushed write in _VFS_PENDING_WRITES."""
     if not resolved_path:
@@ -67,6 +79,60 @@ def has_pending_vfs_write(resolved_path: Optional[str]) -> bool:
     norm_res = Path(resolved_path).as_posix()
     with _VFS_CACHE_LOCK:
         return norm_res in _VFS_PENDING_WRITES
+def read_cached_physical_text(resolved_path: str, bypass_read_cache: bool = False) -> Tuple[Optional[int], Optional[str]]:
+    """
+    Unified Ring 2 Read-Your-Writes primitive:
+    Inspects _VFS_PENDING_WRITES first (returning (-seq, content)), then _VFS_READ_CACHE
+    (verifying st_mtime_ns and st_size), and finally falls back to reading physical disk.
+    Returns (revision_token, text) or (None, None) if missing/deleted.
+    """
+    if not resolved_path:
+        return None, None
+    norm_res = Path(resolved_path).as_posix()
+    with _VFS_CACHE_LOCK:
+        pending = _VFS_PENDING_WRITES.get(norm_res)
+        if pending is not None:
+            if pending[1] is _VFS_TOMBSTONE:
+                return None, None
+            return -int(pending[0]), str(pending[1])
+
+    try:
+        st = os.stat(norm_res)
+    except OSError:
+        with _VFS_CACHE_LOCK:
+            if norm_res in _VFS_PENDING_WRITES:
+                p_retry = _VFS_PENDING_WRITES[norm_res]
+                if p_retry[1] is not _VFS_TOMBSTONE:
+                    return -int(p_retry[0]), str(p_retry[1])
+        return None, None
+
+    if stat.S_ISDIR(st.st_mode):
+        return None, None
+
+    if not bypass_read_cache:
+        cached = _cache_get(norm_res, st=st)
+        if cached is not None:
+            return int(st.st_mtime_ns), cached
+
+    try:
+        with open(norm_res, 'r', encoding='utf-8') as f:
+            text = f.read()
+        _cache_put(norm_res, text, st=st)
+        return int(st.st_mtime_ns), text
+    except (UnicodeDecodeError, OSError):
+        return None, None
+
+
+def reset() -> None:
+    """Purges VFS read cache, pending write overlay, and ancestor ring buffer for isolated test harnesses."""
+    global _VFS_READ_CACHE_BYTES
+    with _VFS_CACHE_LOCK:
+        _VFS_READ_CACHE.clear()
+        _VFS_READ_CACHE_BYTES = 0
+        _VFS_PENDING_WRITES.clear()
+    with _ANCESTOR_LOCK:
+        _ANCESTOR_CACHE.clear()
+
 
 _ANCESTOR_CACHE: Dict[str, "OrderedDict[str, str]"] = OrderedDict()
 _ANCESTOR_LOCK = threading.Lock()
@@ -445,9 +511,10 @@ def mount_volume(workspace_id, scheme, volume, physical_target):
 def _resolve_physical_path(filepath, workspace_id, is_absolute_artifact=False):
     """Centralized SSOT for VFS path resolution via the Volume Router."""
     if not filepath: return None
-
     if is_absolute_artifact and Path(filepath).is_absolute():
-        return resolve_system_artifact_path(filepath, workspace_id)
+        if _ARTIFACT_PATH_RESOLVER is not None:
+            return _ARTIFACT_PATH_RESOLVER(filepath, workspace_id)
+        return Path(filepath).resolve().as_posix()
 
     vol, rel = parse_uri(filepath)
     if vol and "://" not in str(filepath):
@@ -929,33 +996,8 @@ class VFSTransaction:
         resolved = _resolve_physical_path(filepath, self.workspace_id, is_absolute_artifact)
         if not resolved:
             return None
-
-        norm_res = Path(resolved).as_posix()
-        with _VFS_CACHE_LOCK:
-            pending = _VFS_PENDING_WRITES.get(norm_res)
-            if pending is not None:
-                if pending[1] is _VFS_TOMBSTONE:
-                    return None
-                return pending[1]
-
-        try:
-            st = os.stat(resolved)
-        except OSError:
-            return None
-
-        if stat.S_ISDIR(st.st_mode):
-            return None
-
-        cached = _cache_get(resolved, st=st)
-        if cached is not None:
-            return cached
-        try:
-            with open(resolved, 'r', encoding='utf-8') as f:
-                text = f.read()
-            _cache_put(resolved, text, st=st)
-            return text
-        except (UnicodeDecodeError, OSError):
-            return None
+        _, text = read_cached_physical_text(resolved)
+        return text
 
     def __enter__(self):
         self._in_transaction = True

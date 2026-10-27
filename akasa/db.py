@@ -4,13 +4,43 @@ import time
 import shutil
 import sqlite3
 import threading
-from akasa.utils import get_workspace_physics, get_all_workspace_ids, get_tenant_control_dir, sniff_tenant_id
+from typing import Callable, Optional, Tuple, List
+from akasa.context import sniff_tenant_id
 from akasa.hooks import hooks
 
 # Thread-local storage guarantees safe connection pooling across the ASGI / Worker matrix
 _local = threading.local()
 
 _REGISTERED_SCHEMAS = {}
+_PHYSICS_RESOLVER: Optional[Callable[[Optional[str]], Tuple[str, str]]] = None
+_ALL_WORKSPACES_RESOLVER: Optional[Callable[[], List[str]]] = None
+
+
+def set_db_physics_resolvers(
+    physics_fn: Callable[[Optional[str]], Tuple[str, str]],
+    all_workspaces_fn: Callable[[], List[str]],
+) -> None:
+    """DI Interface: Ring 2 state module binds workspace physics resolvers so db.py has zero upward dependencies."""
+    global _PHYSICS_RESOLVER, _ALL_WORKSPACES_RESOLVER
+    _PHYSICS_RESOLVER = physics_fn
+    _ALL_WORKSPACES_RESOLVER = all_workspaces_fn
+
+
+def _get_workspace_physics(workspace_id: Optional[str] = None) -> Tuple[str, str]:
+    if _PHYSICS_RESOLVER is not None:
+        return _PHYSICS_RESOLVER(workspace_id)
+    raise RuntimeError("Database physics resolver not initialized.")
+
+
+def _get_tenant_control_dir(workspace_id: Optional[str] = None) -> str:
+    cfg_path, _ = _get_workspace_physics(workspace_id)
+    return Path(cfg_path).parent.as_posix()
+
+
+def _get_all_workspace_ids() -> List[str]:
+    if _ALL_WORKSPACES_RESOLVER is not None:
+        return _ALL_WORKSPACES_RESOLVER()
+    return ["default"]
 
 def register_schema(ext_name, schema_dict):
     """Registers a declarative SQLite schema for automatic workspace migration."""
@@ -77,11 +107,9 @@ def provision_workspace_schemas(workspace_id: str) -> None:
     """Applies all registered declarative SQLite schemas for a specific tenant workspace."""
     for ext_name, schema in _REGISTERED_SCHEMAS.items():
         apply_declarative_schema(ext_name, schema, workspace_id)
-
-
 def recover_corrupt_databases(workspace_id: str) -> None:
     """Self-healing recovery routine: salvages rows from *.db.corrupt_* dumps inside the workspace's cache/db directory."""
-    base_dir = Path(get_tenant_control_dir(workspace_id))
+    base_dir = Path(_get_tenant_control_dir(workspace_id))
     cache_db_dir = base_dir.joinpath("cache", "db")
     if not cache_db_dir.exists() or not cache_db_dir.is_dir():
         return
@@ -118,11 +146,9 @@ def recover_corrupt_databases(workspace_id: str) -> None:
                         pass
             except Exception as e:
                 print(f"⚠️ [DB Recovery] Could not recover from {item}: {e}")
-
-
 def migrate_legacy_sqlite_paths(workspace_id: str, db_name: str, table: str, column: str, old_sub: str, new_sub: str) -> None:
     """Updates legacy substring paths inside a specific workspace SQLite table column if the database exists."""
-    base_dir = Path(get_tenant_control_dir(workspace_id))
+    base_dir = Path(_get_tenant_control_dir(workspace_id))
     db_file = base_dir.joinpath("cache", "db", f"{db_name}.db")
     if not db_file.exists():
         return
@@ -136,12 +162,10 @@ def migrate_legacy_sqlite_paths(workspace_id: str, db_name: str, table: str, col
         conn.close()
     except Exception:
         pass
-
-
 @hooks.on('system_boot', priority=90)
 def init_declarative_schemas(**kwargs):
     """Automatically provisions schemas and boots workspaces across all tenants."""
-    for ws_id in get_all_workspace_ids():
+    for ws_id in _get_all_workspace_ids():
         provision_workspace_schemas(ws_id)
         hooks.emit('workspace_boot', workspace_id=ws_id)
 @hooks.on('workspace_shutdown')
@@ -168,7 +192,6 @@ def evict_cached_connection(workspace_id, db_name):
         except Exception:
             pass
         del ws_dict[db_name]
-
 def close_thread_connections():
     """Closes and purges all cached SQLite connections on the calling thread to prevent FD leaks in per-request WSGI threads."""
     if not hasattr(_local, 'connections'):
@@ -182,6 +205,15 @@ def close_thread_connections():
                     conn.close()
                 except Exception:
                     pass
+
+
+hooks.set_thread_cleanup(close_thread_connections)
+
+
+def reset() -> None:
+    """Closes pooled thread-local SQLite connections for isolated test harnesses."""
+    close_thread_connections()
+
 
 def get_connection(db_name, workspace_id=None):
     """
@@ -223,7 +255,7 @@ def get_connection(db_name, workspace_id=None):
                         pass
         _local.connections[workspace_id] = {}
 
-    cfg_path, _ = get_workspace_physics(workspace_id)
+    cfg_path, _ = _get_workspace_physics(workspace_id)
     db_dir = Path(cfg_path).parent.joinpath("cache", "db")
     db_path = db_dir.joinpath(f"{db_name}.db").as_posix()
     os.makedirs(db_dir, exist_ok=True)

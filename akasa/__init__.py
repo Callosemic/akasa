@@ -2,27 +2,60 @@ import os
 import hmac
 import queue
 import threading
-from typing import Optional, Iterable, Tuple
-from flask import Flask, request, jsonify, Response
-from akasa.hooks import hooks
-import akasa.utils as _akasa_utils
-from akasa.utils import (
-    register_core_module,
+from typing import Optional, Iterable, Tuple, Callable
+from flask import Flask, request, jsonify, Response, has_request_context
+import akasa.context as _akasa_context
+from akasa.context import (
+    set_daemon_cwd,
+    set_tenant_resolver,
     register_trusted_host_suffix,
     get_trusted_host_suffixes,
 )
+from akasa.events import sse_bus
+from akasa.hooks import hooks
+import akasa.db as _akasa_db
+from akasa.db import close_thread_connections
+import akasa.vfs as _akasa_vfs
+import akasa.state as _akasa_state
+from akasa.state import register_core_module
+import akasa.workers as _akasa_workers
+import akasa.extension as _akasa_extension
+from akasa.auth import auth_bp, get_security_blueprint, BOOT_TOKEN
+
+_ = _akasa_extension
+
+try:
+    import resource as _resource
+except ImportError:
+    _resource = None
+
+
+def _flask_http_tenant_resolver() -> Optional[str]:
+    """Default Ring 4 HTTP transport tenant resolver reading X-Workspace-ID from active Flask requests."""
+    try:
+        if has_request_context() and request:
+            if "X-Workspace-ID" in request.headers:
+                return request.headers["X-Workspace-ID"]
+            if request.view_args and "workspace_id" in request.view_args:
+                return str(request.view_args["workspace_id"])
+    except Exception:
+        pass
+    return None
+
+
+set_tenant_resolver(_flask_http_tenant_resolver)
 
 
 def tune_process_resources() -> None:
     """Tier 1 OS Resource Governance: Raises file descriptor limits, bounds glibc arenas, and caps thread stack size."""
-    try:
-        import resource as _resource
-        soft_lim, hard_lim = _resource.getrlimit(_resource.RLIMIT_NOFILE)
-        target_lim = min(hard_lim, 65536) if hard_lim > 0 else 65536
-        if soft_lim < target_lim:
-            _resource.setrlimit(_resource.RLIMIT_NOFILE, (target_lim, hard_lim))
-    except Exception:
-        pass
+    if _resource is not None:
+        try:
+            soft_lim, hard_lim = _resource.getrlimit(_resource.RLIMIT_NOFILE)
+            target_lim = min(hard_lim, 65536) if hard_lim > 0 else 65536
+            if soft_lim < target_lim:
+                _resource.setrlimit(_resource.RLIMIT_NOFILE, (target_lim, hard_lim))
+        except Exception:
+            pass
 
     os.environ.setdefault("MALLOC_ARENA_MAX", "2")
     try:
@@ -44,8 +77,6 @@ class ForceHTTPSProxyFix:
         ):
             environ["wsgi.url_scheme"] = "https"
         return self.app(environ, start_response)
-
-
 def configure(
     control_dir: str = ".akasa",
     trusted_namespaces: Optional[Iterable[str]] = None,
@@ -54,6 +85,7 @@ def configure(
     sse_passthrough: Optional[Iterable[str]] = None,
     trusted_host_suffixes: Tuple[str, ...] = (),
     tune_os_resources: bool = True,
+    tenant_resolver: Optional[Callable[[], Optional[str]]] = None,
 ) -> None:
     """Phase A: Headless-safe process & HookRegistry physics configuration."""
     if tune_os_resources:
@@ -61,6 +93,9 @@ def configure(
 
     if control_dir:
         os.environ["AKASA_CONTROL_DIR"] = control_dir
+
+    if tenant_resolver is not None:
+        set_tenant_resolver(tenant_resolver)
 
     for ns in (trusted_namespaces or ()):
         hooks.register_trusted_namespace(ns)
@@ -89,20 +124,13 @@ def init_app(
     disable_browser_cache: bool = True,
 ) -> Flask:
     """Phase B: Wires Flask transport, authentication gate, DB connection teardown, and optional SSE stream."""
-    from akasa.auth import auth_bp as _auth_bp, security_bp as _security_bp, BOOT_TOKEN as _BOOT_TOKEN
-    from akasa.db import close_thread_connections as _close_thread_connections
-    from akasa.events import sse_bus as _sse_bus
-    import akasa.workers as _akasa_workers  # Ensure metronome hooks are registered
-
-    _ = _akasa_workers
-
     if enable_proxy_fix:
         app.wsgi_app = ForceHTTPSProxyFix(app.wsgi_app)
 
     if "auth" not in app.blueprints:
-        app.register_blueprint(_auth_bp)
+        app.register_blueprint(auth_bp)
     if "security" not in app.blueprints:
-        app.register_blueprint(_security_bp.bp)
+        app.register_blueprint(get_security_blueprint().bp)
 
     allowed_routes = {"/auth/bootstrap"}
     if public_routes:
@@ -112,7 +140,7 @@ def init_app(
 
     @app.teardown_appcontext
     def _akasa_cleanup_request_db_connections(exception=None):
-        _close_thread_connections()
+        close_thread_connections()
 
     if disable_browser_cache:
         @app.after_request
@@ -121,6 +149,7 @@ def init_app(
             response.headers["Pragma"] = "no-cache"
             response.headers["Expires"] = "0"
             return response
+
     @app.before_request
     def _akasa_enforce_token_gate():
         req_route = request.path
@@ -135,7 +164,7 @@ def init_app(
             or request.headers.get("X-Akasa-Token")
             or request.args.get("token")
         )
-        if not client_token or not hmac.compare_digest(str(client_token), str(_BOOT_TOKEN)):
+        if not client_token or not hmac.compare_digest(str(client_token), str(BOOT_TOKEN)):
             return jsonify({"error": "401 Unauthorized: Invalid or missing execution credentials."}), 401
         return None
 
@@ -143,7 +172,7 @@ def init_app(
         @app.route(sse_route, methods=["GET"])
         def _akasa_sse_stream():
             def event_stream():
-                q = _sse_bus.subscribe()
+                q = sse_bus.subscribe()
                 try:
                     yield 'event: connected\ndata: {"status": "ok"}\n\n'
                     while True:
@@ -153,7 +182,7 @@ def init_app(
                         except queue.Empty:
                             yield ": heartbeat\n\n"
                 finally:
-                    _sse_bus.unsubscribe(q)
+                    sse_bus.unsubscribe(q)
 
             return Response(
                 event_stream(),
@@ -162,16 +191,8 @@ def init_app(
             )
 
     return app
-
-
 def boot(skip_if_reloader_parent: bool = False) -> None:
     """Ignites the Akasa kernel lifecycle (DB migrations, VFS write pipeline, and Worker Metronome)."""
-    import akasa.db as _akasa_db
-    import akasa.vfs as _akasa_vfs
-    import akasa.workers as _akasa_workers
-
-    _ = (_akasa_db, _akasa_vfs, _akasa_workers)
-
     is_werkzeug_worker = os.environ.get("WERKZEUG_RUN_MAIN") == "true"
     if skip_if_reloader_parent and not is_werkzeug_worker:
         return
@@ -180,30 +201,18 @@ def boot(skip_if_reloader_parent: bool = False) -> None:
         hooks.emit("system_boot")
     except Exception as e:
         print(f"Warning: system_boot failed: {e}")
-
-
 def reset_state(cwd: Optional[str] = None, control_dir: Optional[str] = None) -> None:
-    """First-class test harness reset: closes pooled DB handles, clears RAM caches, and optionally re-anchors cwd."""
-    from akasa.db import close_thread_connections as _close_thread_connections
-    import akasa.vfs as _akasa_vfs
-    import akasa.workers as _akasa_workers
-    _close_thread_connections()
-    hooks.clear_auth_cache()
-    _akasa_utils._JSON_CACHE.clear()
-    _akasa_utils._JSON_MTIME.clear()
-    _akasa_utils.load_config.clear_all()
-    with _akasa_vfs._VFS_CACHE_LOCK:
-        _akasa_vfs._VFS_READ_CACHE.clear()
-        _akasa_vfs._VFS_READ_CACHE_BYTES = 0
-        _akasa_vfs._VFS_PENDING_WRITES.clear()
+    """First-class test harness reset: delegates to each Ring subsystem's reset() contract."""
+    _akasa_context.reset()
+    set_tenant_resolver(_flask_http_tenant_resolver)
+    hooks.reset()
+    _akasa_db.reset()
+    _akasa_vfs.reset()
+    _akasa_state.reset()
+    _akasa_workers.reset()
 
-    with _akasa_vfs._ANCESTOR_LOCK:
-        _akasa_vfs._ANCESTOR_CACHE.clear()
-
-    with _akasa_workers._SCHEMA_INIT_LOCK:
-        _akasa_workers._INITIALIZED_WORKSPACES.clear()
     if cwd is not None:
-        _akasa_utils._in_test_sandbox = True
-        _akasa_utils.set_daemon_cwd(cwd)
+        _akasa_context._in_test_sandbox = True
+        set_daemon_cwd(cwd)
     if control_dir is not None:
         os.environ["AKASA_CONTROL_DIR"] = control_dir
