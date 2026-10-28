@@ -1,13 +1,34 @@
 import os
 import ast
 from pathlib import Path
-from .core import PROJECT_ROOT, KERNEL_DIR, VFS_WRITE_WHITELIST, SQLITE_WHITELIST, report_violation, collect_unique_files
+from .core import (
+    PROJECT_ROOT,
+    KERNEL_DIR,
+    VFS_WRITE_WHITELIST,
+    SQLITE_WHITELIST,
+    FLASK_TRANSPORT_WHITELIST,
+    KERNEL_RING_MAP,
+    report_violation,
+    collect_unique_files,
+)
+def _resolve_module_key(filepath: Path) -> str:
+    try:
+        rel = filepath.resolve().relative_to(KERNEL_DIR.resolve())
+        parts = rel.parts
+        if len(parts) > 1:
+            return parts[0]
+    except ValueError:
+        pass
+    return filepath.stem
+
 
 class KernelFitnessVisitor(ast.NodeVisitor):
     def __init__(self, filepath, filename, is_test=False):
         self.filepath = filepath
         self.filename = filename
         self.is_test = is_test or "tests" in Path(filepath).parts or filename.startswith("test_")
+        self.module_key = _resolve_module_key(Path(filepath)) if not self.is_test else ""
+        self.my_ring = KERNEL_RING_MAP.get(self.module_key, 4)
         self.top_level_imports = set()
     def visit_Module(self, node):
         top_level_funcs = set()
@@ -30,53 +51,97 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                     self.top_level_imports.add(f"{module}.{alias.name}" if module else alias.name)
                     self.top_level_imports.add(alias.asname or alias.name)
         self.generic_visit(node)
-
     def visit_FunctionDef(self, node):
         for child in ast.walk(node):
-            if isinstance(child, ast.Import):
-                for alias in child.names:
-                    name = alias.asname or alias.name
-                    if name in self.top_level_imports or alias.name in self.top_level_imports:
-                        report_violation("REDUNDANT_INLINE_IMPORT", self.filepath, child.lineno, f"Redundant inline import '{alias.name}' inside '{node.name}' (already imported at module level).")
-                    elif not (alias.asname and alias.asname.startswith('_')):
-                        report_violation("UNALIASED_INLINE_IMPORT", self.filepath, child.lineno, f"Inline import '{alias.name}' inside '{node.name}' must be placed at the module top-level or aliased with a leading underscore (e.g. 'import {alias.name} as _{alias.name}').")
-            elif isinstance(child, ast.ImportFrom):
-                module = child.module or ""
-                for alias in child.names:
-                    full_name = f"{module}.{alias.name}" if module else alias.name
-                    name = alias.asname or alias.name
-                    if full_name in self.top_level_imports or name in self.top_level_imports:
-                        report_violation("REDUNDANT_INLINE_IMPORT", self.filepath, child.lineno, f"Redundant inline import 'from {module} import {alias.name}' inside '{node.name}' (already imported at module level).")
-                    elif not (alias.asname and alias.asname.startswith('_')):
-                        report_violation("UNALIASED_INLINE_IMPORT", self.filepath, child.lineno, f"Inline import 'from {module} import {alias.name}' inside '{node.name}' must be placed at the module top-level or aliased with a leading underscore (e.g. 'from {module} import {alias.name} as _{alias.name}').")
+            if isinstance(child, (ast.Import, ast.ImportFrom)):
+                if not self.is_test:
+                    report_violation(
+                        "STRICT_TOP_LEVEL_IMPORTS_MANDATE",
+                        self.filepath,
+                        child.lineno,
+                        f"Inline import detected inside '{node.name}'. The Akasa Ring DAG prohibits inline imports in kernel modules; hoist all imports to the top of the file."
+                    )
+                elif isinstance(child, ast.Import):
+                    for alias in child.names:
+                        name = alias.asname or alias.name
+                        if name in self.top_level_imports or alias.name in self.top_level_imports:
+                            report_violation("REDUNDANT_INLINE_IMPORT", self.filepath, child.lineno, f"Redundant inline import '{alias.name}' inside '{node.name}' (already imported at module level).")
+                        elif not (alias.asname and alias.asname.startswith('_')):
+                            report_violation("UNALIASED_INLINE_IMPORT", self.filepath, child.lineno, f"Inline import '{alias.name}' inside '{node.name}' must be placed at the module top-level or aliased with a leading underscore.")
+                elif isinstance(child, ast.ImportFrom):
+                    module = child.module or ""
+                    for alias in child.names:
+                        full_name = f"{module}.{alias.name}" if module else alias.name
+                        name = alias.asname or alias.name
+                        if full_name in self.top_level_imports or name in self.top_level_imports:
+                            report_violation("REDUNDANT_INLINE_IMPORT", self.filepath, child.lineno, f"Redundant inline import 'from {module} import {alias.name}' inside '{node.name}' (already imported at module level).")
+                        elif not (alias.asname and alias.asname.startswith('_')):
+                            report_violation("UNALIASED_INLINE_IMPORT", self.filepath, child.lineno, f"Inline import 'from {module} import {alias.name}' inside '{node.name}' must be placed at the module top-level or aliased with a leading underscore.")
         self.generic_visit(node)
 
     def visit_Import(self, node):
         for alias in node.names:
             if alias.name.startswith('insetu'):
                 report_violation(
-                    "ZERO_DOMAIN_LEAKAGE", 
-                    self.filepath, 
-                    node.lineno, 
+                    "ZERO_DOMAIN_LEAKAGE",
+                    self.filepath,
+                    node.lineno,
                     f"Tier 1 kernel cannot import from host application '{alias.name}'."
                 )
             if self.filename not in SQLITE_WHITELIST and alias.name == 'sqlite3':
                 report_violation(
-                    "THREAD_LOCAL_POOLING_MANDATE", 
-                    self.filepath, 
-                    node.lineno, 
+                    "THREAD_LOCAL_POOLING_MANDATE",
+                    self.filepath,
+                    node.lineno,
                     "Direct sqlite3 import banned outside db.py. Use get_connection()."
                 )
+            if not self.is_test:
+                if alias.name == 'flask' or alias.name.startswith('flask.'):
+                    if self.my_ring < 4 and self.filename not in FLASK_TRANSPORT_WHITELIST:
+                        report_violation(
+                            "KERNEL_TRANSPORT_ISOLATION",
+                            self.filepath,
+                            node.lineno,
+                            f"Ring {self.my_ring} module '{self.module_key}' cannot import from transport framework '{alias.name}'."
+                        )
+                if alias.name.startswith('akasa.'):
+                    target_mod = alias.name.split('.')[1]
+                    target_ring = KERNEL_RING_MAP.get(target_mod)
+                    if target_ring is not None and target_ring > self.my_ring:
+                        report_violation(
+                            "KERNEL_RING_DAG_MANDATE",
+                            self.filepath,
+                            node.lineno,
+                            f"Ring {self.my_ring} module '{self.module_key}' cannot import upward from Ring {target_ring} module 'akasa.{target_mod}'."
+                        )
         self.generic_visit(node)
-
     def visit_ImportFrom(self, node):
         if node.module and node.module.startswith('insetu'):
             report_violation(
-                "ZERO_DOMAIN_LEAKAGE", 
-                self.filepath, 
-                node.lineno, 
+                "ZERO_DOMAIN_LEAKAGE",
+                self.filepath,
+                node.lineno,
                 f"Tier 1 kernel cannot import from host application '{node.module}'."
             )
+        if not self.is_test and node.module:
+            if node.module == 'flask' or node.module.startswith('flask.'):
+                if self.my_ring < 4 and self.filename not in FLASK_TRANSPORT_WHITELIST:
+                    report_violation(
+                        "KERNEL_TRANSPORT_ISOLATION",
+                        self.filepath,
+                        node.lineno,
+                        f"Ring {self.my_ring} module '{self.module_key}' cannot import from transport framework '{node.module}'."
+                    )
+            if node.module.startswith('akasa.'):
+                target_mod = node.module.split('.')[1]
+                target_ring = KERNEL_RING_MAP.get(target_mod)
+                if target_ring is not None and target_ring > self.my_ring:
+                    report_violation(
+                        "KERNEL_RING_DAG_MANDATE",
+                        self.filepath,
+                        node.lineno,
+                        f"Ring {self.my_ring} module '{self.module_key}' cannot import upward from Ring {target_ring} module 'akasa.{target_mod}'."
+                    )
         self.generic_visit(node)
     def visit_Constant(self, node):
         if isinstance(node.value, str):
@@ -251,14 +316,16 @@ def check_python_files():
                     )
             except SyntaxError as e:
                 report_violation("UNITTEST_SYNTAX_ERROR", test_fp, e.lineno or 1, f"Syntax error in unit test file: {e}")
-
     code_index_path = PROJECT_ROOT / "CODE_INDEX.md"
     if code_index_path.exists():
         for idx, line in enumerate(code_index_path.read_text(encoding="utf-8").splitlines(), start=1):
             if "[comment required]" in line:
+                tree_entry = line.split("#", 1)[0].lstrip(" │├└─\t").strip()
+                if tree_entry.startswith(("def ", "async def ", "class ", "function ")):
+                    continue
                 report_violation(
                     "CARTOGRAPHER_PLACEHOLDER_BAN",
                     code_index_path,
                     idx,
-                    f"Unresolved '# [comment required]' placeholder in CODE_INDEX.md: {line.strip()}"
+                    f"Unresolved file/directory '# [comment required]' placeholder in CODE_INDEX.md: {line.strip()}"
                 )

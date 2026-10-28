@@ -1,19 +1,30 @@
 import ast
+import contextlib
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import akasa
+import akasa.context as akasa_context
+import akasa.state as akasa_state
 import akasa.utils as akasa_utils
+from akasa.context import (
+    execution_frame,
+    get_current_frame,
+    sniff_tenant_id,
+    thread_safe_cache,
+)
 from akasa.db import get_connection
 from akasa.extension import AkasaExtension
 from akasa.hooks import hooks
 from akasa.process import execute_binary
+from akasa.state import load_json_config, save_json_config
 from akasa.uri import AkasaURI
-from akasa.utils import thread_safe_cache
 from akasa.vfs import (
     DefaultVFSDriver,
     execute_vfs_save,
@@ -22,8 +33,8 @@ from akasa.vfs import (
     sync_vfs_barrier,
 )
 from akasa.workers import _init_worker_schema
-from tests.fitness.core import FitnessState
-from tests.fitness.rules_python import KernelFitnessVisitor
+from tests.fitness.core import FitnessState, KERNEL_DIR
+from tests.fitness.rules_python import KernelFitnessVisitor, check_python_files
 
 
 class TestAkasaKernelHardening(unittest.TestCase):
@@ -237,6 +248,132 @@ class TestAkasaKernelHardening(unittest.TestCase):
             init_violations,
             "KernelFitnessVisitor must record a violation for duplicate top-level function definitions."
         )
+
+    def test_json_config_pending_write_read_your_writes_and_locking(self):
+        """save_json_config guarantees immediate Read-Your-Writes in load_json_config even before physical disk flush."""
+        new_cfg_path = (self.control_dir / "brand_new.settings.json").as_posix()
+        self.assertFalse(os.path.exists(new_cfg_path))
+
+        payload = {"feature_flag": True, "nested": {"count": 42}}
+        akasa_utils.save_json_config(new_cfg_path, payload, workspace_id=self.workspace_id)
+
+        # Immediately read back BEFORE sync_vfs_barrier flushes to disk
+        immediate_read = akasa_utils.load_json_config(new_cfg_path, {})
+        self.assertEqual(immediate_read, payload, "load_json_config must return staged pending JSON even before disk creation")
+
+        # Mutate returned dict and verify internal cache is not corrupted
+        immediate_read["feature_flag"] = False
+        second_read = akasa_utils.load_json_config(new_cfg_path, {})
+        self.assertTrue(second_read["feature_flag"], "Caller mutation must not corrupt cached JSON state")
+
+        sync_vfs_barrier(self.workspace_id)
+        self.assertTrue(os.path.exists(new_cfg_path))
+        post_flush_read = akasa_utils.load_json_config(new_cfg_path, {})
+        self.assertEqual(post_flush_read, payload)
+    def test_injectable_tenant_resolver_decoupling(self):
+        """akasa.configure(tenant_resolver=...) and execution_frame route sniff_tenant_id and HookRegistry emissions without Flask."""
+        with execution_frame(workspace_id="frame_scoped_tenant", transport="CLI"):
+            self.assertEqual(sniff_tenant_id(), "frame_scoped_tenant")
+            self.assertEqual(get_current_frame().transport, "CLI")
+
+        akasa.configure(tenant_resolver=lambda: "custom_headless_tenant")
+        self.assertEqual(sniff_tenant_id(), "custom_headless_tenant")
+
+        # Explicit execution_frame must take precedence over ambient tenant_resolver, and restore on exit
+        with execution_frame(workspace_id="explicit_inner_tenant", transport="IPC"):
+            self.assertEqual(sniff_tenant_id(), "explicit_inner_tenant")
+            with execution_frame(workspace_id="deep_nested_tenant", transport="WORKER"):
+                self.assertEqual(sniff_tenant_id(), "deep_nested_tenant")
+            self.assertEqual(sniff_tenant_id(), "explicit_inner_tenant")
+        self.assertEqual(sniff_tenant_id(), "custom_headless_tenant")
+
+        captured_tenants = []
+
+        @hooks.on("headless_tenant_probe")
+        def _probe_listener(workspace_id=None, **kwargs):
+            captured_tenants.append(workspace_id)
+            return workspace_id
+
+        res = hooks.emit_first("headless_tenant_probe")
+        self.assertEqual(res, "custom_headless_tenant")
+        self.assertEqual(captured_tenants, ["custom_headless_tenant"])
+
+    def test_ring2_parsed_json_cache_avoids_redundant_json_loads(self):
+        """load_json_config caches parsed objects keyed by VFS causal revision token and avoids redundant json.loads calls on cache hits."""
+        cfg_file = (self.control_dir / "config.json").as_posix()
+
+        # Verify utils facade re-exports Ring 0 and Ring 2 primitives identically
+        self.assertIs(akasa_utils.load_json_config, load_json_config)
+        self.assertIs(akasa_utils.save_json_config, save_json_config)
+        self.assertIs(akasa_utils.execution_frame, execution_frame)
+
+        # First read populates the parsed cache
+        first = load_json_config(cfg_file, {})
+        self.assertIn("workspace_root", first)
+
+        # Subsequent reads of unchanged file must hit _JSON_PARSED_CACHE without calling json.loads
+        with patch("akasa.state.json.loads", wraps=json.loads) as spy_loads:
+            for _ in range(10):
+                cached = load_json_config(cfg_file, {})
+                self.assertEqual(cached["extensions"], ["enabled_ext"])
+            self.assertEqual(spy_loads.call_count, 0, "Cache hit must return cloned parsed object without calling json.loads")
+
+    def test_job_manager_write_scratch_registers_ephemeral_artifact(self):
+        """ctx.jobs.write_scratch writes scratch content to the extension scratch cache and registers it in ephemeral_artifacts."""
+        ext_bp = AkasaExtension("enabled_ext", __name__, core=False)
+        ctx = ext_bp.get_context(self.workspace_id)
+        scratch_path = ctx.jobs.write_scratch("node_output.txt", "oversized scratch payload", ttl_seconds=1800)
+
+        self.assertTrue(os.path.exists(scratch_path))
+        self.assertEqual(Path(scratch_path).read_text(encoding="utf-8"), "oversized scratch payload")
+        self.assertIn(scratch_path, ctx.jobs.get_ephemerals())
+
+    def test_fitness_rules_enforce_ring_dag_and_transport_isolation(self):
+        """KernelFitnessVisitor enforces zero violations on the live kernel and catches upward Ring imports, Flask leaks, and inline imports."""
+        prev = FitnessState.violations_found
+        FitnessState.violations_found = 0
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                check_python_files()
+            self.assertEqual(
+                FitnessState.violations_found,
+                0,
+                f"Live Akasa kernel had fitness violations:\n{buf.getvalue()}",
+            )
+
+            # 1. Ring 0 (context.py) importing upward from Ring 2 (vfs) and Ring 4 (extension)
+            bad_ring0_code = (
+                "import akasa.extension\n"
+                "from akasa.vfs import execute_vfs_save\n"
+            )
+            ring0_path = KERNEL_DIR / "context.py"
+            ring0_tree = ast.parse(bad_ring0_code, filename=str(ring0_path))
+            buf_ring0 = io.StringIO()
+            with contextlib.redirect_stdout(buf_ring0):
+                KernelFitnessVisitor(ring0_path, "context.py", is_test=False).visit(ring0_tree)
+            out_ring0 = buf_ring0.getvalue()
+            self.assertIn("KERNEL_RING_DAG_MANDATE", out_ring0)
+            self.assertIn("Ring 0 module 'context' cannot import upward from Ring 4 module 'akasa.extension'", out_ring0)
+            self.assertIn("Ring 0 module 'context' cannot import upward from Ring 2 module 'akasa.vfs'", out_ring0)
+
+            # 2. Ring 2 (state.py) importing Flask transport or using an inline import
+            bad_ring2_code = (
+                "from flask import request\n"
+                "def bad_helper():\n"
+                "    import json as _json\n"
+                "    return _json\n"
+            )
+            ring2_path = KERNEL_DIR / "state.py"
+            ring2_tree = ast.parse(bad_ring2_code, filename=str(ring2_path))
+            buf_ring2 = io.StringIO()
+            with contextlib.redirect_stdout(buf_ring2):
+                KernelFitnessVisitor(ring2_path, "state.py", is_test=False).visit(ring2_tree)
+            out_ring2 = buf_ring2.getvalue()
+            self.assertIn("KERNEL_TRANSPORT_ISOLATION", out_ring2)
+            self.assertIn("STRICT_TOP_LEVEL_IMPORTS_MANDATE", out_ring2)
+        finally:
+            FitnessState.violations_found = prev
 
 
 if __name__ == "__main__":

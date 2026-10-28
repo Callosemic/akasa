@@ -4,8 +4,26 @@ from pathlib import Path
 # --- CONFIGURATION ---
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 KERNEL_DIR = PROJECT_ROOT / "akasa"
-VFS_WRITE_WHITELIST = ["vfs.py", "db.py", "utils.py", "__init__.py"]
+VFS_WRITE_WHITELIST = ["vfs.py", "db.py", "state.py", "context.py", "utils.py", "__init__.py"]
 SQLITE_WHITELIST = ["db.py"]
+FLASK_TRANSPORT_WHITELIST = ["__init__.py", "extension.py"]
+
+KERNEL_RING_MAP = {
+    "types": 0,
+    "uri": 0,
+    "context": 0,
+    "events": 1,
+    "hooks": 1,
+    "db": 2,
+    "vfs": 2,
+    "state": 2,
+    "utils": 2,
+    "process": 3,
+    "workers": 3,
+    "sync": 3,
+    "auth": 4,
+    "extension": 4,
+}
 
 class FitnessState:
     violations_found = 0
