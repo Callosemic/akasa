@@ -40,6 +40,11 @@ Because Akasa adheres to the **Blind Substrate Mandate**, the host application i
 * **`hooks.register_sse_passthrough(*event_names: str)`**: Registers high-priority Event Bus hook names (e.g., `'topology_resolved'`) that `hooks.emit()` should automatically serialize and broadcast over `sse_bus`.
 * **`hooks.set_workspace_router(router_fn: Callable)`**: Injects a spatial routing function `router_fn(event_name: str, **kwargs) -> Iterable[str]` that maps physical paths or global events to owning `workspace_id`s.
 * **`register_core_module(ext_name: str)` (`akasa.utils`)**: Declares a module identifier as a foundational core module so `is_extension_enabled(ext_name)` always returns `True`.
+* **`set_tenant_resolver(resolver_fn: Callable[[], Optional[str]])` (`akasa.context`)**: DI Interface registering a transport-agnostic callable to resolve the active tenant ID without Flask request coupling.
+* **`hooks.set_hook_authorizer(authorizer_fn: Callable)` (`akasa.hooks`)**: Injects Ring 2 tenant extension enablement evaluation into Ring 1 HookRegistry without upward imports.
+* **`hooks.set_thread_cleanup(cleanup_fn: Callable[[], None])` (`akasa.hooks`)**: Injects SQLite connection cleanup into background hook worker threads.
+* **`set_db_physics_resolvers(physics_fn, all_workspaces_fn)` (`akasa.db`)**: Injects workspace physics and tenant listing resolvers into Ring 2 database connection pooling.
+* **`set_vfs_artifact_path_resolver(resolver_fn: Callable)` (`akasa.vfs`)**: Injects system artifact path resolution into Ring 2 VFS without upward dependencies on state.
 
 ### 2.2 VFS Volume & Driver Registration (`akasa.vfs`)
 * **`mount_volume(workspace_id: str, scheme: str, volume: str, physical_target: str)`**: Maps a logical `(workspace_id, scheme, volume)` tuple in `_MOUNT_TABLE` to a physical host directory.
@@ -146,6 +151,7 @@ ext_bp = AkasaExtension(
    * .get_recent_logs(limit=20) -> List[Dict[str, Any]]
    * .cancel(job_id), .pause(job_id) -> bool, .resume(job_id, reset_timer=True) -> bool
    * .update_progress(message, artifact=None), .update_meta(meta_dict)
+   * .write_scratch(filename: str, content: str, ttl_seconds: int = 3600, owner: Optional[str] = None) -> str: Atomically writes an ephemeral scratch buffer inside the tenant cache directory and registers it for TTL cleanup.
    * .register_ephemeral(filepath, ttl_seconds=3600, owner=None), .get_ephemerals(owner=None) -> List[str], .clear_ephemerals(owner=None)
  * Settings & JSON Store:
    * ctx.settings (SettingsManager): .get(key, default=None, repo=None, mask_secrets=False), .set(key, value, repo=None), .get_all(repo=None, mask_secrets=False), .update(payload_dict, repo=None).
@@ -165,12 +171,22 @@ ext_bp = AkasaExtension(
    * ctx.emit_merge_list(event_name, *args, **kwargs) -> List[Any]
    * ctx.emit_background(event_name, *args, **kwargs)
 5. URI, VFS Concurrency & Telemetry Primitives
- * AkasaURI(raw_path: str) (akasa.uri):
+* ExecutionFrame & Context Primitives (akasa.context):
+    * class ExecutionFrame: Slotted immutable execution context bound to contextvars across HTTP, IPC, Worker, and CLI transports.
+    * execution_frame(workspace_id=None, transport="CLI", method="CALL", payload=None, job_id=None): Context manager binding an active ExecutionFrame.
+    * get_current_frame() -> Optional[ExecutionFrame]: Returns active frame or None.
+    * resolve_active_tenant(default="default") -> str: Resolves tenant from active frame or injected resolver.
+    * sniff_tenant_id() -> str: Returns resolved active tenant workspace_id.
+    * atomic_write_bytes(filepath, data, mode=None, lock=False) / atomic_write_text(filepath, content, encoding="utf-8", mode=None, lock=False): Atomic write with optional inter-process locking on .state.lock.
+* AkasaURI(raw_path: str) (akasa.uri):
    * Attributes: .scheme, .volume, .path, .is_dir, .basename, .parts: tuple, .parent -> AkasaURI (backed by `__slots__`).
    * Methods: .join(child_path: str) -> AkasaURI, .relative_to(base_uri: AkasaURI) -> str, .match(pattern: str) -> bool.
  * Event Bus Barrier (akasa.hooks):
    * hooks.sync_event_bus_barrier(timeout: float = 5.0) -> bool: Awaits completion of all queued background event bus handlers.
- * VFS OCC & 3-Way Merge (akasa.vfs):
+ * VFS OCC & 3-Way Merge (akasa.vfs, akasa.state):
+   * read_cached_physical_text(resolved_path: str, bypass_read_cache: bool = False) -> Tuple[Optional[int], Optional[str]]: Unified Read-Your-Writes primitive checking _VFS_PENDING_WRITES, _VFS_READ_CACHE, and physical disk.
+   * heal_daemon_config_files(remove_legacy_system_json: bool = False) -> Tuple[str, str]: Splits legacy system.json into workspaces.json and host.json.
+   * load_json_config(filepath, default_fallback=None): Loads and caches parsed JSON objects keyed by VFS causal revision tokens.
    * compute_vfs_sha256(text: str) -> str
    * record_vfs_ancestor(workspace_id: str, filepath_or_resolved: str, text: str, text_hash: Optional[str] = None) -> str
    * lookup_vfs_ancestor(workspace_id: str, filepath_or_resolved: str, base_hash: Optional[str], fallback_base_content: Optional[str] = None) -> Optional[str]

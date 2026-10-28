@@ -13,6 +13,22 @@ Akasa is a strictly domain-agnostic Tier 1 application kernel and volume router.
 * **Inversion of Control (IoC):** All application-specific capabilities must be injected into Akasa by host applications or Tier 2/3 extensions via `@hooks.on()` event subscriptions, custom VFS `Driver` registrations, and volume mount configurations.
 * **Kernel Independence:** Akasa must build, test, and run without dependencies on higher-tier domain modules.
 
+### 0.1 The 5-Ring Strict Acyclic Dependency DAG (`KERNEL_RING_DAG_MANDATE`)
+
+To guarantee zero circular imports, deterministic initialization, and headless execution without HTTP/WSGI frameworks, all internal `akasa` modules are partitioned into five concentric rings (`Ring 0` through `Ring 4`):
+
+* **Ring 0 — Pure Stdlib Primitives & Execution Context (`types.py`, `uri.py`, `context.py`):** Zero internal `akasa.*` imports and zero third-party dependencies. Houses `AkasaURI`, `ExecutionFrame` (`contextvars`), `atomic_write_bytes` / `atomic_write_text`, `@thread_safe_cache`, `clone_json_value`, `typeddict_to_openapi`, and pure mathematical/graph utilities.
+* **Ring 1 — Signaling & Priority Event Bus (`events.py`, `hooks.py`):** Depends only on Ring 0. Houses `EventBus` (`sse_bus`) and `HookRegistry` (`hooks`). Delegates workspace enablement checks via an injected Ring 2 authorizer (`set_hook_authorizer`) so Ring 1 never imports upward.
+* **Ring 2 — Persistence, VFS & Causal State (`db.py`, `vfs.py`, `state.py`, `utils.py`):** Depends only on Rings 0–1. `db.py` manages thread-local SQLite WAL pooling; `vfs.py` manages the volume router, `_VFS_READ_CACHE`, and `_VFS_PENDING_WRITES` overlay; `state.py` manages workspace physics (`get_workspace_physics`), `load_config`, and the causal parsed-object JSON cache (`_JSON_PARSED_CACHE` keyed by VFS revision tokens); `utils.py` serves as the unified backward-compatible facade re-exporting Ring 0 and Ring 2 primitives.
+* **Ring 3 — Process Sandboxing, Worker Metronome & Heartbeat (`process.py`, `workers/__init__.py`, `sync.py`):** Depends only on Rings 0–2. Houses `ProcessManager`, `execute_binary`, dual-pool background workers (`Akasa-Interactive`, `Akasa-Worker`, `Akasa-IO`), and `get_system_deltas`.
+* **Ring 4 — Transport Adapters, Cryptography & Extension SDK (`auth/__init__.py`, `extension.py`, `__init__.py`):** Depends on Rings 0–3. Houses Fernet secret management, `AkasaExtension`, `ExtensionContext`, `SettingsManager`, `JobManager`, and the optional Flask WSGI transport adapter (`akasa.init_app`).
+
+**Enforced AST Fitness Invariants (`akasa/tests/fitness/rules_python.py`):**
+1. **`KERNEL_RING_DAG_MANDATE`:** A module in Ring $N$ may only import from Ring $M$ where $M \le N$. Upward imports across rings are strictly banned; cross-ring coordination must use dependency injection callbacks bound at initialization time.
+2. **`KERNEL_TRANSPORT_ISOLATION`:** Importing `flask` or WSGI transport objects is strictly banned in Rings 0–3 (`types`, `uri`, `context`, `events`, `hooks`, `db`, `vfs`, `state`, `utils`, `process`, `workers`, `sync`).
+3. **`STRICT_TOP_LEVEL_IMPORTS_MANDATE`:** Inline `import` statements inside functions or methods are strictly prohibited across all kernel modules; all imports must reside at the top of the module.
+4. **Subsystem `reset()` Contract:** Every stateful Ring module (`context`, `db`, `vfs`, `state`, `workers`) exposes a deterministic `reset()` function orchestrated by `akasa.reset_state()` for isolated unit test harnesses.
+
 ---
 
 ## 1. Single Source of Truth (SSOT) & Spatial Physics
@@ -38,8 +54,7 @@ Logic, pathing, and settings management must operate deterministically from a si
 ## 2. Stateless Multi-Tenancy & Thread-Local Storage
 
 Akasa serves multiple tenant workspaces concurrently within a single process daemon without cross-tenant memory leakage.
-
-* **Request-Scoped Workspace Identification:** Tenant contexts are passed explicitly or extracted via the `X-Workspace-ID` HTTP header (`sniff_tenant_id()`). Default fallback is always `"default"`.
+* **Transport-Agnostic ExecutionFrame & Tenant Identification (`ExecutionFrame`):** Active tenant scope, transport type (`HTTP`, `IPC`, `WORKER`, `CLI`), and request payloads are bound to a slotted `ExecutionFrame` on a `contextvars.ContextVar` via `with execution_frame(workspace_id=..., transport=...):` in Ring 0 (`akasa/context.py`). `resolve_active_tenant()` and `sniff_tenant_id()` inspect the active `ExecutionFrame` first (ensuring explicit `ctx.call()` or worker frames always take precedence), falling back to the injected transport `tenant_resolver` (e.g., Flask's `X-Workspace-ID` header) and finally `"default"`.
 * **Thread-Local Connection Pooling (`_local`):** SQLite connection pools are stored in thread-local storage (`threading.local()`) and structured hierarchically as `_local.connections[workspace_id][db_name]`. Connection limits are capped at 3 active workspaces per thread and 4 databases per workspace using True LRU eviction to prevent WAL handle exhaustion.
 * **Thread-Local Connection Lifecycle Purging (`close_thread_connections`):** Per-request WSGI threads and background worker threads must call `close_thread_connections()` upon completing execution to close all cached SQLite connections on the calling thread, preventing file descriptor exhaustion. Individual connections can be evicted using `evict_cached_connection(workspace_id, db_name)`.
 * **Database Relocation & Storage Bounds:** Tenant databases are stored in `<tenant_control_dir>/cache/db/<db_name>.db`. All connections must enforce:
@@ -137,3 +152,39 @@ All public SDK methods, event bus payloads, and worker interfaces must conform s
 * **No Ambiguous Property Aliases:** Event payloads and API payloads must evaluate SSOT property names (`filepath` rather than ambiguous aliases like `path` or `filename`).
 * **In-Process Zero-Copy IPC Gateway (`ctx.call`):** Extensions expose transport-agnostic capabilities registered automatically in `_CAPABILITY_REGISTRY`. Extensions invoke peer capabilities using `ctx.call(capability, wait=True, timeout=60.0, **kwargs)`, executing directly in-process within the active workspace context. Invocations returning HTTP 202 automatically await background worker settlement when `wait=True`. Input arguments and HTTP requests are unified via `ctx.payload` and `ctx.method`.
 * **OpenAPI Schema Reflection:** API routes registered via `AkasaExtension.route()` must accept typed request/response schemas. `TypedDict` annotations are converted to OpenAPI 3.0 JSON Schema objects using `typeddict_to_openapi()`.
+
+---
+
+## 7. The Three-Tier Bug Diagnostic & Verification Governance
+
+To prevent test suite bloat while maximizing defect prevention across the kernel, every bug or architectural regression discovered during development must pass through a strict triage decision tree before a fix is finalized:
+
+```text
+                                BUG DIAGNOSED
+                                      │
+        ┌──────────────────────────────┼──────────────────────────────┐
+        ▼                              ▼                              ▼
+1. Structural / Form           2. Behavioral Invariant        3. Isolated Logic
+    (AST syntax, Ring DAG,         (Cross-system contracts,       (Math edge cases,
+    inline imports, leaks)         idempotency, barriers)         URI/merge corner cases)
+        │                              │                              │
+        ▼                              ▼                              │
+  Fitness Function               Contract / Matrix Unit Test    Local Regression Test
+  (`tests/fitness/`)             (`tests/unit/test_*.py`)       (`tests/unit/test_*.py`)
+
+```
+
+1. **Structural Anti-Pattern $\rightarrow$ AST Fitness Function (`akasa/tests/fitness/`):**
+* *Criterion:* If the defect is caused by a structural violation—such as an upward Ring import (`KERNEL_RING_DAG_MANDATE`), a transport leak in Rings 0–3 (`KERNEL_TRANSPORT_ISOLATION`), an inline function import (`STRICT_TOP_LEVEL_IMPORTS_MANDATE`), a synchronous file write outside `vfs.py` (`ASYNC_VFS_PIPELINE_COMPLIANCE`), or a domain token leak (`SUBSTRATE_PURITY_VIOLATION`)— that an LLM or developer could repeat in another file tomorrow, it belongs in `KernelFitnessVisitor`.
+* *Verification:* Every new fitness rule must be paired with a negative synthetic AST test in `test_kernel_hardening.py` proving `KernelFitnessVisitor` catches the violation.
+
+
+2. **Behavioral Invariant $\rightarrow$ Contract / Matrix Unit Test (`akasa/tests/unit/`):**
+* *Criterion:* If the defect represents a breach of a cross-subsystem guarantee (e.g., Read-Your-Writes consistency between `_VFS_PENDING_WRITES` and `_JSON_PARSED_CACHE`, `ExecutionFrame` nesting precedence, worker signature reflection across complex `Union`/`Literal`/`Tuple` types, or subprocess `AKASA_BOOT_TOKEN` scrubbing across `run` and `popen` modes), codify it as a behavioral contract test in `akasa/tests/unit/`.
+
+
+3. **Isolated Logic Flaw $\rightarrow$ Local Regression Test (`akasa/tests/unit/`):**
+* *Criterion:* If the defect is an algorithmic edge case inside a single function (e.g., double-slash normalization in `AkasaURI` or subsequence detection in `three_way_merge_text`), add a targeted assertion to that subsystem's unit test method.
+
+
+
