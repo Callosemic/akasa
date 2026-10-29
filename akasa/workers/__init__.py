@@ -10,7 +10,13 @@ import threading
 import typing
 from typing import TypedDict, List, Dict, Any, Optional, Literal, Union
 from concurrent.futures import ThreadPoolExecutor
-from akasa.context import execution_frame, sniff_tenant_id, reclaim_process_memory
+from akasa.context import (
+    execution_frame,
+    sniff_tenant_id,
+    reclaim_process_memory,
+    resolve_dag_wavefronts,
+    CycleError,
+)
 from akasa.events import sse_bus
 from akasa.hooks import hooks
 from akasa.db import get_connection, apply_declarative_schema, evict_cached_connection, close_thread_connections, _REGISTERED_SCHEMAS
@@ -30,56 +36,58 @@ class ChainStepArtifact(TypedDict, total=False):
     state_deltas: Optional[Dict[str, Any]]
     next_job_id: Optional[str]
     next_kwargs: Optional[Dict[str, Any]]
+def _prepare_anchored_dag_steps(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Normalizes source/body/sink boundary anchors and prunes unknown dependency references."""
+    if not steps:
+        return []
+    prepared = [dict(s) for s in steps if isinstance(s, dict) and s.get("id")]
+    all_ids = {s["id"] for s in prepared}
+    source_ids = {s["id"] for s in prepared if s.get("anchor") == "source"}
+    non_sink_ids = {s["id"] for s in prepared if s.get("anchor") != "sink" and not s.get("terminal")}
+
+    for s in prepared:
+        sid = s["id"]
+        is_sink = s.get("anchor") == "sink" or s.get("terminal")
+        is_source = s.get("anchor") == "source"
+        existing_deps = {d for d in (s.get("depends_on") or []) if d in all_ids and d != sid}
+        if is_sink:
+            existing_deps |= (non_sink_ids - {sid})
+        elif not is_source and source_ids:
+            existing_deps |= (source_ids - {sid})
+        s["depends_on"] = sorted(existing_deps)
+
+    return prepared
+
 
 def resolve_dag_chain(ctx, hook_name: str) -> List[Dict[str, Any]]:
     """
     Generic Akasa DAG Orchestrator.
     Collects step definitions from a registration hook, resolves boundary anchors
-    ("source", "body", "sink"), and performs a cycle-safe topological sort.
+    ("source", "body", "sink"), and delegates topological wavefront sorting to
+    Ring 0 resolve_dag_wavefronts (graphlib.TopologicalSorter).
     """
-    steps = []
+    raw_steps = []
     for res in ctx.emit(hook_name):
-        if res: steps.extend(res)
+        if res:
+            raw_steps.extend(res)
 
-    # 1. Isolate non-sink step IDs
-    non_sink_ids = {s['id'] for s in steps if s.get('anchor') != 'sink' and not s.get('terminal')}
+    steps = _prepare_anchored_dag_steps(raw_steps)
+    if not steps:
+        return []
 
-    # 2. Inject non-sink IDs into sink anchors as dynamic prerequisites
-    for s in steps:
-        is_sink = s.get('anchor') == 'sink' or s.get('terminal')
-        if is_sink:
-            existing_deps = set(s.get('depends_on', []))
-            s['depends_on'] = list(existing_deps | non_sink_ids)
+    try:
+        wavefronts = resolve_dag_wavefronts(steps, id_key="id", parents_key="depends_on", order_key="order")
+        return [step for wave in wavefronts for step in wave]
+    except (CycleError, ValueError) as e:
+        print(f"⚠️ Circular or invalid dependency detected in DAG [{hook_name}]: {e}. Falling back to priority order.")
+        steps.sort(key=lambda x: (x.get("order", 50), x["id"]))
+        return steps
 
-    # 3. Primary sort by explicit priority order
-    steps.sort(key=lambda x: (x.get('order', 50), x['id']))
 
-    # 4. Topological Sort with Cycle Guard
-    ordered_steps = []
-    visited = set()
-    visiting = set()
-
-    def visit(step_id):
-        if step_id in visited: return
-        if step_id in visiting:
-            print(f"⚠️ Circular dependency detected in DAG [{hook_name}] involving [{step_id}]. Bypassing.")
-            return
-        visiting.add(step_id)
-        step = next((s for s in steps if s['id'] == step_id), None)
-        if step:
-            for dep in step.get('depends_on', []):
-                visit(dep)
-            visited.add(step_id)
-            ordered_steps.append(step)
-        visiting.remove(step_id)
-
-    for s in steps:
-        visit(s['id'])
-
-    return ordered_steps
 _executor = None
 _interactive_executor = None
 _io_executor = None
+_io_pool_local = threading.local()
 _metronome_thread = None
 _shutdown_event = threading.Event()
 _metronome_wakeup = threading.Condition()
@@ -322,25 +330,32 @@ def start_dag_chain(steps: List[Dict[str, Any]], workspace_id: str, on_complete_
         submit_immediate_job(jid, step["ext_name"], step["worker_name"], args_json, workspace_id=workspace_id, coalesce=False, job_category=job_category)
 
     return first_dispatched_id
-
 def run_parallel(fn, items, max_workers: int = 4) -> list:
     """
     Executes `fn(item)` across `items` using the shared bounded Akasa I/O ThreadPoolExecutor
     and deterministically closes thread-local SQLite connections on each worker thread.
+    Automatically executes inline if invoked reentrantly from within an active Akasa-IO worker
+    to prevent thread pool starvation and deadlocks.
     """
     global _io_executor
     items_list = list(items or [])
     if not items_list:
         return []
-    if len(items_list) == 1 or threading.current_thread().name.startswith("Akasa-IO"):
+    if (
+        len(items_list) == 1
+        or getattr(_io_pool_local, "in_pool", False)
+        or threading.current_thread().name.startswith("Akasa-IO")
+    ):
         return [fn(item) for item in items_list]
     if _io_executor is None:
         _io_executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="Akasa-IO")
 
     def _safe_worker(item):
+        _io_pool_local.in_pool = True
         try:
             return fn(item)
         finally:
+            _io_pool_local.in_pool = False
             close_thread_connections()
 
     futures = [_io_executor.submit(_safe_worker, item) for item in items_list]
@@ -1032,8 +1047,31 @@ def get_active_pipeline_modules(workspace_id=None) -> Dict[str, Any]:
     }
 
 
+def _quiesce_background_workers(join_timeout: float = 5.0) -> None:
+    """
+    Stops the metronome and both job pools, waiting for in-flight jobs, then re-arms lazy startup
+    (the next submit_immediate_job() or system_boot restarts them). Without this, a metronome started
+    in one sandbox keeps ticking after the daemon cwd changes and opens databases at the new location.
+    """
+    global _executor, _interactive_executor, _metronome_thread
+    _shutdown_event.set()
+    with _metronome_wakeup:
+        _metronome_wakeup.notify_all()
+    thread = _metronome_thread
+    if thread is not None and thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=join_timeout)
+    for pool in (_executor, _interactive_executor):
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+    _executor = None
+    _interactive_executor = None
+    _metronome_thread = None
+    _shutdown_event.clear()
+
+
 def reset() -> None:
-    """Clears initialized workspace schema watermarks and active DAG state for isolated test harnesses."""
+    """Quiesces background workers, then clears initialized workspace schema watermarks and active DAG state for isolated test harnesses."""
+    _quiesce_background_workers()
     with _SCHEMA_INIT_LOCK:
         _INITIALIZED_WORKSPACES.clear()
     with _dag_lock:

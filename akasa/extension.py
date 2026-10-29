@@ -403,24 +403,48 @@ class SettingsManager:
                     return MASKED_SECRET_SENTINEL if decrypted else ""
                 return decrypted
         else:
-            filepath = self._resolve_filepath(scope)
-            data = load_json_config(filepath, {})
-
-            if scope == 'daemon':
-                # Agnostic Fallback: If it is nested under the extension, return it.
-                # Otherwise, if it manages a root configuration parameter, return the root.
-                if key in data.get(self.ext_name, {}):
-                    return data[self.ext_name][key]
-                elif key in data:
-                    return data[key]
-            elif scope == 'repo':
-                if repo and key in data.get(repo, {}).get(self.ext_name, {}):
-                    return data[repo][self.ext_name][key]
-            else:
-                if key in data.get(self.ext_name, {}):
-                    return data[self.ext_name][key]
+            found, stored = self._lookup_stored_plain(scope, key, repo)
+            if found:
+                return stored
 
         return field.get('default', default)
+
+    def _lookup_stored_plain(self, scope, key, repo=None):
+        """Returns (found, value) for a non-secure key from its scope's settings file, without schema defaults."""
+        data = load_json_config(self._resolve_filepath(scope), {})
+        if scope == 'daemon':
+            # Agnostic Fallback: If it is nested under the extension, return it.
+            # Otherwise, if it manages a root configuration parameter, return the root.
+            if key in data.get(self.ext_name, {}):
+                return True, data[self.ext_name][key]
+            if key in data:
+                return True, data[key]
+        elif scope == 'repo':
+            if repo and key in data.get(repo, {}).get(self.ext_name, {}):
+                return True, data[repo][self.ext_name][key]
+        else:
+            if key in data.get(self.ext_name, {}):
+                return True, data[self.ext_name][key]
+        return False, None
+
+    def is_set(self, key, repo=None) -> bool:
+        """
+        True when a value for key has been saved in its scope's storage, False when get() would
+        fall back to the schema default. Lets callers distinguish explicit configuration from defaults.
+        """
+        field = self._get_field_meta(key)
+        if not field:
+            return False
+        scope = field.get('scope', 'workspace')
+        if field.get('secure', False):
+            control_dir = get_tenant_control_dir(self.workspace_id)
+            data = load_json_config(Path(control_dir).joinpath(self.secrets_filename).as_posix(), {})
+            ext_secrets = data.get(self.ext_name, {})
+            if scope == 'repo' and repo:
+                ext_secrets = ext_secrets.get(repo, {})
+            return key in ext_secrets
+        found, _ = self._lookup_stored_plain(scope, key, repo)
+        return found
     def set(self, key, value, repo=None):
         field = self._get_field_meta(key)
         if not field: return
@@ -754,10 +778,13 @@ class ExtensionContext:
     def db(self) -> DatabaseWrapper:
         """Returns an SQLite connection automatically keyed to the active tenant workspace."""
         return self.get_db(self.ext_name)
-
     def get_active_modules(self) -> List[str]:
         """Returns a sorted list of all active core and workspace-enabled extension modules."""
         return get_active_modules(self.workspace_id)
+
+    def get_registered_capabilities(self) -> Dict[str, Dict[str, Any]]:
+        """Returns a shallow copy of the global transport-agnostic capability registry."""
+        return get_registered_capabilities()
 
     def emit_sse(self, event_type: str, payload: Dict[str, Any]) -> None:
         """Publishes a real-time Server-Sent Event onto the global SSE bus."""
@@ -1083,20 +1110,22 @@ class AkasaExtension:
         # Attach directly to the underlying Flask Blueprint instance for Flask reflection
         if not hasattr(self.bp, 'route_schemas'):
             self.bp.route_schemas = {}
-            
+
         if full_rule not in self.bp.route_schemas:
             self.bp.route_schemas[full_rule] = {}
-            
+
         docstring = options.pop('docstring', None)
+        mcp_expose = options.pop('mcp_expose', None)
         for method in options.get('methods', ['GET']):
             m_upper = method.upper()
             req_sch = request_schema.get(m_upper) if isinstance(request_schema, dict) else request_schema
             res_sch = response_schema.get(m_upper) if isinstance(response_schema, dict) else response_schema
-            
+
             self.bp.route_schemas[full_rule][m_upper] = {
                 "request_schema": req_sch,
                 "response_schema": res_sch,
-                "docstring": docstring
+                "docstring": docstring,
+                "mcp_expose": mcp_expose,
             }
         path_params = [m[1] for m in re.findall(r'<([^>:]+:)?([^>]+)>', clean_rule)]
         cap_action = re.sub(r'/<[^>]+>', '', clean_rule).strip('/').replace('/', '.')
@@ -1113,6 +1142,11 @@ class AkasaExtension:
             merged_res_schema = response_schema or (existing_spec.get("response_schema") if existing_spec else None)
             merged_doc = docstring or (existing_spec.get("docstring") if existing_spec else None)
             merged_path_params = list(dict.fromkeys((existing_spec.get("path_params", []) if existing_spec else []) + path_params))
+            merged_mcp_expose = (
+                bool(mcp_expose)
+                if mcp_expose is not None
+                else bool(existing_spec.get("mcp_expose", True) if existing_spec else True)
+            )
 
             _CAPABILITY_REGISTRY[cap_id] = {
                 "id": cap_id,
@@ -1124,6 +1158,7 @@ class AkasaExtension:
                 "request_schema": merged_req_schema,
                 "response_schema": merged_res_schema,
                 "docstring": merged_doc,
+                "mcp_expose": merged_mcp_expose,
                 "core": bool(getattr(self, 'core', False)),
                 "handler": f,
                 "handlers_by_method": handlers_by_method,

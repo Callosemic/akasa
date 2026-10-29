@@ -21,6 +21,8 @@ from akasa.state import register_core_module
 import akasa.workers as _akasa_workers
 import akasa.extension as _akasa_extension
 from akasa.auth import auth_bp, get_security_blueprint, BOOT_TOKEN
+import akasa.auth.peer as _akasa_peer
+from akasa.auth.peer import classify_peer, is_host_allowed, register_proxy_header, register_allowed_host
 
 _ = _akasa_extension
 
@@ -86,6 +88,8 @@ def configure(
     trusted_host_suffixes: Tuple[str, ...] = (),
     tune_os_resources: bool = True,
     tenant_resolver: Optional[Callable[[], Optional[str]]] = None,
+    proxy_headers: Tuple[str, ...] = (),
+    allowed_hosts: Tuple[str, ...] = (),
 ) -> None:
     """Phase A: Headless-safe process & HookRegistry physics configuration."""
     if tune_os_resources:
@@ -112,6 +116,12 @@ def configure(
     if trusted_host_suffixes:
         register_trusted_host_suffix(*trusted_host_suffixes)
 
+    if proxy_headers:
+        register_proxy_header(*proxy_headers)
+
+    if allowed_hosts:
+        register_allowed_host(*allowed_hosts)
+
 
 def init_app(
     app: Flask,
@@ -122,6 +132,7 @@ def init_app(
     sse_route: Optional[str] = None,
     enable_proxy_fix: bool = True,
     disable_browser_cache: bool = True,
+    enforce_host_validation: bool = True,
 ) -> Flask:
     """Phase B: Wires Flask transport, authentication gate, DB connection teardown, and optional SSE stream."""
     if enable_proxy_fix:
@@ -152,6 +163,11 @@ def init_app(
 
     @app.before_request
     def _akasa_enforce_token_gate():
+        # DNS-rebinding guard runs before the public-route allowlist so no route answers a foreign Host.
+        if enforce_host_validation:
+            peer = classify_peer(request.remote_addr, request.headers)
+            if not is_host_allowed(peer.host, get_trusted_host_suffixes()):
+                return jsonify({"error": "421 Misdirected Request: Host not allowed."}), 421
         req_route = request.path
         if (
             req_route in allowed_routes
@@ -203,13 +219,16 @@ def boot(skip_if_reloader_parent: bool = False) -> None:
         print(f"Warning: system_boot failed: {e}")
 def reset_state(cwd: Optional[str] = None, control_dir: Optional[str] = None) -> None:
     """First-class test harness reset: delegates to each Ring subsystem's reset() contract."""
+    # Quiesce background workers first: an in-flight job must not reopen databases or queue VFS
+    # writes while the subsystems below are being reset or after the daemon cwd changes.
+    _akasa_workers.reset()
     _akasa_context.reset()
     set_tenant_resolver(_flask_http_tenant_resolver)
     hooks.reset()
     _akasa_db.reset()
     _akasa_vfs.reset()
     _akasa_state.reset()
-    _akasa_workers.reset()
+    _akasa_peer.reset()
 
     if cwd is not None:
         _akasa_context._in_test_sandbox = True

@@ -124,8 +124,16 @@ def read_cached_physical_text(resolved_path: str, bypass_read_cache: bool = Fals
 
 
 def reset() -> None:
-    """Purges VFS read cache, pending write overlay, and ancestor ring buffer for isolated test harnesses."""
+    """
+    Drains the async write queue, then purges the VFS read cache, pending write overlay, and ancestor
+    ring buffer for isolated test harnesses. Draining first matters: a write queued under one daemon
+    cwd must not execute after the harness switches cwd, or it lands at the wrong physical path.
+    """
     global _VFS_READ_CACHE_BYTES
+    try:
+        sync_vfs_barrier("default", timeout=5.0)
+    except (RuntimeError, TimeoutError) as e:
+        print(f"⚠️ [VFS] reset() could not drain the write queue before purging: {e}")
     with _VFS_CACHE_LOCK:
         _VFS_READ_CACHE.clear()
         _VFS_READ_CACHE_BYTES = 0
@@ -877,13 +885,6 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data, defer_event
                 "relocated_to": filepath,
                 "ignore_ledger": ignore_ledger
             })
-            try:
-                parent_dir = Path(old_abs_path).parent.as_posix()
-                while parent_dir and os.path.isdir(parent_dir) and not os.listdir(parent_dir):
-                    os.rmdir(parent_dir)
-                    parent_dir = Path(parent_dir).parent.as_posix()
-            except OSError:
-                pass
             if not ignore_ledger:
                 ledger_rows.append((delete_source, 'deleted', now_ts))
 

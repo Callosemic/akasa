@@ -1,5 +1,6 @@
 from pathlib import Path
 from functools import wraps
+from graphlib import TopologicalSorter, CycleError
 import contextlib
 import contextvars
 import ctypes
@@ -539,8 +540,180 @@ def generate_ascii_tree(file_paths):
             lines.append(f"{prefix}{'└── ' if is_last else '├── '}{key}")
             lines.extend(print_tree(node[key], prefix + ("    " if is_last else "│   ")))
         return lines
-
     return ".\n" + "\n".join(print_tree(tree))
+
+
+def resolve_dag_wavefronts(
+    items: typing.List[typing.Dict[str, typing.Any]],
+    id_key: str = "id",
+    parents_key: str = "depends_on",
+    order_key: str = "order",
+) -> typing.List[typing.List[typing.Dict[str, typing.Any]]]:
+    """
+    Compiles a list of node dictionaries into level-order topological wavefronts (generations)
+    using stdlib graphlib.TopologicalSorter.
+    - Raises ValueError on duplicate or missing IDs.
+    - Raises CycleError (a ValueError subclass) on circular dependencies.
+    - Preserves deterministic tie-breaking within each wavefront via (order_key, insertion_index).
+    """
+    if not items:
+        return []
+
+    node_map: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
+    order_meta: typing.Dict[str, typing.Tuple[int, int]] = {}
+
+    for idx, item in enumerate(items):
+        if not isinstance(item, dict):
+            raise ValueError(f"DAG node at index {idx} must be a dict.")
+        raw_id = item.get(id_key)
+        node_id = str(raw_id or "").strip()
+        if not node_id:
+            raise ValueError(f"DAG node at index {idx} is missing a valid '{id_key}'.")
+        if node_id in node_map:
+            raise ValueError(f"Duplicate DAG node '{id_key}' detected: '{node_id}'.")
+        node_map[node_id] = item
+        raw_order = item.get(order_key, 50)
+        try:
+            order_val = int(raw_order) if raw_order is not None else 50
+        except (TypeError, ValueError):
+            order_val = 50
+        order_meta[node_id] = (order_val, idx)
+
+    sorter: TopologicalSorter = TopologicalSorter()
+    for node_id, item in node_map.items():
+        raw_parents = item.get(parents_key) or []
+        if isinstance(raw_parents, str):
+            raw_parents = [p.strip() for p in raw_parents.split(",") if p.strip()]
+        valid_parents = []
+        for p in raw_parents:
+            p_str = str(p or "").strip()
+            if not p_str:
+                continue
+            if p_str not in node_map:
+                raise ValueError(f"DAG node '{node_id}' references unknown parent '{p_str}'.")
+            valid_parents.append(p_str)
+        sorter.add(node_id, *valid_parents)
+
+    sorter.prepare()
+    wavefronts: typing.List[typing.List[typing.Dict[str, typing.Any]]] = []
+    while sorter.is_active():
+        ready_ids = list(sorter.get_ready())
+        if not ready_ids:
+            break
+        ready_ids.sort(key=lambda nid: (order_meta[nid][0], order_meta[nid][1], nid))
+        wavefronts.append([node_map[nid] for nid in ready_ids])
+        sorter.done(*ready_ids)
+
+    return wavefronts
+_TEMPLATE_VAR_RE = re.compile(r'\{\{\s*(?:macro_)?([a-zA-Z0-9_.\[\]-]+)(?:\s*\|\s*([^{}]*?))?\s*\}\}')
+_INNERMOST_MUSTACHE_RE = re.compile(r'\{\{\s*([^{}|]+?)(?:\s*\|\s*([^{}]*?))?\s*\}\}')
+_RESERVED_TEMPLATE_MACROS = frozenset({
+    "UNTIL", "triple", "inputs", "nodes", "item", "loop", "global",
+    "system_prompt", "user_message", "user_prompt", "context_block", "history_summary", "plan_uri",
+})
+_RESERVED_TEMPLATE_PREFIXES = ("wordcount_", "nodes.", "inputs.", "global.", "item.", "loop.", "include_prompt:")
+
+
+def extract_template_variables(text: str) -> typing.List[typing.Dict[str, typing.Any]]:
+    """
+    Scans text for {{ var }} or {{ var | default }} placeholders (including {{ macro_var }}),
+    ignoring system multipliers, wordcount tags, and runtime orchestrator namespaces.
+    Returns a deduplicated list of {'name': str, 'default': Optional[str], 'required': bool, 'description': str}.
+    """
+    if not text or "{{" not in text:
+        return []
+    vars_map: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
+    for m in _TEMPLATE_VAR_RE.finditer(text):
+        name = m.group(1).strip()
+        if (
+            not name
+            or "." in name
+            or "[" in name
+            or name.startswith(_RESERVED_TEMPLATE_PREFIXES)
+            or name in _RESERVED_TEMPLATE_MACROS
+        ):
+            continue
+        default_val = m.group(2).strip() if m.group(2) is not None else None
+        if default_val and default_val.startswith(_RESERVED_TEMPLATE_PREFIXES):
+            default_val = None
+        if name not in vars_map:
+            vars_map[name] = {
+                "name": name,
+                "default": default_val,
+                "required": default_val is None,
+                "description": f"Template parameter '{name}'" + (f" (default: {default_val})" if default_val else ""),
+            }
+        elif vars_map[name]["default"] is None and default_val is not None:
+            vars_map[name]["default"] = default_val
+            vars_map[name]["required"] = False
+            vars_map[name]["description"] = f"Template parameter '{name}' (default: {default_val})"
+    return list(vars_map.values())
+
+
+def interpolate_template_variables(
+    text: str,
+    values: typing.Optional[typing.Dict[str, typing.Any]] = None,
+    resolver: typing.Optional[typing.Callable[[str], typing.Any]] = None,
+) -> str:
+    """
+    Inside-out template variable interpolator for {{ var }}, {{ var | fallback_var | default }},
+    and nested {{ var | {{ fallback }} }} placeholders.
+    """
+    if not text or "{{" not in text:
+        return text or ""
+    normalized_vals: typing.Dict[str, typing.Any] = {}
+    for raw_k, raw_v in (values or {}).items():
+        if raw_v is None:
+            continue
+        clean_k = raw_k[len("macro_"):] if str(raw_k).startswith("macro_") else str(raw_k)
+        normalized_vals[clean_k] = raw_v
+
+    def _lookup(token: str) -> typing.Any:
+        clean_tok = token[len("macro_"):] if token.startswith("macro_") else token
+        if clean_tok in normalized_vals:
+            return normalized_vals[clean_tok]
+        if resolver is not None:
+            return resolver(clean_tok)
+        return None
+
+    def _format_val(val: typing.Any) -> str:
+        if isinstance(val, (dict, list)):
+            return json.dumps(val)
+        return str(val)
+
+    def _repl(match: typing.Match) -> str:
+        raw_head = (match.group(1) or "").strip()
+        if (
+            not raw_head
+            or raw_head.startswith(("wordcount_", "include_prompt"))
+            or raw_head in ("UNTIL", "triple")
+            or "*" in raw_head
+        ):
+            return match.group(0)
+        raw_tail = match.group(2)
+        candidates = [raw_head] + ([p.strip() for p in raw_tail.split("|")] if raw_tail is not None else [])
+        for idx, cand in enumerate(candidates):
+            if not cand:
+                continue
+            val = _lookup(cand)
+            if val is not None and val != "":
+                return _format_val(val)
+            # If this is the final pipe segment and not a runtime namespace reference, treat it as a literal default
+            if idx == len(candidates) - 1 and idx > 0:
+                if not cand.startswith(("nodes.", "inputs.", "global.", "item.", "loop.")):
+                    return cand.strip("'\"")
+                return ""
+        return "" if resolver is not None else match.group(0)
+
+    current = text
+    for _ in range(4):
+        if "{{" not in current:
+            break
+        next_str = _INNERMOST_MUSTACHE_RE.sub(_repl, current)
+        if next_str == current:
+            break
+        current = next_str
+    return current
 
 
 def reset() -> None:

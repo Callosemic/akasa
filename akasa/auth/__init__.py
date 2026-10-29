@@ -4,7 +4,6 @@ import json
 import shutil
 import socket
 import secrets
-import urllib.parse
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Blueprint, request, jsonify
@@ -12,9 +11,9 @@ import akasa.context as _akasa_context
 from akasa.context import (
     get_daemon_cwd,
     get_control_dir_name,
-    get_trusted_host_suffixes,
     atomic_write_bytes,
 )
+from akasa.auth.peer import classify_peer, is_loopback_origin
 from akasa.hooks import hooks
 from akasa.state import (
     load_config,
@@ -190,29 +189,19 @@ def bootstrap():
     """Unauthenticated token exchange gate supporting absolute dynamic fallback routing."""
     data = request.json or {}
 
-    # Extract real IP if behind Tailscale Serve or a Reverse Proxy
-    client_ip = request.headers.get('X-Forwarded-For', request.remote_addr).split(',')[0].strip()
+    # Single source of truth for request origin (fail-closed proxy detection, rightmost-hop client IP)
+    peer = classify_peer(request.remote_addr, request.headers)
     # --- ROUTE A: LOCALHOST BYPASS ---
-    # If the user is physically on the machine, auto-authenticate
-    if client_ip == '127.0.0.1':
-        # Check for cross-origin browser requests (Localhost Drive-By CSRF prevention)
+    # Only an unproxied request from this machine naming a loopback Host is auto-authenticated.
+    # Any forwarding header disqualifies the request, so proxies can never inherit localhost trust.
+    if peer.is_direct_loopback:
+        # Check for cross-origin browser requests (Localhost Drive-By CSRF prevention).
+        # Only loopback origins qualify; remote origins must authenticate through Route B or C.
         origin = request.headers.get('Origin', '')
         referer = request.headers.get('Referer', '')
-        def is_allowed(url_str):
-            try:
-                hostname = urllib.parse.urlparse(url_str).hostname or ""
-                if hostname in ['127.0.0.1', 'localhost']:
-                    return True
-                trusted_suffixes = get_trusted_host_suffixes()
-                if trusted_suffixes and any(hostname.endswith(sfx) for sfx in trusted_suffixes):
-                    return True
-                return bool(hooks.emit_first('is_trusted_origin', url=url_str, hostname=hostname, predicate=bool))
-            except Exception:
-                return False
-
-        if origin and not is_allowed(origin):
+        if origin and not is_loopback_origin(origin):
             return jsonify({"error": "Forbidden: Cross-origin request blocked"}), 403
-        if referer and not is_allowed(referer):
+        if referer and not is_loopback_origin(referer):
             return jsonify({"error": "Forbidden: Cross-origin request blocked"}), 403
 
         return jsonify({
@@ -222,10 +211,13 @@ def bootstrap():
         })
     cfg = load_config()
     # --- ROUTE B: INVERSION OF CONTROL (Zero-Knowledge Identity Protocols) ---
+    # Providers receive the classified peer; client_ip is the trusted (rightmost-hop) address,
+    # or '' when a proxied request carried no usable forwarding address.
     auth_res = hooks.emit_first(
         'execute_identity_handshake',
         request=request,
-        client_ip=client_ip,
+        peer=peer,
+        client_ip=peer.client_ip,
         config=cfg,
         predicate=lambda r: isinstance(r, dict) and r.get("status") == "authenticated"
     )
