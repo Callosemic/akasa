@@ -12,10 +12,10 @@ akasa/
 │   ├── __init__.py                 # Ring 4: Two-phase bootloader and WSGI transport adapter
 │   │   ├── def tune_process_resources() # Tier 1 OS Resource Governance: Raises file descriptor limits, bounds glibc arenas, and caps thread stack size.
 │   │   ├── class ForceHTTPSProxyFix # WSGI Middleware to force HTTPS scheme when behind reverse proxies or trusted tunnel suffixes.
-│   │   ├── def configure(control_dir, trusted_namespaces, extension_namespaces, core_modules, ...) # [stale?] Phase A: Headless-safe process & HookRegistry physics configuration.
-│   │   ├── def init_app(app, token_header, public_routes, public_prefixes, ...) # [stale?] Phase B: Wires Flask transport, authentication gate, DB connection teardown, and optional SSE stream.
+│   │   ├── def configure(control_dir, trusted_namespaces, extension_namespaces, core_modules, ...) # Phase A: Headless-safe process & HookRegistry physics configuration.
+│   │   ├── def init_app(app, token_header, public_routes, public_prefixes, ...) # Phase B: Wires Flask transport, authentication gate, DB connection teardown, and optional SSE stream.
 │   │   ├── def boot(skip_if_reloader_parent) # Ignites the Akasa kernel lifecycle (DB migrations, VFS write pipeline, and Worker Metronome).
-│   │   └── def reset_state(cwd, control_dir) # [stale?] First-class test harness reset: delegates to each Ring subsystem's reset() contract.
+│   │   └── def reset_state(cwd, control_dir) # First-class test harness reset: delegates to each Ring subsystem's reset() contract.
 │   ├── auth/                       # Ring 4: Authentication blueprint, token exchange, and Fernet encryption
 │   │   ├── __init__.py             # Authentication and Fernet key rotation endpoints
 │   │   │   ├── def get_master_key() # Loads or generates the global Fernet master key.
@@ -24,7 +24,16 @@ akasa/
 │   │   │   ├── def decrypt_secret(val) # Decrypts a v1: Fernet token string with fallback key support.
 │   │   │   ├── def rotate_master_key(new_key_str) # Validates a new Fernet key, re-encrypts all workspace secrets.json files, and updates master_key.txt.
 │   │   │   ├── def get_security_blueprint() # Lazily instantiates and returns the core security AkasaExtension blueprint.
-│   │   │   └── def bootstrap()     # [stale?] Unauthenticated token exchange gate supporting absolute dynamic fallback routing.
+│   │   │   ├── def get_boot_token() # The token the gate accepts: AKASA_BOOT_TOKEN if set, else the durable session token (created lazily).
+│   │   │   └── def bootstrap()     # Unauthenticated token exchange gate supporting absolute dynamic fallback routing.
+│   │   ├── credentials.py          # Bottom-layer credential store (stdlib only) shared by the token gate and a host's recovery server.
+│   │   │   ├── def auth_dir(control_dir) # Returns <control_dir>/auth.
+│   │   │   ├── def session_token_path(control_dir) # Returns the path of the durable session token.
+│   │   │   ├── def read_token(control_dir) # Returns the stored session token, or None when it is missing, empty or unreadable.
+│   │   │   ├── def load_or_create_token(control_dir) # Returns the durable session token, creating it on first use (O_EXCL, owner-only).
+│   │   │   ├── def rotate_token(control_dir) # Replaces the session token with a new one and returns it.
+│   │   │   ├── def verify_token(presented, expected) # Constant-time comparison that never accepts an empty or missing credential.
+│   │   │   └── def permission_problems(control_dir) # Lists credential paths that group or other users can access (POSIX only).
 │   │   └── peer.py                 # Ring 4 peer classifier: fail-closed proxy detection, trusted client IP, Host and Origin validation
 │   │       ├── def register_proxy_header() # DI Interface: Registers additional headers whose presence marks a request as proxied (case-insensitive).
 │   │       ├── def get_proxy_headers() # Returns the lowercase forwarding header names that mark a request as proxied.
@@ -196,7 +205,7 @@ akasa/
 │           ├── def register_ephemeral_artifact(filepath, owner, ttl_seconds, workspace_id) # [comment required]
 │           ├── def sweep_ephemeral_artifacts(workspace_id) # Sweeps and deletes expired temporary files and old immediate jobs.
 │           ├── def get_active_pipeline_modules(workspace_id) # Fast, single-query helper returning active_modules, pending_modules, and is_pipeline_active without scanning vfs_event_log or firing manifes...
-│           ├── def reset()         # [stale?] Resets Ring 0 context state for isolated test harnesses.
+│           ├── def reset()         # Resets Metronome worker state for isolated test harnesses.
 │           ├── def start_workers(**kwargs) # [comment required]
 │           └── def stop_workers(**kwargs) # [comment required]
 ├── docs/                           # Architectural documentation and standards
@@ -204,15 +213,16 @@ akasa/
 │   ├── 01_engineering_standards.md # Core engineering standards and audit guardrails
 │   ├── 02_kernel_api_and_ioc_contracts.md # External SDK, DI, and IoC hook interface contracts
 │   └── adrs/                       # Architectural Decision Records (ADRs)
-│       ├── 0004_vfs_bulk_mutation_batching_and_atomic_consolidation.md # ADR 0004 specification
 │       ├── 0006_resource_governance_bounded_executors_and_secret_lifecycle.md # ADR 0006 specification
 │       ├── 0007_kernel_bootloader_vfs_3way_merge_and_substrate_purity.md # ADR 0007 kernel bootloader, 3-way VFS merge, and substrate purity specification
 │       ├── 0008_microbatched_vfs_dual_pool_workers_and_ipc_gateway.md # ADR 0008 micro-batched VFS commits, dual-pool workers, signature validation, and IPC gateway specification
 │       ├── 0009_5ring_acyclic_dag_execution_frame_and_causal_state_caching.md # ADR 0009 5-ring acyclic DAG, ExecutionFrame contextvars, and causal state caching specification
 │       ├── 0010_fail_closed_peer_trust_dns_rebinding_gate_and_dag_wavefronts.md # ADR 0010: Fail-Closed Peer Classification, DNS-Rebinding Host Gate, Topological DAG Wavefronts, and Test Sandbox Quiescing
+│       ├── 0011_durable_credential_store_lazy_tokens_and_guarded_job_settlement.md # ADR 0011: Durable Stdlib Credential Store, Lazy Boot Token Initialization, and Claim-Guarded Worker Settlement
 │       ├── archived/               # Baseline architectural decisions assimilated into kernel
 │       │   ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001 specification
-│       │   └── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
+│       │   ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
+│       │   └── 0004_vfs_bulk_mutation_batching_and_atomic_consolidation.md # ADR 0004 specification
 │       └── superseded/             # Obsolete architectural decisions replaced by newer ADRs
 │           ├── .gitkeep            # Git preservation marker
 │           ├── 0003_openapi_reflection_dag_orchestration_and_error_hooks.md # ADR 0003 specification
@@ -233,12 +243,15 @@ akasa/
     ├── run_unit_tests.py           # CLI runner for Akasa kernel behavioral unit tests
     └── unit/                       # Behavioral unit tests for the Akasa kernel
         ├── __init__.py             # Unit test package initialization
+        ├── test_auth_credentials.py # Tests for the durable, stdlib-only credential store and the lazy boot token built on it
+        │   ├── class TestCredentialStore(unittest.TestCase) # credentials.py creates, reads, rotates and verifies the session token with owner-only files.
+        │   └── class TestBootToken(unittest.TestCase) # get_boot_token: an explicit environment token wins; otherwise the durable token under the daemon's control dir.
         ├── test_auth_peer_trust.py # Tests for peer classification, the localhost bootstrap route, the Host gate, and the forwarding-header rule
         │   ├── class TestPeerClassification(unittest.TestCase) # S1: classify_peer is the single source of truth for request origin and fails closed on any proxy signal.
         │   ├── class TestBootstrapAndHostGate(unittest.TestCase) # S1: /auth/bootstrap only grants localhost trust to direct loopback requests; the gate rejects foreign Hosts.
         │   └── class TestForwardedHeaderMembraneRule(unittest.TestCase) # S1: the FORWARDED_HEADER_MEMBRANE fitness rule keeps forwarding-header reads inside akasa/auth/peer.py.
         ├── test_kernel_hardening.py # Unit tests for RFC 0048 VFS micro-batching, idempotency, slotted AkasaURI, hook auth caching, and SQLite PRAGMAs
-        │   └── class TestAkasaKernelHardening(unittest.TestCase) # Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening (Refactors A–F).
+        │   └── class TestAkasaKernelHardening(unittest.TestCase) # [stale?] Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening (Refactors A–F).
         ├── test_settings_is_set.py # Tests that SettingsManager.is_set distinguishes saved values from schema defaults in every scope
         │   └── class TestSettingsIsSet(unittest.TestCase) # SettingsManager.is_set distinguishes saved values from schema defaults across every scope.
         ├── test_vfs_reset_drain.py # Tests that reset_state drains queued VFS writes before switching the daemon cwd

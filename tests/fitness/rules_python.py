@@ -1,4 +1,5 @@
 import os
+import sys
 import ast
 from pathlib import Path
 from .core import (
@@ -17,6 +18,24 @@ FORWARDED_CLIENT_HEADERS = frozenset({
     "x-forwarded-for", "x-real-ip", "forwarded",
     "http_x_forwarded_for", "http_x_real_ip", "http_forwarded",
 })
+
+
+def _is_credential_store(filepath) -> bool:
+    fp = Path(filepath)
+    return fp.name == "credentials.py" and fp.parent.name == "auth"
+
+
+def _check_credentials_import(filepath, lineno, module_name, level=0) -> None:
+    """CREDENTIALS_STDLIB_ONLY: the recovery server loads akasa/auth/credentials.py by path, so it may import only the standard library."""
+    top = (module_name or "").split(".")[0]
+    if level or top not in sys.stdlib_module_names:
+        shown = ("." * level) + (module_name or "")
+        report_violation(
+            "CREDENTIALS_STDLIB_ONLY",
+            filepath,
+            lineno,
+            f"akasa/auth/credentials.py imports '{shown}'. It must stay standard-library only so the lifeboat can load it when the rest of akasa cannot."
+        )
 
 
 def _is_peer_classifier(filepath) -> bool:
@@ -94,6 +113,8 @@ class KernelFitnessVisitor(ast.NodeVisitor):
 
     def visit_Import(self, node):
         for alias in node.names:
+            if _is_credential_store(self.filepath):
+                _check_credentials_import(self.filepath, node.lineno, alias.name)
             if alias.name.startswith('insetu'):
                 report_violation(
                     "ZERO_DOMAIN_LEAKAGE",
@@ -129,6 +150,8 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                         )
         self.generic_visit(node)
     def visit_ImportFrom(self, node):
+        if _is_credential_store(self.filepath):
+            _check_credentials_import(self.filepath, node.lineno, node.module, node.level)
         if node.module and node.module.startswith('insetu'):
             report_violation(
                 "ZERO_DOMAIN_LEAKAGE",

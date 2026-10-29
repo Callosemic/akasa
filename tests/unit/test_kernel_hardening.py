@@ -372,6 +372,19 @@ class TestAkasaKernelHardening(unittest.TestCase):
             out_ring2 = buf_ring2.getvalue()
             self.assertIn("KERNEL_TRANSPORT_ISOLATION", out_ring2)
             self.assertIn("STRICT_TOP_LEVEL_IMPORTS_MANDATE", out_ring2)
+
+            # 3. Credentials store importing non-stdlib or package modules
+            bad_cred_code = (
+                "import akasa\n"
+                "from flask import request\n"
+            )
+            cred_path = KERNEL_DIR / "auth" / "credentials.py"
+            cred_tree = ast.parse(bad_cred_code, filename=str(cred_path))
+            buf_cred = io.StringIO()
+            with contextlib.redirect_stdout(buf_cred):
+                KernelFitnessVisitor(cred_path, "credentials.py", is_test=False).visit(cred_tree)
+            out_cred = buf_cred.getvalue()
+            self.assertIn("CREDENTIALS_STDLIB_ONLY", out_cred)
         finally:
             FitnessState.violations_found = prev
 

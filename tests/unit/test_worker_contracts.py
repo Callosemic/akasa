@@ -16,7 +16,9 @@ from akasa.workers import (
     _execute_immediate_job,
     _execute_job,
     _init_worker_schema,
+    pause_job,
     register_callback,
+    submit_one_shot_job,
     validate_dag_chain_kwargs,
 )
 
@@ -248,6 +250,50 @@ class TestAkasaWorkerContracts(unittest.TestCase):
         fresh_conn = get_connection("workers", workspace_id=self.workspace_id)
         row = fresh_conn.execute("SELECT id FROM jobs WHERE id=?", ("job_recurring_123",)).fetchone()
         self.assertIsNone(row, "Job record must be purged from jobs table.")
+
+    def _run_claimed_job(self, job_id, callback_name, interval_ms):
+        conn = get_connection("workers", workspace_id=self.workspace_id)
+        conn.execute(
+            "INSERT OR REPLACE INTO jobs (id, ext_name, callback_name, interval_ms, status) VALUES (?, ?, ?, ?, 'running')",
+            (job_id, "contract_test", callback_name, interval_ms),
+        )
+        conn.commit()
+        _execute_job(
+            job_id=job_id,
+            ext_name="contract_test",
+            callback_name=callback_name,
+            interval_ms=interval_ms,
+            jitter_ms=0,
+            args_json="{}",
+            fallback_ws=self.workspace_id,
+        )
+        return get_connection("workers", workspace_id=self.workspace_id).execute(
+            "SELECT status, args_json FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()
+
+    def test_one_shot_job_resubmitted_while_running_is_not_deleted(self):
+        """A one-shot job re-submitted during its own run keeps the new submission (the debounced-compile pattern)."""
+        def resubmitting_callback(**kwargs):
+            submit_one_shot_job("debounced_1", "contract_test", "debounced_task", 2500,
+                                args_json=json.dumps({"events": ["new"]}), workspace_id=self.workspace_id)
+
+        register_callback("contract_test", "debounced_task", resubmitting_callback)
+        row = self._run_claimed_job("debounced_1", "debounced_task", 0)
+        self.assertIsNotNone(row, "The re-submitted job must survive the earlier run's cleanup.")
+        self.assertEqual(row["status"], "pending")
+        self.assertIn("new", row["args_json"])
+
+    def test_one_shot_job_is_deleted_after_a_normal_run(self):
+        register_callback("contract_test", "plain_task", lambda **kwargs: None)
+        self.assertIsNone(self._run_claimed_job("plain_1", "plain_task", 0))
+
+    def test_recurring_job_paused_while_running_stays_paused(self):
+        def pausing_callback(**kwargs):
+            pause_job("recurring_1", workspace_id=self.workspace_id)
+
+        register_callback("contract_test", "pausing_task", pausing_callback)
+        row = self._run_claimed_job("recurring_1", "pausing_task", 60000)
+        self.assertEqual(row["status"], "paused")
 
     @patch("akasa.workers.is_extension_enabled")
     def test_immediate_job_fails_safely_for_disabled_extension(self, mock_is_enabled):

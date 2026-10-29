@@ -4,7 +4,8 @@ from pathlib import Path
 # --- CONFIGURATION ---
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 KERNEL_DIR = PROJECT_ROOT / "akasa"
-VFS_WRITE_WHITELIST = ["vfs.py", "db.py", "state.py", "context.py", "utils.py", "__init__.py"]
+# credentials.py writes its own files: it must work when the VFS pipeline cannot start (CREDENTIALS_STDLIB_ONLY).
+VFS_WRITE_WHITELIST = ["vfs.py", "db.py", "state.py", "context.py", "utils.py", "__init__.py", "credentials.py"]
 SQLITE_WHITELIST = ["db.py"]
 FLASK_TRANSPORT_WHITELIST = ["__init__.py", "extension.py"]
 
