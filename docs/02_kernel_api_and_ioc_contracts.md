@@ -13,7 +13,7 @@ Host applications configure Akasa's spatial physics and runtime diagnostics thro
 | :--- | :--- | :--- |
 | `AKASA_CONTROL_DIR` | `".akasa"` | Name of the hidden control plane directory inside the workspace root and user home directory (`~/<control_dir>/master_key.txt`). |
 | `AKASA_CONFIG` | *Unset* | Optional absolute path override for the active workspace `config.json`. |
-| `AKASA_BOOT_TOKEN` | *Auto-generated* | 32-character hex runtime session token (`BOOT_TOKEN`). Anchored in `os.environ` to survive `os.execv()` and reloader restarts. |
+| `AKASA_BOOT_TOKEN` | *Auto-generated* | 32-character hex runtime session token (`BOOT_TOKEN`). When unset, lazily resolves to durable token in `<daemon cwd>/<control dir>/auth/session_token` via `credentials.py`. Anchored in `os.environ` to survive `os.execv()` and reloader restarts. |
 | `AKASA_DEBUG` | `"0"` | Set to `"1"` to enable verbose stdout telemetry for VFS physical writes, idempotency drops, and `vfs_mutated` broadcasts. |
 
 ---
@@ -172,6 +172,15 @@ ext_bp = AkasaExtension(
    * ctx.emit_merge_list(event_name, *args, **kwargs) -> List[Any]
    * ctx.emit_background(event_name, *args, **kwargs)
 5. URI, VFS Concurrency & Telemetry Primitives
+* Bottom-Layer Credential Store (akasa.auth.credentials):
+    * Standard library only; safe to load by file path via `importlib.util.spec_from_file_location` without importing `akasa`.
+    * auth_dir(control_dir) -> Path: Returns `<control_dir>/auth`.
+    * session_token_path(control_dir) -> Path: Returns the path of the durable session token.
+    * read_token(control_dir) -> Optional[str]: Returns stored token, tightening permissions if needed.
+    * load_or_create_token(control_dir) -> str: Returns durable session token, creating it race-safely (`O_CREAT | O_EXCL`, `0o600`) on first use.
+    * rotate_token(control_dir) -> str: Replaces session token with a new token and returns it.
+    * verify_token(presented, expected) -> bool: Constant-time comparison rejecting empty or non-string credentials.
+    * permission_problems(control_dir) -> List[str]: Reports paths accessible by group or other users (POSIX only).
 * Peer Classification & DNS-Rebinding Guard (akasa.auth.peer):
     * class PeerInfo: Slotted frozen dataclass (`remote_addr`, `client_ip`, `host`, `via_proxy`, `peer_is_loopback`, `host_is_loopback`, `is_direct_loopback`).
     * classify_peer(remote_addr, headers) -> PeerInfo: Single source of truth for request origin and fail-closed proxy classification.
