@@ -932,11 +932,14 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
             if jitter_ms and jitter_ms > 0:
                 actual_interval += random.randint(-jitter_ms, jitter_ms)
             conn = get_connection("workers", workspace_id=target_ws)
+            # Only settle the row this run claimed. If the job was re-submitted while it ran
+            # (submit_one_shot_job resets it to 'pending' with new args) or paused, that newer
+            # state wins: deleting or rescheduling it here would silently drop the new work.
             if interval_ms > 0:
                 next_run = time.time() + (actual_interval / 1000.0)
-                conn.execute("UPDATE jobs SET status='pending', next_run_at=? WHERE id=?", (next_run, job_id))
+                conn.execute("UPDATE jobs SET status='pending', next_run_at=? WHERE id=? AND status='running'", (next_run, job_id))
             else:
-                conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+                conn.execute("DELETE FROM jobs WHERE id=? AND status='running'", (job_id,))
             conn.commit()
         except Exception:
             pass

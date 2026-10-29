@@ -1,5 +1,4 @@
 import os
-import hmac
 import queue
 import threading
 from typing import Optional, Iterable, Tuple, Callable
@@ -20,7 +19,8 @@ import akasa.state as _akasa_state
 from akasa.state import register_core_module
 import akasa.workers as _akasa_workers
 import akasa.extension as _akasa_extension
-from akasa.auth import auth_bp, get_security_blueprint, BOOT_TOKEN
+from akasa.auth import auth_bp, get_security_blueprint, get_boot_token
+import akasa.auth.credentials as _akasa_credentials
 import akasa.auth.peer as _akasa_peer
 from akasa.auth.peer import classify_peer, is_host_allowed, register_proxy_header, register_allowed_host
 
@@ -180,7 +180,7 @@ def init_app(
             or request.headers.get("X-Akasa-Token")
             or request.args.get("token")
         )
-        if not client_token or not hmac.compare_digest(str(client_token), str(BOOT_TOKEN)):
+        if not _akasa_credentials.verify_token(client_token, get_boot_token()):
             return jsonify({"error": "401 Unauthorized: Invalid or missing execution credentials."}), 401
         return None
 
@@ -235,3 +235,10 @@ def reset_state(cwd: Optional[str] = None, control_dir: Optional[str] = None) ->
         set_daemon_cwd(cwd)
     if control_dir is not None:
         os.environ["AKASA_CONTROL_DIR"] = control_dir
+
+
+def __getattr__(name):
+    # Backwards compatibility: akasa.BOOT_TOKEN resolves the durable token on access.
+    if name == "BOOT_TOKEN":
+        return get_boot_token()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

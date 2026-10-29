@@ -4,6 +4,7 @@ import json
 import shutil
 import socket
 import secrets
+import threading
 from pathlib import Path
 from cryptography.fernet import Fernet, InvalidToken
 from flask import Blueprint, request, jsonify
@@ -13,6 +14,7 @@ from akasa.context import (
     get_control_dir_name,
     atomic_write_bytes,
 )
+from akasa.auth import credentials as _credentials
 from akasa.auth.peer import classify_peer, is_loopback_origin
 from akasa.hooks import hooks
 from akasa.state import (
@@ -178,12 +180,42 @@ def _on_security_settings_updated(workspace_id=None, **kwargs):
         except Exception as e:
             print(f"⚠️ [Security] Master key rotation rejected (invalid Fernet key): {e}")
     return {"requires_refresh": False}
-# Generate a cryptographically sound scrolling runtime session token
-# Anchor to the environment so it survives os.execv() and Werkzeug hot-reloads
-BOOT_TOKEN = os.environ.get("AKASA_BOOT_TOKEN")
-if not BOOT_TOKEN:
-    BOOT_TOKEN = secrets.token_hex(16)
-    os.environ["AKASA_BOOT_TOKEN"] = BOOT_TOKEN
+_BOOT_TOKEN_LOCK = threading.Lock()
+
+
+def get_boot_token() -> str:
+    """
+    The token the gate accepts. An explicit AKASA_BOOT_TOKEN wins; otherwise the durable session
+    token in <daemon cwd>/<control dir>/auth/ (created on first use), so devices stay signed in across
+    restarts and a recovery server reading the same file accepts them too. Resolved lazily, never at
+    import, so importing akasa writes nothing. Exported to the environment so os.execv() reboots and
+    Werkzeug reloads keep it; execute_binary strips it from child processes.
+    """
+    token = os.environ.get("AKASA_BOOT_TOKEN")
+    if token:
+        return token
+    with _BOOT_TOKEN_LOCK:
+        token = os.environ.get("AKASA_BOOT_TOKEN")
+        if token:
+            return token
+        control_dir = Path(get_daemon_cwd()).joinpath(get_control_dir_name())
+        try:
+            token = _credentials.load_or_create_token(control_dir)
+            for problem in _credentials.permission_problems(control_dir):
+                print(f"⚠️ [Auth] {problem}")
+        except OSError as e:
+            # Read-only or missing control dir: fall back to a per-process token rather than fail open.
+            print(f"⚠️ [Auth] Could not persist the session token ({e}); using a per-process token.")
+            token = secrets.token_hex(_credentials.TOKEN_BYTES)
+        os.environ["AKASA_BOOT_TOKEN"] = token
+        return token
+
+
+def __getattr__(name):
+    # Backwards compatibility: `from akasa.auth import BOOT_TOKEN` resolves the token on access.
+    if name == "BOOT_TOKEN":
+        return get_boot_token()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 @auth_bp.route('/auth/bootstrap', methods=['POST'])
 def bootstrap():
     """Unauthenticated token exchange gate supporting absolute dynamic fallback routing."""
@@ -206,7 +238,7 @@ def bootstrap():
 
         return jsonify({
             "status": "authenticated", 
-            "token": BOOT_TOKEN, 
+            "token": get_boot_token(), 
             "method": "localhost"
         })
     cfg = load_config()
@@ -224,7 +256,7 @@ def bootstrap():
     if auth_res:
         return jsonify({
             "status": "authenticated", 
-            "token": BOOT_TOKEN, 
+            "token": get_boot_token(), 
             "method": auth_res.get("method", "hook"),
             "user": auth_res.get("user")
         })
@@ -235,7 +267,7 @@ def bootstrap():
     if system_token and client_token and hmac.compare_digest(str(client_token), str(system_token)):
         return jsonify({
             "status": "authenticated", 
-            "token": BOOT_TOKEN, 
+            "token": get_boot_token(), 
             "method": "static_config"
         })
 
