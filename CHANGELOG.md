@@ -2,6 +2,18 @@
 
 <!-- version list -->
 
+## v0.5.0 (2026-10-29)
+
+### Features
+
+- **auth**: Add durable stdlib credential store, lazy boot token gate, and guarded worker execution
+  settlement
+  ([`baf5c0d`](https://github.com/Callosemic/akasa/commit/baf5c0d22b0411fdae78ff2c9adccd2cd9481989))
+
+- **auth**: Durable stdlib credential store, lazy boot token, and guarded worker settlement
+  ([`202db33`](https://github.com/Callosemic/akasa/commit/202db33053d3cbb07351bc2ce65128306a1bed80))
+
+
 ## v0.4.0 (2026-10-29)
 
 ### Features
