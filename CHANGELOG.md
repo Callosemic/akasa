@@ -2,6 +2,25 @@
 
 <!-- version list -->
 
+## v0.4.0 (2026-10-29)
+
+### Features
+
+- Fail-closed peer classification, dns-rebinding host gate, dag wavefronts, and worker quiesce
+  ([`729ce08`](https://github.com/Callosemic/akasa/commit/729ce08f0ca72e3acc3426a13173954706e56eac))
+
+- **auth**: Add peer classification, host validation gate, forwarded header membrane, and test
+  sandbox quiescence
+  ([`d7ba088`](https://github.com/Callosemic/akasa/commit/d7ba0884ec88b4a6dd4ef5f195650a96825132f6))
+
+- **kernel**: Implement 5-ring acyclic dag, execution-frame contextvars, inter-process file locking,
+  and causal parsed-object caching
+  ([`7331e32`](https://github.com/Callosemic/akasa/commit/7331e3252ab2043b295d104e54a73b3a043211d1))
+
+- **tests**: Codify 5-ring acyclic dag ast fitness rules and expand kernel verification suite
+  ([`b808e94`](https://github.com/Callosemic/akasa/commit/b808e94e5d39e11b569dbc0fba1286a87f5f073d))
+
+
 ## v0.3.0 (2026-10-26)
 
 ### Features
