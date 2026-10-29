@@ -1,0 +1,23 @@
+# Runs the shared Callosemic stack battery (akasa -> sutram -> insetu) on every push to main.
+# The battery itself lives in insetu/.github/workflows/battery.yml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.repository }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  battery:
+    uses: Callosemic/insetu/.github/workflows/battery.yml@main
+    with:
+      trigger_repo: akasa
+      trigger_sha: ${{ github.sha }}
+    secrets: inherit

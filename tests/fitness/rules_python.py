@@ -11,6 +11,19 @@ from .core import (
     report_violation,
     collect_unique_files,
 )
+# Client-identity forwarding headers (HTTP and WSGI spellings). Only akasa/auth/peer.py may read them,
+# so every trust decision about where a request came from flows through classify_peer().
+FORWARDED_CLIENT_HEADERS = frozenset({
+    "x-forwarded-for", "x-real-ip", "forwarded",
+    "http_x_forwarded_for", "http_x_real_ip", "http_forwarded",
+})
+
+
+def _is_peer_classifier(filepath) -> bool:
+    fp = Path(filepath)
+    return fp.name == "peer.py" and fp.parent.name == "auth"
+
+
 def _resolve_module_key(filepath: Path) -> str:
     try:
         rel = filepath.resolve().relative_to(KERNEL_DIR.resolve())
@@ -146,6 +159,13 @@ class KernelFitnessVisitor(ast.NodeVisitor):
     def visit_Constant(self, node):
         if isinstance(node.value, str):
             val = node.value.lower()
+            if not self.is_test and val.strip() in FORWARDED_CLIENT_HEADERS and not _is_peer_classifier(self.filepath):
+                report_violation(
+                    "FORWARDED_HEADER_MEMBRANE",
+                    self.filepath,
+                    node.lineno,
+                    f"Forwarding header '{node.value}' read outside akasa/auth/peer.py. Use classify_peer() so proxy trust stays fail-closed and rightmost-hop."
+                )
             if ".insetu" in val or "insetu_" in val:
                 report_violation(
                     "DYNAMIC_SPATIAL_PHYSICS", 

@@ -1,17 +1,37 @@
 # akasa/pyproject.toml
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=77.0"]
 build-backend = "setuptools.build_meta"
 [project]
 name = "akasa"
 version = "0.3.0"
 description = "Agnostic Volume Router and Event Bus Substrate."
 readme = "README.md"
+authors = [{ name = "Akasa Contributors", email = "hello@insetu.dev" }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Framework :: Flask",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
 dependencies = [
     "Flask>=3.0.0",
     "cryptography>=41.0.0"
 ]
+
+[project.urls]
+Homepage = "https://github.com/Callosemic/akasa"
+Repository = "https://github.com/Callosemic/akasa.git"
+Documentation = "https://github.com/Callosemic/akasa#readme"
+"Bug Tracker" = "https://github.com/Callosemic/akasa/issues"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["akasa", "akasa.*"]

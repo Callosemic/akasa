@@ -12,19 +12,33 @@ akasa/
 │   ├── __init__.py                 # Ring 4: Two-phase bootloader and WSGI transport adapter
 │   │   ├── def tune_process_resources() # Tier 1 OS Resource Governance: Raises file descriptor limits, bounds glibc arenas, and caps thread stack size.
 │   │   ├── class ForceHTTPSProxyFix # WSGI Middleware to force HTTPS scheme when behind reverse proxies or trusted tunnel suffixes.
-│   │   ├── def configure(control_dir, trusted_namespaces, extension_namespaces, core_modules, ...) # Phase A: Headless-safe process & HookRegistry physics configuration.
-│   │   ├── def init_app(app, token_header, public_routes, public_prefixes, ...) # Phase B: Wires Flask transport, authentication gate, DB connection teardown, and optional SSE stream.
+│   │   ├── def configure(control_dir, trusted_namespaces, extension_namespaces, core_modules, ...) # [stale?] Phase A: Headless-safe process & HookRegistry physics configuration.
+│   │   ├── def init_app(app, token_header, public_routes, public_prefixes, ...) # [stale?] Phase B: Wires Flask transport, authentication gate, DB connection teardown, and optional SSE stream.
 │   │   ├── def boot(skip_if_reloader_parent) # Ignites the Akasa kernel lifecycle (DB migrations, VFS write pipeline, and Worker Metronome).
-│   │   └── def reset_state(cwd, control_dir) # First-class test harness reset: delegates to each Ring subsystem's reset() contract.
+│   │   └── def reset_state(cwd, control_dir) # [stale?] First-class test harness reset: delegates to each Ring subsystem's reset() contract.
 │   ├── auth/                       # Ring 4: Authentication blueprint, token exchange, and Fernet encryption
-│   │   └── __init__.py             # Authentication and Fernet key rotation endpoints
-│   │       ├── def get_master_key() # Loads or generates the global Fernet master key.
-│   │       ├── def ensure_master_key_on_disk() # Synchronously guarantees the Fernet master key exists on disk.
-│   │       ├── def encrypt_secret(val) # Encrypts a plaintext string using the active Fernet master key.
-│   │       ├── def decrypt_secret(val) # Decrypts a v1: Fernet token string with fallback key support.
-│   │       ├── def rotate_master_key(new_key_str) # Validates a new Fernet key, re-encrypts all workspace secrets.json files, and updates master_key.txt.
-│   │       ├── def get_security_blueprint() # Lazily instantiates and returns the core security AkasaExtension blueprint.
-│   │       └── def bootstrap()     # Unauthenticated token exchange gate supporting absolute dynamic fallback routing.
+│   │   ├── __init__.py             # Authentication and Fernet key rotation endpoints
+│   │   │   ├── def get_master_key() # Loads or generates the global Fernet master key.
+│   │   │   ├── def ensure_master_key_on_disk() # Synchronously guarantees the Fernet master key exists on disk.
+│   │   │   ├── def encrypt_secret(val) # Encrypts a plaintext string using the active Fernet master key.
+│   │   │   ├── def decrypt_secret(val) # Decrypts a v1: Fernet token string with fallback key support.
+│   │   │   ├── def rotate_master_key(new_key_str) # Validates a new Fernet key, re-encrypts all workspace secrets.json files, and updates master_key.txt.
+│   │   │   ├── def get_security_blueprint() # Lazily instantiates and returns the core security AkasaExtension blueprint.
+│   │   │   └── def bootstrap()     # [stale?] Unauthenticated token exchange gate supporting absolute dynamic fallback routing.
+│   │   └── peer.py                 # Ring 4 peer classifier: fail-closed proxy detection, trusted client IP, Host and Origin validation
+│   │       ├── def register_proxy_header() # DI Interface: Registers additional headers whose presence marks a request as proxied (case-insensitive).
+│   │       ├── def get_proxy_headers() # Returns the lowercase forwarding header names that mark a request as proxied.
+│   │       ├── def register_allowed_host() # DI Interface: Registers exact hostnames (no port) accepted by Host validation, e.g.
+│   │       ├── def get_allowed_hosts() # Returns the registered exact-match hostnames.
+│   │       ├── def reset()         # Resets Ring 0 context state for isolated test harnesses.
+│   │       ├── def parse_ip(value) # Parses an IP literal, tolerating IPv6 brackets, an IPv4 ':port' suffix, and IPv4-mapped IPv6.
+│   │       ├── def is_loopback_ip(value) # True for 127.0.0.0/8, ::1, and IPv4-mapped loopback addresses.
+│   │       ├── def normalize_hostname(value) # Lowercases a Host header value and strips any port, IPv6 brackets, and a trailing root dot.
+│   │       ├── def rightmost_forwarded_ip(forwarded_for) # Returns the rightmost valid IP in an X-Forwarded-For value, or '' when absent or malformed.
+│   │       ├── class PeerInfo      # Immutable classification of a request's origin.
+│   │       ├── def classify_peer(remote_addr, headers) # Classifies a request from its socket peer address and headers.
+│   │       ├── def is_host_allowed(host, trusted_suffixes, allowed_hosts) # DNS-rebinding guard: accepts loopback hostnames, exact registered hosts, and hosts under a trusted suffix.
+│   │       └── def is_loopback_origin(url_str) # True when an Origin/Referer URL points at a loopback hostname (port ignored).
 │   ├── context.py                  # Ring 0: Pure stdlib execution context (ExecutionFrame), atomic file writes, and stateless utilities
 │   │   ├── class ExecutionFrame    # Immutable-style slotted execution frame bound to contextvars across HTTP, IPC, Worker, and CLI calls.
 │   │   ├── def execution_frame(workspace_id, transport, method, payload, ...) # Context manager binding an active ExecutionFrame for transport-agnostic tenant and payload resolution.
@@ -53,6 +67,9 @@ akasa/
 │   │   ├── def is_subpath(child_path, parent_path) # Returns True if child_path resolves inside or equal to parent_path without prefix collision.
 │   │   ├── def build_tree_dict(file_paths) # Builds a nested dictionary representing a directory hierarchy from a list of file paths.
 │   │   ├── def generate_ascii_tree(file_paths) # Renders an ASCII directory tree string from a list of file paths.
+│   │   ├── def resolve_dag_wavefronts(items, id_key, parents_key, order_key) # Compiles a list of node dictionaries into level-order topological wavefronts (generations) using stdlib graphlib.TopologicalSorter.
+│   │   ├── def extract_template_variables(text) # Scans text for {{ var }} or {{ var | default }} placeholders (including {{ macro_var }}), ignoring system multipliers and wordcount tags.
+│   │   ├── def interpolate_template_variables(text, values, resolver) # Inside-out template variable interpolator for {{ var }}, {{ var | fallback_var | default }}, and nested {{ var | {{ fallback }} }} placehold...
 │   │   └── def reset()             # Resets Ring 0 context state for isolated test harnesses.
 │   ├── db.py                       # Ring 2: Thread-local SQLite connection pool and WAL schema migrations
 │   │   ├── def set_db_physics_resolvers(physics_fn, all_workspaces_fn) # DI Interface: Ring 2 state module binds workspace physics resolvers so db.py has zero upward dependencies.
@@ -135,7 +152,7 @@ akasa/
 │   │   ├── def set_vfs_artifact_path_resolver(resolver_fn) # DI Interface: Ring 2 state module binds resolve_system_artifact_path so vfs.py has zero upward dependencies.
 │   │   ├── def has_pending_vfs_write(resolved_path) # Returns True if resolved_path currently has an un-flushed write in _VFS_PENDING_WRITES.
 │   │   ├── def read_cached_physical_text(resolved_path, bypass_read_cache) # Unified Ring 2 Read-Your-Writes primitive: Inspects _VFS_PENDING_WRITES first (returning (-seq, content)), then _VFS_READ_CACHE (verifying s...
-│   │   ├── def reset()             # Purges VFS read cache, pending write overlay, and ancestor ring buffer for isolated test harnesses.
+│   │   ├── def reset()             # [stale?] Purges VFS read cache, pending write overlay, and ancestor ring buffer for isolated test harnesses.
 │   │   ├── def compute_vfs_sha256(text) # [comment required]
 │   │   ├── def record_vfs_ancestor(workspace_id, filepath_or_resolved, text, text_hash) # [comment required]
 │   │   ├── def lookup_vfs_ancestor(workspace_id, filepath_or_resolved, base_hash, fallback_base_content) # [comment required]
@@ -179,7 +196,7 @@ akasa/
 │           ├── def register_ephemeral_artifact(filepath, owner, ttl_seconds, workspace_id) # [comment required]
 │           ├── def sweep_ephemeral_artifacts(workspace_id) # Sweeps and deletes expired temporary files and old immediate jobs.
 │           ├── def get_active_pipeline_modules(workspace_id) # Fast, single-query helper returning active_modules, pending_modules, and is_pipeline_active without scanning vfs_event_log or firing manifes...
-│           ├── def reset()         # Resets Ring 0 context state for isolated test harnesses.
+│           ├── def reset()         # [stale?] Resets Ring 0 context state for isolated test harnesses.
 │           ├── def start_workers(**kwargs) # [comment required]
 │           └── def stop_workers(**kwargs) # [comment required]
 ├── docs/                           # Architectural documentation and standards
@@ -187,15 +204,19 @@ akasa/
 │   ├── 01_engineering_standards.md # Core engineering standards and audit guardrails
 │   ├── 02_kernel_api_and_ioc_contracts.md # External SDK, DI, and IoC hook interface contracts
 │   └── adrs/                       # Architectural Decision Records (ADRs)
-│       ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001 specification
-│       ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
-│       ├── 0003_openapi_reflection_dag_orchestration_and_error_hooks.md # ADR 0003 specification
 │       ├── 0004_vfs_bulk_mutation_batching_and_atomic_consolidation.md # ADR 0004 specification
-│       ├── 0005_parallel_dag_orchestration_vfs_ram_caching_and_inter_workspace_routing.md # ADR 0005 specification
 │       ├── 0006_resource_governance_bounded_executors_and_secret_lifecycle.md # ADR 0006 specification
 │       ├── 0007_kernel_bootloader_vfs_3way_merge_and_substrate_purity.md # ADR 0007 kernel bootloader, 3-way VFS merge, and substrate purity specification
 │       ├── 0008_microbatched_vfs_dual_pool_workers_and_ipc_gateway.md # ADR 0008 micro-batched VFS commits, dual-pool workers, signature validation, and IPC gateway specification
-│       └── 0009_5ring_acyclic_dag_execution_frame_and_causal_state_caching.md # ADR 0009 5-ring acyclic DAG, ExecutionFrame contextvars, and causal state caching specification
+│       ├── 0009_5ring_acyclic_dag_execution_frame_and_causal_state_caching.md # ADR 0009 5-ring acyclic DAG, ExecutionFrame contextvars, and causal state caching specification
+│       ├── 0010_fail_closed_peer_trust_dns_rebinding_gate_and_dag_wavefronts.md # ADR 0010: Fail-Closed Peer Classification, DNS-Rebinding Host Gate, Topological DAG Wavefronts, and Test Sandbox Quiescing
+│       ├── archived/               # Baseline architectural decisions assimilated into kernel
+│       │   ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001 specification
+│       │   └── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
+│       └── superseded/             # Obsolete architectural decisions replaced by newer ADRs
+│           ├── .gitkeep            # Git preservation marker
+│           ├── 0003_openapi_reflection_dag_orchestration_and_error_hooks.md # ADR 0003 specification
+│           └── 0005_parallel_dag_orchestration_vfs_ram_caching_and_inter_workspace_routing.md # ADR 0005 specification
 ├── pyproject.toml                  # Build system specification and dependencies
 └── tests/                          # Architectural fitness tests and unit test suite
     ├── fitness/                    # Fitness rule package directory
@@ -212,8 +233,18 @@ akasa/
     ├── run_unit_tests.py           # CLI runner for Akasa kernel behavioral unit tests
     └── unit/                       # Behavioral unit tests for the Akasa kernel
         ├── __init__.py             # Unit test package initialization
+        ├── test_auth_peer_trust.py # Tests for peer classification, the localhost bootstrap route, the Host gate, and the forwarding-header rule
+        │   ├── class TestPeerClassification(unittest.TestCase) # S1: classify_peer is the single source of truth for request origin and fails closed on any proxy signal.
+        │   ├── class TestBootstrapAndHostGate(unittest.TestCase) # S1: /auth/bootstrap only grants localhost trust to direct loopback requests; the gate rejects foreign Hosts.
+        │   └── class TestForwardedHeaderMembraneRule(unittest.TestCase) # S1: the FORWARDED_HEADER_MEMBRANE fitness rule keeps forwarding-header reads inside akasa/auth/peer.py.
         ├── test_kernel_hardening.py # Unit tests for RFC 0048 VFS micro-batching, idempotency, slotted AkasaURI, hook auth caching, and SQLite PRAGMAs
         │   └── class TestAkasaKernelHardening(unittest.TestCase) # Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening (Refactors A–F).
-        └── test_worker_contracts.py # Unit tests for signature-driven worker validation, DAG chains, and envelope isolation
-            └── class TestAkasaWorkerContracts(unittest.TestCase) # [comment required]
+        ├── test_settings_is_set.py # Tests that SettingsManager.is_set distinguishes saved values from schema defaults in every scope
+        │   └── class TestSettingsIsSet(unittest.TestCase) # SettingsManager.is_set distinguishes saved values from schema defaults across every scope.
+        ├── test_vfs_reset_drain.py # Tests that reset_state drains queued VFS writes before switching the daemon cwd
+        │   └── class TestVfsResetDrain(unittest.TestCase) # reset_state() drains queued VFS writes first, so they land under the cwd they were queued for.
+        ├── test_worker_contracts.py # Unit tests for signature-driven worker validation, DAG chains, and envelope isolation
+        │   └── class TestAkasaWorkerContracts(unittest.TestCase) # [comment required]
+        └── test_workers_reset_quiesce.py # Tests that reset_state stops the metronome and job pools so no background thread outlives its sandbox
+            └── class TestWorkersResetQuiesce(unittest.TestCase) # reset_state() stops the metronome and job pools so no background thread outlives its sandbox.
 ```
