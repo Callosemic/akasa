@@ -1,7 +1,8 @@
 # ADR 0002: Thread-Safe Caching, SSE Event Bus, and Non-Blocking VFS Barriers
 
-* **Status:** Accepted
+* **Status:** Archived (Baseline Implemented)
 * **Date:** 2026-09-21
+* **Archived Date:** 2026-10-28
 * **Scope:** Akasa Micro-Kernel Architecture & Extension SDK
 
 ## Context

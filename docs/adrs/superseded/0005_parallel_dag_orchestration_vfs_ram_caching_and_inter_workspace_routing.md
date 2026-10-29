@@ -1,7 +1,8 @@
 # ADR 0005: Parallel DAG Orchestration, In-Memory VFS Read Caching, and Inter-Workspace Routing
 
-* **Status:** Accepted
+* **Status:** Superseded by [ADR 0006](../0006_resource_governance_bounded_executors_and_secret_lifecycle.md), [ADR 0008](../0008_microbatched_vfs_dual_pool_workers_and_ipc_gateway.md), and [ADR 0010](../0010_fail_closed_peer_trust_dns_rebinding_gate_and_dag_wavefronts.md)
 * **Date:** 2026-10-18
+* **Superseded Date:** 2026-10-28
 * **Scope:** Akasa Micro-Kernel Architecture, VFS Pipeline, Worker Metronome, & Connection Pool
 
 ## Context

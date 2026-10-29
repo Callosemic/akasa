@@ -23,8 +23,8 @@ Host applications configure Akasa's spatial physics and runtime diagnostics thro
 Host applications can wire the full Tier 1 kernel lifecycle via the top-level `akasa` module:
 
 * **`akasa.tune_process_resources()`**: Raises `RLIMIT_NOFILE` to 65,536, bounds glibc arenas (`MALLOC_ARENA_MAX=2`), and sets thread stack size to 1 MB.
-* **`akasa.configure(...)`**: Phase A headless configuration setting control directory, trusted namespaces, extension namespaces, core modules, SSE passthrough events, and trusted tunnel suffixes.
-* **`akasa.init_app(app: Flask, ...)`**: Phase B transport wiring. Attaches `ForceHTTPSProxyFix`, mounts authentication blueprints (`auth_bp`, `security_bp`), sets up `@app.teardown_appcontext` SQLite connection purging, injects anti-caching response headers, enforces token gates, and mounts optional SSE streaming routes.
+* **`akasa.configure(control_dir, proxy_headers=(), allowed_hosts=(), ...)`**: Phase A headless configuration setting control directory, trusted namespaces, extension namespaces, core modules, SSE passthrough events, trusted tunnel suffixes, additional proxy headers, and allowed hostnames.
+* **`akasa.init_app(app: Flask, enforce_host_validation=True, ...)`**: Phase B transport wiring. Attaches `ForceHTTPSProxyFix`, mounts authentication blueprints (`auth_bp`, `security_bp`), enforces DNS-rebinding Host header validation (`421 Misdirected Request`), sets up `@app.teardown_appcontext` SQLite connection purging, injects anti-caching response headers, enforces token gates, and mounts optional SSE streaming routes.
 * **`akasa.boot(skip_if_reloader_parent=False)`**: Fires `hooks.emit('system_boot')`, gracefully bypassing parent processes during Werkzeug debug reloads.
 * **`akasa.reset_state(cwd=None, control_dir=None)`**: Closes pooled database handles, purges JSON/VFS/Ancestor RAM caches, and resets workspace state for isolated test harnesses.
 
@@ -64,7 +64,7 @@ Because Akasa adheres to the **Blind Substrate Mandate**, the host application i
 
 | Hook Name | Kwargs Passed by Akasa | Expected Host Return Value |
 | :--- | :--- | :--- |
-| `execute_identity_handshake` | `request`, `client_ip: str`, `config: dict`, `workspace_id: str` | `{"status": "authenticated", "method": str, "user": Optional[str]}` or `None`. |
+| `execute_identity_handshake` | `request`, `peer: PeerInfo`, `client_ip: str`, `config: dict`, `workspace_id: str` | `{"status": "authenticated", "method": str, "user": Optional[str]}` or `None`. |
 | `is_trusted_origin` | `url: str`, `hostname: str`, `workspace_id: str` | `bool` (`True` if the `Origin`/`Referer` hostname is permitted during localhost bootstrap). |
 | `mutate_workspace_config` | `cfg: dict` (positional arg 0), `workspace_id: str` | Mutates `cfg` in-place prior to caching in `load_config()`. |
 | `request_paths` | `workspace_id: str` | `Dict[str, str]` of domain directory paths merged into `ctx.paths`. |
@@ -154,7 +154,8 @@ ext_bp = AkasaExtension(
    * .write_scratch(filename: str, content: str, ttl_seconds: int = 3600, owner: Optional[str] = None) -> str: Atomically writes an ephemeral scratch buffer inside the tenant cache directory and registers it for TTL cleanup.
    * .register_ephemeral(filepath, ttl_seconds=3600, owner=None), .get_ephemerals(owner=None) -> List[str], .clear_ephemerals(owner=None)
  * Settings & JSON Store:
-   * ctx.settings (SettingsManager): .get(key, default=None, repo=None, mask_secrets=False), .set(key, value, repo=None), .get_all(repo=None, mask_secrets=False), .update(payload_dict, repo=None).
+   * ctx.settings (SettingsManager): .get(key, default=None, repo=None, mask_secrets=False), .is_set(key, repo=None) -> bool, .set(key, value, repo=None), .get_all(repo=None, mask_secrets=False), .update(payload_dict, repo=None).
+   * ctx.get_registered_capabilities() -> Dict[str, Dict[str, Any]]: Returns a shallow copy of the capability registry.
    * ctx.store (StoreManager): .get(filename, key, default=None), .set(filename, key, value) (persisted in <tenant_control_dir>/data/<ext_name>/<filename>).
  * Subprocess Execution (ctx.exec -> ProcessManager):
    * Resolves binaries via execute_binary across system PATH, active virtual environments, and python module CLI fallbacks.
@@ -171,7 +172,17 @@ ext_bp = AkasaExtension(
    * ctx.emit_merge_list(event_name, *args, **kwargs) -> List[Any]
    * ctx.emit_background(event_name, *args, **kwargs)
 5. URI, VFS Concurrency & Telemetry Primitives
-* ExecutionFrame & Context Primitives (akasa.context):
+* Peer Classification & DNS-Rebinding Guard (akasa.auth.peer):
+    * class PeerInfo: Slotted frozen dataclass (`remote_addr`, `client_ip`, `host`, `via_proxy`, `peer_is_loopback`, `host_is_loopback`, `is_direct_loopback`).
+    * classify_peer(remote_addr, headers) -> PeerInfo: Single source of truth for request origin and fail-closed proxy classification.
+    * is_host_allowed(host, trusted_suffixes, allowed_hosts) -> bool: DNS-rebinding validation against loopback, exact hosts, and trusted suffixes.
+    * is_loopback_origin(url_str) -> bool: Verifies whether Origin/Referer URLs resolve to loopback hostnames.
+    * register_proxy_header(*names) / get_proxy_headers(): Registers additional proxy header names.
+    * register_allowed_host(*hosts) / get_allowed_hosts(): Registers exact-match allowed hostnames.
+* ExecutionFrame, DAG Wavefront & Context Primitives (akasa.context):
+    * resolve_dag_wavefronts(items, id_key="id", parents_key="depends_on", order_key="order") -> List[List[Dict]]: Level-order topological wavefront sorting using stdlib `graphlib.TopologicalSorter`.
+    * extract_template_variables(text) -> List[Dict]: Extracts template parameters with default/required annotations.
+    * interpolate_template_variables(text, values=None, resolver=None) -> str: Resolves inside-out template placeholders with fallbacks.
     * class ExecutionFrame: Slotted immutable execution context bound to contextvars across HTTP, IPC, Worker, and CLI transports.
     * execution_frame(workspace_id=None, transport="CLI", method="CALL", payload=None, job_id=None): Context manager binding an active ExecutionFrame.
     * get_current_frame() -> Optional[ExecutionFrame]: Returns active frame or None.

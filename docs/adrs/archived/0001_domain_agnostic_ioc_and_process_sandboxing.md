@@ -1,7 +1,8 @@
 # ADR 0001: Domain-Agnostic Inversion of Control & Process Sandboxing
 
-* **Status:** Accepted
+* **Status:** Archived (Baseline Implemented)
 * **Date:** 2026-09-17
+* **Archived Date:** 2026-10-28
 * **Scope:** Akasa Kernel Architecture & Extension SDK
 
 ## Context

@@ -1,7 +1,8 @@
 # ADR 0003: OpenAPI Reflection, DAG Step Orchestration, and System Error Hooks
 
-* **Status:** Accepted
+* **Status:** Superseded by [ADR 0010](../0010_fail_closed_peer_trust_dns_rebinding_gate_and_dag_wavefronts.md)
 * **Date:** 2026-09-24
+* **Superseded Date:** 2026-10-28
 * **Scope:** Akasa Micro-Kernel Architecture, Extension SDK, & Worker Engine
 
 ## Context
