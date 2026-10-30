@@ -194,3 +194,17 @@ To prevent test suite bloat while maximizing defect prevention across the kernel
 
 
 
+---
+
+## 8. Security Substrate
+
+Akasa holds the parts of security that must keep working when the host application cannot: the credential store, the token gate and the VFS write guard. All three stay domain-agnostic; hosts register their own specifics.
+
+* **Stdlib-Only Credential Store (`CREDENTIALS_STDLIB_ONLY`)**: `akasa/auth/credentials.py` imports only the standard library and nothing from the rest of akasa, so a host's recovery server can load it by file path (`importlib.util.spec_from_file_location`) even when `akasa/__init__.py` cannot be imported. It writes its own files and is the one exception to `ASYNC_VFS_PIPELINE_COMPLIANCE` outside the VFS modules.
+* **Durable, Lazy Session Token (`get_boot_token`)**: The token lives in `<daemon cwd>/<control dir>/auth/session_token`, created on first use with `O_EXCL` and owner-only permissions (directory `0700`, file `0600`), never at import time. An explicit `AKASA_BOOT_TOKEN` environment value overrides it. `BOOT_TOKEN` remains as a lazily resolved compatibility alias. If the control directory is not writable, the gate falls back to a per-process token rather than failing open.
+* **Constant-Time, Fail-Closed Verification**: The gate compares credentials only through `credentials.verify_token`, which uses `hmac.compare_digest` and never accepts an empty or missing value.
+* **Deny-by-Default Gate (`init_app`)**: The Host check (DNS-rebinding guard) runs before the public allowlist, and every path not on the host's exact-route or prefix allowlist needs the token. Hosts should not use suffix exemptions: a suffix opens every route whose last path segment comes from the caller.
+* **Protected VFS Targets (`register_protected_vfs_targets`)**: Hosts register `(namespace, basename)` pairs for files the VFS must never replace. Matching is by whole path segments, and the guard also refuses paths that would shadow the file at import time: a same-named package directory, compiled or extension-module variants, and `__pycache__` entries. Refusal messages are generic and name no host files (`SUBSTRATE_PURITY_VIOLATION`).
+* **Child Process Hygiene**: `execute_binary` removes `AKASA_BOOT_TOKEN` from every child environment, including environments passed explicitly.
+* **MCP Exposure Flag**: `AkasaExtension.route(..., mcp_expose=False)` records that a capability must not be offered to machine clients. Akasa only records the flag; the host's MCP server must enforce it in both listing and calling.
+* **Settled Job State**: A finished worker only deletes or reschedules its own job row if the row is still the one it claimed (`status='running'`), so a job re-submitted or paused during its run keeps the newer state.

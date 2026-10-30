@@ -23,7 +23,7 @@ Host applications configure Akasa's spatial physics and runtime diagnostics thro
 Host applications can wire the full Tier 1 kernel lifecycle via the top-level `akasa` module:
 
 * **`akasa.tune_process_resources()`**: Raises `RLIMIT_NOFILE` to 65,536, bounds glibc arenas (`MALLOC_ARENA_MAX=2`), and sets thread stack size to 1 MB.
-* **`akasa.configure(control_dir, proxy_headers=(), allowed_hosts=(), ...)`**: Phase A headless configuration setting control directory, trusted namespaces, extension namespaces, core modules, SSE passthrough events, trusted tunnel suffixes, additional proxy headers, and allowed hostnames.
+* **`akasa.configure(control_dir, proxy_headers=(), allowed_hosts=(), protected_vfs_targets=(), ...)`**: Phase A headless configuration setting control directory, trusted namespaces, extension namespaces, core modules, SSE passthrough events, trusted tunnel suffixes, additional proxy headers, allowed hostnames, and host-protected VFS targets.
 * **`akasa.init_app(app: Flask, enforce_host_validation=True, ...)`**: Phase B transport wiring. Attaches `ForceHTTPSProxyFix`, mounts authentication blueprints (`auth_bp`, `security_bp`), enforces DNS-rebinding Host header validation (`421 Misdirected Request`), sets up `@app.teardown_appcontext` SQLite connection purging, injects anti-caching response headers, enforces token gates, and mounts optional SSE streaming routes.
 * **`akasa.boot(skip_if_reloader_parent=False)`**: Fires `hooks.emit('system_boot')`, gracefully bypassing parent processes during Werkzeug debug reloads.
 * **`akasa.reset_state(cwd=None, control_dir=None)`**: Closes pooled database handles, purges JSON/VFS/Ancestor RAM caches, and resets workspace state for isolated test harnesses.
@@ -50,6 +50,7 @@ Because Akasa adheres to the **Blind Substrate Mandate**, the host application i
 * **`mount_volume(workspace_id: str, scheme: str, volume: str, physical_target: str)`**: Maps a logical `(workspace_id, scheme, volume)` tuple in `_MOUNT_TABLE` to a physical host directory.
 * **`register_driver(scheme: str, driver_instance: Any, volume: Optional[str] = None)`**: Registers a custom VFS resolution driver (implementing `.resolve(uri_obj, workspace_id, physical_target) -> Optional[str]`) for an entire URI scheme (e.g., `'ctx'`) or a specific `(scheme, volume)` pair.
 * **`set_mount_authorizer(authorizer_fn: Callable)`**: Injects the bilateral peer-to-peer mount policy evaluator `authorizer_fn(target_ws: str, subscriber_ws: str, domain: str, rel_path: str) -> bool` governing read-only `ws://<target_ws>/<domain>/<rel_path>` virtual mounts.
+* **`register_protected_vfs_targets(*targets: Union[str, Tuple[str, str]])`**: DI Interface registering host-protected (namespace, basename) targets or paths that VFS mutations (`save`, `delete`, `move`, `bulk`) are prohibited from modifying or shadowing at Python import time.
 
 ### 2.3 Flask Blueprints & WSGI Teardown
 * **`auth_bp` (`akasa.auth`)**: Exposes `POST /auth/bootstrap` for localhost, IoC hook (`execute_identity_handshake`), and static token authentication handshakes.
@@ -204,6 +205,7 @@ ext_bp = AkasaExtension(
  * Event Bus Barrier (akasa.hooks):
    * hooks.sync_event_bus_barrier(timeout: float = 5.0) -> bool: Awaits completion of all queued background event bus handlers.
  * VFS OCC & 3-Way Merge (akasa.vfs, akasa.state):
+   * drain_write_queue(timeout: float = 5.0) -> None: Blocks until every queued VFS write has reached physical disk; logs warnings on timeout without raising.
    * read_cached_physical_text(resolved_path: str, bypass_read_cache: bool = False) -> Tuple[Optional[int], Optional[str]]: Unified Read-Your-Writes primitive checking _VFS_PENDING_WRITES, _VFS_READ_CACHE, and physical disk.
    * heal_daemon_config_files(remove_legacy_system_json: bool = False) -> Tuple[str, str]: Splits legacy system.json into workspaces.json and host.json.
    * load_json_config(filepath, default_fallback=None): Loads and caches parsed JSON objects keyed by VFS causal revision tokens.

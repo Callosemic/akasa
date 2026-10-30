@@ -17,6 +17,7 @@ This directory contains the core architectural specifications, integration contr
 * **[ADR 0009: 5-Ring Strict Acyclic Kernel DAG, ExecutionFrame ContextVars, Inter-Process State Locking, and Zero-Copy Causal Config Caching](./adrs/0009_5ring_acyclic_dag_execution_frame_and_causal_state_caching.md)**
 * **[ADR 0010: Fail-Closed Peer Classification, DNS-Rebinding Host Gate, Topological DAG Wavefronts, and Test Sandbox Quiescing](./adrs/0010_fail_closed_peer_trust_dns_rebinding_gate_and_dag_wavefronts.md)**
 * **[ADR 0011: Durable Stdlib Credential Store, Lazy Boot Token Initialization, and Claim-Guarded Worker Settlement](./adrs/0011_durable_credential_store_lazy_tokens_and_guarded_job_settlement.md)**
+* **[ADR 0012: Host-Protected VFS Targets, Import Shadowing Defense, and Pre-Reset Write Drainage](./adrs/0012_host_protected_vfs_targets_and_sandbox_drainage.md)**
 
 ### Superseded Records
 * **[ADR 0003: OpenAPI Reflection, DAG Step Orchestration, and System Error Hooks](./adrs/superseded/0003_openapi_reflection_dag_orchestration_and_error_hooks.md)** *(Superseded by ADR 0010)*
