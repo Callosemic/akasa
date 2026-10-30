@@ -9,8 +9,8 @@ import hashlib
 import traceback
 import threading
 from collections import OrderedDict
-from pathlib import Path
-from typing import Optional, Dict, List, Tuple, Any, Callable
+from pathlib import Path, PurePosixPath
+from typing import Optional, Dict, List, Tuple, Any, Callable, Set, Union
 from akasa.context import parse_uri, is_subpath, atomic_write_text
 from akasa.hooks import hooks
 from akasa.db import (
@@ -21,6 +21,23 @@ from akasa.db import (
 from akasa.uri import AkasaURI
 
 _ARTIFACT_PATH_RESOLVER: Optional[Callable[[str, Optional[str]], str]] = None
+_PROTECTED_VFS_TARGETS: Set[Tuple[str, str]] = set()
+
+
+def register_protected_vfs_targets(*targets: Union[str, Tuple[str, str]]) -> None:
+    """DI Interface: Host OS registers protected (namespace, basename) pairs that VFS mutations must refuse."""
+    for item in targets:
+        if isinstance(item, tuple) and len(item) == 2:
+            ns, base = str(item[0]).strip().lower(), str(item[1]).strip().lower()
+            if base:
+                _PROTECTED_VFS_TARGETS.add((ns, base))
+        elif isinstance(item, str) and item.strip():
+            norm = item.replace("\\", "/").strip().strip("/").lower()
+            if "/" in norm:
+                ns, _, base = norm.rpartition("/")
+                _PROTECTED_VFS_TARGETS.add((ns, base))
+            else:
+                _PROTECTED_VFS_TARGETS.add(("", norm))
 
 
 def set_vfs_artifact_path_resolver(resolver_fn: Callable[[str, Optional[str]], str]) -> None:
@@ -123,6 +140,14 @@ def read_cached_physical_text(resolved_path: str, bypass_read_cache: bool = Fals
         return None, None
 
 
+def drain_write_queue(timeout: float = 5.0) -> None:
+    """Blocks until every queued VFS write has reached disk; on failure, logs and returns (test-harness use)."""
+    try:
+        sync_vfs_barrier("default", timeout=timeout)
+    except (RuntimeError, TimeoutError) as e:
+        print(f"⚠️ [VFS] Could not drain the write queue: {e}")
+
+
 def reset() -> None:
     """
     Drains the async write queue, then purges the VFS read cache, pending write overlay, and ancestor
@@ -130,10 +155,7 @@ def reset() -> None:
     cwd must not execute after the harness switches cwd, or it lands at the wrong physical path.
     """
     global _VFS_READ_CACHE_BYTES
-    try:
-        sync_vfs_barrier("default", timeout=5.0)
-    except (RuntimeError, TimeoutError) as e:
-        print(f"⚠️ [VFS] reset() could not drain the write queue before purging: {e}")
+    drain_write_queue()
     with _VFS_CACHE_LOCK:
         _VFS_READ_CACHE.clear()
         _VFS_READ_CACHE_BYTES = 0
@@ -751,9 +773,53 @@ def stop_vfs_pipeline(**kwargs):
     _VFS_WRITE_QUEUE.put(None)
     if _VFS_WORKER_THREAD:
         _VFS_WORKER_THREAD.join(timeout=5.0)
+_PROTECTED_WRITE_MESSAGE = "Refusing to modify a host-protected file (registered with register_protected_vfs_targets)."
+
+
+def _protected_segment_match(segments: List[str], ns_segments: List[str], protected_base: str) -> bool:
+    """
+    True when the path names the protected module or anything that would shadow it at import time:
+    the file itself, a same-named package directory (<stem>/__init__.py), compiled or extension
+    variants (<stem>.cpython-*.so, <stem>.pyc), and __pycache__ entries. The namespace must be the
+    directory the module sits in, compared by whole path segments (so 'pkg' never matches 'pkg-demo').
+    """
+    stem = protected_base.rsplit(".", 1)[0] if "." in protected_base else protected_base
+    for idx, seg in enumerate(segments):
+        is_file = idx == len(segments) - 1
+        hit = seg == protected_base or (seg == stem and not is_file) or seg.startswith(stem + ".")
+        if not hit:
+            continue
+        parents = segments[:idx]
+        if parents and parents[-1] == "__pycache__":
+            parents = parents[:-1]
+        if not ns_segments or parents[-len(ns_segments):] == ns_segments:
+            return True
+    return False
+
+
+def _is_s8_protected_target(filepath: Optional[str], resolved_path: Optional[str] = None) -> bool:
+    """Refuses writes, moves, or deletions that would replace or shadow a host-registered protected file."""
+    if not _PROTECTED_VFS_TARGETS:
+        return False
+    for candidate in (filepath, resolved_path):
+        if not candidate:
+            continue
+        norm = str(candidate).replace("\\", "/").lower()
+        if "://" in norm:
+            norm = norm.partition("://")[2]
+        segments = [seg for seg in PurePosixPath(norm).parts if seg not in ("/", ".")]
+        for ns_token, protected_base in _PROTECTED_VFS_TARGETS:
+            ns_segments = [seg for seg in PurePosixPath(ns_token).parts if seg not in ("/", ".")]
+            if _protected_segment_match(segments, ns_segments, protected_base):
+                return True
+    return False
+
+
 def execute_vfs_move(workspace_id, filepath, dest_path):
     if str(filepath).startswith("ws://") or str(dest_path).startswith("ws://"):
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}, 403
+    if _is_s8_protected_target(filepath) or _is_s8_protected_target(dest_path):
+        return {"status": "error", "message": _PROTECTED_WRITE_MESSAGE}, 403
     resolved_src = _resolve_physical_path(filepath, workspace_id)
     resolved_dest = _resolve_physical_path(dest_path, workspace_id)
     src_text = None
@@ -770,6 +836,8 @@ def execute_vfs_delete(workspace_id, filepath):
     if str(filepath).startswith("ws://"):
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}, 403
     resolved_path = _resolve_physical_path(filepath, workspace_id)
+    if _is_s8_protected_target(filepath, resolved_path):
+        return {"status": "error", "message": _PROTECTED_WRITE_MESSAGE}, 403
     seq = _stage_pending_write(resolved_path, _VFS_TOMBSTONE)
     _ensure_vfs_worker_alive()
     _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "delete", "_pending_seq": seq}))
@@ -781,6 +849,8 @@ def execute_vfs_bulk(workspace_id, operations):
         fp = op.get("filepath", "")
         dest = op.get("dest_path", "")
         if str(fp).startswith("ws://") or str(dest).startswith("ws://"):
+            continue
+        if _is_s8_protected_target(fp) or _is_s8_protected_target(dest):
             continue
         op_copy = dict(op)
         act = op_copy.get("action", "save")
@@ -812,6 +882,9 @@ def execute_vfs_save(workspace_id, filepath, content, data=None):
         print(f"🛑 [VFS Security] Write dropped: Virtual mount '{filepath}' is strictly read-only.")
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}
     resolved_path = _resolve_physical_path(filepath, workspace_id, data.get("is_absolute_artifact"))
+    if _is_s8_protected_target(filepath, resolved_path):
+        print(f"🛑 [VFS Guarded Write] Refused write to protected file '{filepath}'.")
+        return {"status": "error", "message": _PROTECTED_WRITE_MESSAGE}
     # Pre-flight Volume Validation
     if not data.get("is_absolute_artifact"):
         if not resolved_path:

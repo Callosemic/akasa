@@ -608,10 +608,10 @@ def resolve_dag_wavefronts(
 _TEMPLATE_VAR_RE = re.compile(r'\{\{\s*(?:macro_)?([a-zA-Z0-9_.\[\]-]+)(?:\s*\|\s*([^{}]*?))?\s*\}\}')
 _INNERMOST_MUSTACHE_RE = re.compile(r'\{\{\s*([^{}|]+?)(?:\s*\|\s*([^{}]*?))?\s*\}\}')
 _RESERVED_TEMPLATE_MACROS = frozenset({
-    "UNTIL", "triple", "inputs", "nodes", "item", "loop", "global",
+    "UNTIL", "triple", "inputs", "nodes", "item", "loop", "global", "sys",
     "system_prompt", "user_message", "user_prompt", "context_block", "history_summary", "plan_uri",
 })
-_RESERVED_TEMPLATE_PREFIXES = ("wordcount_", "nodes.", "inputs.", "global.", "item.", "loop.", "include_prompt:")
+_RESERVED_TEMPLATE_PREFIXES = ("wordcount_", "nodes.", "inputs.", "global.", "sys.", "item.", "loop.", "include_prompt:")
 
 
 def extract_template_variables(text: str) -> typing.List[typing.Dict[str, typing.Any]]:
@@ -700,7 +700,7 @@ def interpolate_template_variables(
                 return _format_val(val)
             # If this is the final pipe segment and not a runtime namespace reference, treat it as a literal default
             if idx == len(candidates) - 1 and idx > 0:
-                if not cand.startswith(("nodes.", "inputs.", "global.", "item.", "loop.")):
+                if not cand.startswith(("nodes.", "inputs.", "global.", "sys.", "item.", "loop.")):
                     return cand.strip("'\"")
                 return ""
         return "" if resolver is not None else match.group(0)

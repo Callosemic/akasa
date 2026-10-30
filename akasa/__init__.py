@@ -1,7 +1,7 @@
 import os
 import queue
 import threading
-from typing import Optional, Iterable, Tuple, Callable
+from typing import Optional, Iterable, Tuple, Callable, Union
 from flask import Flask, request, jsonify, Response, has_request_context
 import akasa.context as _akasa_context
 from akasa.context import (
@@ -15,6 +15,7 @@ from akasa.hooks import hooks
 import akasa.db as _akasa_db
 from akasa.db import close_thread_connections
 import akasa.vfs as _akasa_vfs
+from akasa.vfs import register_protected_vfs_targets
 import akasa.state as _akasa_state
 from akasa.state import register_core_module
 import akasa.workers as _akasa_workers
@@ -90,6 +91,7 @@ def configure(
     tenant_resolver: Optional[Callable[[], Optional[str]]] = None,
     proxy_headers: Tuple[str, ...] = (),
     allowed_hosts: Tuple[str, ...] = (),
+    protected_vfs_targets: Tuple[Union[str, Tuple[str, str]], ...] = (),
 ) -> None:
     """Phase A: Headless-safe process & HookRegistry physics configuration."""
     if tune_os_resources:
@@ -121,6 +123,9 @@ def configure(
 
     if allowed_hosts:
         register_allowed_host(*allowed_hosts)
+
+    if protected_vfs_targets:
+        register_protected_vfs_targets(*protected_vfs_targets)
 
 
 def init_app(
@@ -222,6 +227,9 @@ def reset_state(cwd: Optional[str] = None, control_dir: Optional[str] = None) ->
     # Quiesce background workers first: an in-flight job must not reopen databases or queue VFS
     # writes while the subsystems below are being reset or after the daemon cwd changes.
     _akasa_workers.reset()
+    # Then flush queued VFS writes while the tenant resolver and mounts that resolved them still apply;
+    # a write that ran after context.reset() could resolve to a path relative to the next sandbox.
+    _akasa_vfs.drain_write_queue()
     _akasa_context.reset()
     set_tenant_resolver(_flask_http_tenant_resolver)
     hooks.reset()
