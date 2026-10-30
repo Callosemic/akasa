@@ -78,7 +78,7 @@ akasa/
 │   │   ├── def generate_ascii_tree(file_paths) # Renders an ASCII directory tree string from a list of file paths.
 │   │   ├── def resolve_dag_wavefronts(items, id_key, parents_key, order_key) # Compiles a list of node dictionaries into level-order topological wavefronts (generations) using stdlib graphlib.TopologicalSorter.
 │   │   ├── def extract_template_variables(text) # Scans text for {{ var }} or {{ var | default }} placeholders (including {{ macro_var }}), ignoring system multipliers and wordcount tags.
-│   │   ├── def interpolate_template_variables(text, values, resolver) # Inside-out template variable interpolator for {{ var }}, {{ var | fallback_var | default }}, and nested {{ var | {{ fallback }} }} placehold...
+│   │   ├── def interpolate_template_variables(text, values, resolver) # Inside-out template variable interpolator for {{ var }}, {{ var | fallback_var | default }}, and nested placeholders.
 │   │   └── def reset()             # Resets Ring 0 context state for isolated test harnesses.
 │   ├── db.py                       # Ring 2: Thread-local SQLite connection pool and WAL schema migrations
 │   │   ├── def set_db_physics_resolvers(physics_fn, all_workspaces_fn) # DI Interface: Ring 2 state module binds workspace physics resolvers so db.py has zero upward dependencies.
@@ -94,34 +94,34 @@ akasa/
 │   │   ├── def reset()             # Resets Ring 0 context state for isolated test harnesses.
 │   │   └── def get_connection(db_name, workspace_id) # Returns a thread-local SQLite connection.
 │   ├── events.py                   # Thread-safe SSE event bus and client queue manager
-│   │   └── class EventBus          # [comment required]
+│   │   └── class EventBus          # Thread-safe Server-Sent Events (SSE) broadcasting bus and subscriber queue manager.
 │   ├── extension.py                # Ring 4: Extension SDK context wrappers, SettingsManager, and JobManager
 │   │   ├── def extension_auth(ext_name) # HTTP route decorator verifying that ext_name is enabled in the target workspace.
-│   │   ├── class SettingsUpdateResponse(TypedDict) # [comment required]
-│   │   ├── class JobManager        # [comment required]
+│   │   ├── class SettingsUpdateResponse(TypedDict) # Response schema returned on extension settings mutation.
+│   │   ├── class JobManager        # Extension-scoped background worker and lifecycle management interface.
 │   │   ├── def get_registered_capabilities() # Returns a shallow copy of the global transport-agnostic capability registry.
 │   │   ├── def get_registered_settings_schemas(workspace_id) # Evaluates and returns all registered declarative settings schemas for the target workspace.
-│   │   ├── class SettingsManager   # [comment required]
-│   │   ├── class StoreManager      # [comment required]
+│   │   ├── class SettingsManager   # Multi-scoped settings resolver across daemon, workspace, repo, and secure scopes.
+│   │   ├── class StoreManager      # Scoped key-value JSON persistence manager for extension data.
 │   │   ├── class DatabaseWrapper   # Lightweight ORM/CRUD wrapper for centralized SQLite access.
 │   │   ├── class ExtensionContext  # Pre-scoped context object injected into all SDK routes.
 │   │   └── class AkasaExtension    # Agnostic Blueprint wrapper that enforces tenant isolation, API routing, authorization, and SQLite schema migrations for kernel extensions.
 │   ├── hooks.py                    # Priority event bus (HookRegistry) and authorization engine
-│   │   ├── class HookPayload_MutateWorkspaceConfig(TypedDict) # [comment required]
-│   │   ├── class HookPayload_VFSMutated(TypedDict) # [comment required]
-│   │   ├── class HookPayload_WorkspaceScoped(TypedDict) # [comment required]
-│   │   ├── class HookPayload_WorkspaceShutdown(TypedDict) # [comment required]
-│   │   ├── class HookPayload_RegisterManifestSignatures(TypedDict) # [comment required]
-│   │   ├── class HookPayload_ExecuteIdentityHandshake(TypedDict) # [comment required]
-│   │   ├── class HookPayload_IsTrustedOrigin(TypedDict) # [comment required]
-│   │   ├── class HookPayload_VFSMountMissing(TypedDict) # [comment required]
-│   │   ├── class HookPayload_PreFileSave(TypedDict) # [comment required]
-│   │   ├── class HookPayload_JobBatonPassed(TypedDict) # [comment required]
-│   │   ├── class HookPayload_SystemError(TypedDict) # [comment required]
+│   │   ├── class HookPayload_MutateWorkspaceConfig(TypedDict) # Payload for mutate_workspace_config hook.
+│   │   ├── class HookPayload_VFSMutated(TypedDict) # Payload for vfs_mutated background telemetry broadcast.
+│   │   ├── class HookPayload_WorkspaceScoped(TypedDict) # Base payload containing workspace_id context.
+│   │   ├── class HookPayload_WorkspaceShutdown(TypedDict) # Payload emitted on workspace teardown.
+│   │   ├── class HookPayload_RegisterManifestSignatures(TypedDict) # Payload for tenant delta manifest signature collection.
+│   │   ├── class HookPayload_ExecuteIdentityHandshake(TypedDict) # Payload for peer authentication handshake evaluation.
+│   │   ├── class HookPayload_IsTrustedOrigin(TypedDict) # Payload for Origin/Referer hostname verification.
+│   │   ├── class HookPayload_VFSMountMissing(TypedDict) # Payload emitted when an unmounted volume target is accessed.
+│   │   ├── class HookPayload_PreFileSave(TypedDict) # Payload emitted immediately before physical VFS disk mutation.
+│   │   ├── class HookPayload_JobBatonPassed(TypedDict) # Telemetry payload emitted during background worker step transitions.
+│   │   ├── class HookPayload_SystemError(TypedDict) # System-wide error telemetry payload for unhandled exceptions.
 │   │   └── class HookRegistry      # The central Event Bus for the Akasa Micro-Kernel.
 │   ├── process.py                  # Volume-sandboxed process manager and execution wrapper
 │   │   ├── def execute_binary(cmd, cwd, env, check, ...) # Universal binary execution wrapper resolving system PATH, venv directories, and module CLI fallbacks across systemd, desktop, and isolated e...
-│   │   └── class ProcessManager    # [comment required]
+│   │   └── class ProcessManager    # Volume-sandboxed subprocess runner enforcing workspace directory boundaries.
 │   ├── py.typed                    # PEP 561 marker for static typing compliance
 │   ├── state.py                    # Ring 2: Workspace physics, extension enablement, and causal parsed-object JSON configuration cache
 │   │   ├── def heal_daemon_config_files(remove_legacy_system_json) # Kernel-level daemon config healer: Synchronizes any legacy system.json into workspaces.json and host.json.
@@ -158,35 +158,37 @@ akasa/
 │   │   └── class AkasaURI          # Zero-knowledge Universal Resource Identifier.
 │   ├── utils.py                    # Ring 2: Unified compatibility facade re-exporting Ring 0 (context) and Ring 2 (state)
 │   ├── vfs.py                      # Ring 2: Virtual File System, volume router, and async write queue
+│   │   ├── def register_protected_vfs_targets() # DI Interface: Host OS registers protected (namespace, basename) pairs that VFS mutations must refuse.
 │   │   ├── def set_vfs_artifact_path_resolver(resolver_fn) # DI Interface: Ring 2 state module binds resolve_system_artifact_path so vfs.py has zero upward dependencies.
 │   │   ├── def has_pending_vfs_write(resolved_path) # Returns True if resolved_path currently has an un-flushed write in _VFS_PENDING_WRITES.
 │   │   ├── def read_cached_physical_text(resolved_path, bypass_read_cache) # Unified Ring 2 Read-Your-Writes primitive: Inspects _VFS_PENDING_WRITES first (returning (-seq, content)), then _VFS_READ_CACHE (verifying s...
-│   │   ├── def reset()             # [stale?] Purges VFS read cache, pending write overlay, and ancestor ring buffer for isolated test harnesses.
-│   │   ├── def compute_vfs_sha256(text) # [comment required]
-│   │   ├── def record_vfs_ancestor(workspace_id, filepath_or_resolved, text, text_hash) # [comment required]
-│   │   ├── def lookup_vfs_ancestor(workspace_id, filepath_or_resolved, base_hash, fallback_base_content) # [comment required]
-│   │   ├── def three_way_merge_text(base_text, disk_text, incoming_text) # Deterministic 3-Way Text Merger (Base -> Disk vs.
+│   │   ├── def drain_write_queue(timeout) # Blocks until every queued VFS write has reached disk; on failure, logs and returns (test-harness use).
+│   │   ├── def reset()             # Drains the async write queue, then purges the VFS read cache, pending write overlay, and ancestor ring buffer for isolated test harnesses.
+│   │   ├── def compute_vfs_sha256(text) # Computes deterministic SHA-256 hash of file content for causal receipts.
+│   │   ├── def record_vfs_ancestor(workspace_id, filepath_or_resolved, text, text_hash) # Records file revision in the in-memory ancestor ring buffer.
+│   │   ├── def lookup_vfs_ancestor(workspace_id, filepath_or_resolved, base_hash, fallback_base_content) # Retrieves historical file content from ancestor cache by hash.
+│   │   ├── def three_way_merge_text(base_text, disk_text, incoming_text) # Deterministic 3-Way Text Merger (Base -> Disk vs. Base -> Incoming).
 │   │   ├── def get_vfs_cache_stats() # Returns public telemetry statistics for the VFS read cache and write queue.
-│   │   ├── def evict_vfs_cache(resolved_path, preserve_ancestors) # [comment required]
-│   │   ├── class DefaultVFSDriver  # [comment required]
+│   │   ├── def evict_vfs_cache(resolved_path, preserve_ancestors) # Purges a path and its children from VFS read and ancestor caches.
+│   │   ├── class DefaultVFSDriver  # Standard filesystem VFS driver mapping logical paths to physical volume targets.
 │   │   ├── def set_mount_authorizer(authorizer_fn) # DI Interface: Host OS registers its peer-to-peer mount authorization policy.
 │   │   ├── class InterWorkspaceVFSDriver # Zero-copy Inter-Workspace VFS Driver (ws://<source_workspace_id>/<domain>/<relative_path>).
-│   │   ├── def register_driver(scheme, driver_instance, volume) # [comment required]
-│   │   ├── def mount_volume(workspace_id, scheme, volume, physical_target) # [comment required]
+│   │   ├── def register_driver(scheme, driver_instance, volume) # Registers a custom VFS driver for a URI scheme or volume.
+│   │   ├── def mount_volume(workspace_id, scheme, volume, physical_target) # Binds a logical volume target to a physical directory path.
 │   │   ├── def resolve_physical_path(filepath, workspace_id, is_absolute_artifact) # Public SSOT gateway for resolving a canonical URI to its physical host path.
 │   │   ├── def sync_vfs_barrier(workspace_id, timeout) # Halts the calling thread until all VFS writes queued prior to this call are physically flushed.
-│   │   ├── def start_vfs_pipeline(**kwargs) # [comment required]
-│   │   ├── def stop_vfs_pipeline(**kwargs) # [comment required]
-│   │   ├── def execute_vfs_move(workspace_id, filepath, dest_path) # [comment required]
-│   │   ├── def execute_vfs_delete(workspace_id, filepath) # [comment required]
-│   │   ├── def execute_vfs_bulk(workspace_id, operations) # [comment required]
-│   │   ├── def execute_vfs_save(workspace_id, filepath, content, data) # [comment required]
-│   │   ├── def execute_vfs_save_physical(workspace_id, filepath, content, data, ...) # [comment required]
+│   │   ├── def start_vfs_pipeline(**kwargs) # Starts the background worker thread for asynchronous VFS writes.
+│   │   ├── def stop_vfs_pipeline(**kwargs) # Drains and terminates the background VFS commit worker thread.
+│   │   ├── def execute_vfs_move(workspace_id, filepath, dest_path) # Queues an atomic asynchronous file move operation.
+│   │   ├── def execute_vfs_delete(workspace_id, filepath) # Queues an atomic asynchronous file deletion operation.
+│   │   ├── def execute_vfs_bulk(workspace_id, operations) # Queues a consolidated batch of VFS operations for atomic commit.
+│   │   ├── def execute_vfs_save(workspace_id, filepath, content, data) # Stages and queues an atomic asynchronous file save operation.
+│   │   ├── def execute_vfs_save_physical(workspace_id, filepath, content, data, ...) # Executes physical disk write with fsync, permissions, and ledger commit.
 │   │   └── class VFSTransaction    # Provides dual-mode immediate queue dispatch and atomic buffered context-manager transactions for VFS mutations.
 │   └── workers/                    # Metronome worker engine and job ledger
-│       └── __init__.py             # Unit test package initialization
-│           ├── class ChainStepSchema(TypedDict) # [comment required]
-│           ├── class ChainStepArtifact(TypedDict) # [comment required]
+│       └── __init__.py             # Metronome worker engine, task scheduler, and job ledger
+│           ├── class ChainStepSchema(TypedDict) # Specification schema for an execution step in a worker chain.
+│           ├── class ChainStepArtifact(TypedDict) # Standard output envelope returned by a worker chain step.
 │           ├── def resolve_dag_chain(ctx, hook_name) # Generic Akasa DAG Orchestrator.
 │           ├── def validate_worker_kwargs(ext_name, callback_name, kwargs, allow_extra) # Synchronously validates worker keyword arguments against the registered function signature and type annotations, and verifies strict JSON se...
 │           ├── def validate_dag_chain_kwargs(steps, kwargs) # Validates shared pipeline kwargs across all steps in a DAG chain.
@@ -202,12 +204,12 @@ akasa/
 │           ├── def submit_immediate_job(job_id, ext_name, callback_name, args_json, ...) # Drops a task directly into the active ThreadPoolExecutor and logs its lifecycle for UI polling.
 │           ├── def update_immediate_job_meta(job_id, meta_dict, workspace_id) # Helper for workers to safely update discrete metrics without altering stream status.
 │           ├── def update_immediate_job_status(job_id, status, message, artifact, ...) # Helper for workers to update their streaming status.
-│           ├── def register_ephemeral_artifact(filepath, owner, ttl_seconds, workspace_id) # [comment required]
+│           ├── def register_ephemeral_artifact(filepath, owner, ttl_seconds, workspace_id) # Registers a temporary file for automatic TTL garbage collection.
 │           ├── def sweep_ephemeral_artifacts(workspace_id) # Sweeps and deletes expired temporary files and old immediate jobs.
 │           ├── def get_active_pipeline_modules(workspace_id) # Fast, single-query helper returning active_modules, pending_modules, and is_pipeline_active without scanning vfs_event_log or firing manifes...
 │           ├── def reset()         # Resets Metronome worker state for isolated test harnesses.
-│           ├── def start_workers(**kwargs) # [comment required]
-│           └── def stop_workers(**kwargs) # [comment required]
+│           ├── def start_workers(**kwargs) # Starts the Metronome scheduler loop and worker thread pools.
+│           └── def stop_workers(**kwargs) # Stops the Metronome loop and terminates worker thread pools.
 ├── docs/                           # Architectural documentation and standards
 │   ├── 00_index.md                 # Master documentation index
 │   ├── 01_engineering_standards.md # Core engineering standards and audit guardrails
@@ -219,6 +221,7 @@ akasa/
 │       ├── 0009_5ring_acyclic_dag_execution_frame_and_causal_state_caching.md # ADR 0009 5-ring acyclic DAG, ExecutionFrame contextvars, and causal state caching specification
 │       ├── 0010_fail_closed_peer_trust_dns_rebinding_gate_and_dag_wavefronts.md # ADR 0010: Fail-Closed Peer Classification, DNS-Rebinding Host Gate, Topological DAG Wavefronts, and Test Sandbox Quiescing
 │       ├── 0011_durable_credential_store_lazy_tokens_and_guarded_job_settlement.md # ADR 0011: Durable Stdlib Credential Store, Lazy Boot Token Initialization, and Claim-Guarded Worker Settlement
+│       ├── 0012_host_protected_vfs_targets_and_sandbox_drainage.md # ADR 0012: Host-Protected VFS Targets, Import Shadowing Defense, and Pre-Reset Write Drainage
 │       ├── archived/               # Baseline architectural decisions assimilated into kernel
 │       │   ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001 specification
 │       │   ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
@@ -251,13 +254,15 @@ akasa/
         │   ├── class TestBootstrapAndHostGate(unittest.TestCase) # S1: /auth/bootstrap only grants localhost trust to direct loopback requests; the gate rejects foreign Hosts.
         │   └── class TestForwardedHeaderMembraneRule(unittest.TestCase) # S1: the FORWARDED_HEADER_MEMBRANE fitness rule keeps forwarding-header reads inside akasa/auth/peer.py.
         ├── test_kernel_hardening.py # Unit tests for RFC 0048 VFS micro-batching, idempotency, slotted AkasaURI, hook auth caching, and SQLite PRAGMAs
-        │   └── class TestAkasaKernelHardening(unittest.TestCase) # [stale?] Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening (Refactors A–F).
+        │   └── class TestAkasaKernelHardening(unittest.TestCase) # Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening (Refactors A–F).
+        ├── test_protected_vfs_targets.py # Tests for host-registered protected VFS targets: whole-segment matching and import-shadowing paths
+        │   └── class TestProtectedVfsTargets(unittest.TestCase) # register_protected_vfs_targets protects a module, everything that would shadow it, and nothing else.
         ├── test_settings_is_set.py # Tests that SettingsManager.is_set distinguishes saved values from schema defaults in every scope
         │   └── class TestSettingsIsSet(unittest.TestCase) # SettingsManager.is_set distinguishes saved values from schema defaults across every scope.
         ├── test_vfs_reset_drain.py # Tests that reset_state drains queued VFS writes before switching the daemon cwd
         │   └── class TestVfsResetDrain(unittest.TestCase) # reset_state() drains queued VFS writes first, so they land under the cwd they were queued for.
         ├── test_worker_contracts.py # Unit tests for signature-driven worker validation, DAG chains, and envelope isolation
-        │   └── class TestAkasaWorkerContracts(unittest.TestCase) # [comment required]
+        │   └── class TestAkasaWorkerContracts(unittest.TestCase) # Behavioral tests for worker parameter validation, DAG chains, and envelope isolation.
         └── test_workers_reset_quiesce.py # Tests that reset_state stops the metronome and job pools so no background thread outlives its sandbox
             └── class TestWorkersResetQuiesce(unittest.TestCase) # reset_state() stops the metronome and job pools so no background thread outlives its sandbox.
 ```
