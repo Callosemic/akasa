@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.6.0 (2026-10-30)
+
+### Features
+
+- **vfs**: Add host-protected targets, import-shadowing guard, write drainage, and template sys
+  namespace
+  ([`be6906c`](https://github.com/Callosemic/akasa/commit/be6906caaff3ca9b04f3bd411c1d445db5d185e6))
+
+
 ## v0.5.0 (2026-10-29)
 
 ### Features
