@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.6.1 (2026-10-30)
+
+### Bug Fixes
+
+- **process**: Kill entire process tree on timeout and preserve verbatim shell commands
+  ([`62ed29e`](https://github.com/Callosemic/akasa/commit/62ed29ef5408fadb66e23024776b7c0c67249c3e))
+
+
 ## v0.6.0 (2026-10-30)
 
 ### Features
