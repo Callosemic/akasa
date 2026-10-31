@@ -1,5 +1,7 @@
 import os
+import signal
 import sys
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -11,6 +13,14 @@ def execute_binary(cmd, cwd=None, env=None, check=False, capture_output=True, te
     Universal binary execution wrapper resolving system PATH, venv directories,
     and module CLI fallbacks across systemd, desktop, and isolated environments.
     """
+    if kwargs.get("shell"):
+        # The shell parses the command line itself, so it is passed through as one string, unresolved.
+        # (Resolving its first word as a binary turned "a && b" into `python -m "a && b"`.)
+        full_cmd = cmd if isinstance(cmd, str) else shlex.join(str(part) for part in cmd)
+        if not full_cmd.strip():
+            raise ValueError("Command cannot be empty.")
+        return _spawn(full_cmd, cwd, env, check, capture_output, text, popen, **kwargs)
+
     cmd_args = [cmd] if isinstance(cmd, str) else list(cmd)
     if not cmd_args:
         raise ValueError("Command list cannot be empty.")
@@ -29,7 +39,11 @@ def execute_binary(cmd, cwd=None, env=None, check=False, capture_output=True, te
     else:
         module_name = bin_name.replace('-', '_')
         full_cmd = [sys.executable, '-m', module_name] + cmd_args[1:]
+    return _spawn(full_cmd, cwd, env, check, capture_output, text, popen, **kwargs)
 
+
+def _spawn(full_cmd, cwd, env, check, capture_output, text, popen, **kwargs):
+    """Starts a resolved command with the boot token removed from its environment."""
     child_env = dict(os.environ) if env is None else dict(env)
     child_env.pop("AKASA_BOOT_TOKEN", None)
     if popen:
@@ -44,15 +58,71 @@ def execute_binary(cmd, cwd=None, env=None, check=False, capture_output=True, te
             **kwargs
         )
 
-    return subprocess.run(
-        full_cmd,
-        cwd=cwd,
-        env=child_env,
-        check=check,
-        capture_output=capture_output,
-        text=text,
-        **kwargs
-    )
+    if kwargs.get("timeout") is None:
+        return subprocess.run(
+            full_cmd,
+            cwd=cwd,
+            env=child_env,
+            check=check,
+            capture_output=capture_output,
+            text=text,
+            **kwargs
+        )
+    return _run_with_tree_timeout(full_cmd, cwd, child_env, check, capture_output, text, **kwargs)
+
+
+def _kill_process_tree(proc) -> None:
+    """Kills a child and everything it started. The child leads its own session (POSIX) or process group (Windows)."""
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            os.killpg(proc.pid, signal.SIGKILL)
+        else:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    try:
+        proc.kill()
+    except OSError:
+        pass
+
+
+def _run_with_tree_timeout(full_cmd, cwd, env, check, capture_output, text, timeout=None, input=None, **kwargs):
+    """
+    subprocess.run() semantics, except that a timeout kills the whole process tree. subprocess.run() only kills
+    the direct child, so grandchildren of a shell, test runner or build tool survive holding locks and ports.
+    The child is started as the leader of a new session (POSIX) or process group (Windows) so the tree can be killed.
+    """
+    if capture_output:
+        kwargs.setdefault("stdout", subprocess.PIPE)
+        kwargs.setdefault("stderr", subprocess.PIPE)
+    if input is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    if os.name == "posix":
+        if "preexec_fn" not in kwargs:
+            kwargs.setdefault("start_new_session", True)
+    else:
+        kwargs.setdefault("creationflags", getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+
+    with subprocess.Popen(full_cmd, cwd=cwd, env=env, text=text, **kwargs) as proc:
+        try:
+            stdout, stderr = proc.communicate(input, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            _kill_process_tree(proc)
+            try:
+                stdout, stderr = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                # A descendant that escaped the group still holds the pipes; stop waiting for it.
+                stdout, stderr = exc.output, exc.stderr
+            raise subprocess.TimeoutExpired(proc.args, timeout, output=stdout, stderr=stderr) from None
+        except BaseException:
+            _kill_process_tree(proc)
+            raise
+        retcode = proc.poll()
+    if check and retcode:
+        raise subprocess.CalledProcessError(retcode, proc.args, output=stdout, stderr=stderr)
+    return subprocess.CompletedProcess(proc.args, retcode, stdout, stderr)
 
 
 class ProcessManager:
@@ -82,7 +152,7 @@ class ProcessManager:
         # Centralized Kernel Guardrails
         kwargs.setdefault('capture_output', True)
         kwargs.setdefault('text', True)
-        kwargs.setdefault('timeout', 60) # Global circuit breaker to prevent zombie threads
+        kwargs.setdefault('timeout', 60) # Global circuit breaker; on expiry the whole process tree is killed
         return execute_binary(cmd, cwd=cwd, **kwargs)
 
     def popen(self, cmd, volume: str = None, **kwargs):

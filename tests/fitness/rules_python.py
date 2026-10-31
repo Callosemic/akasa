@@ -55,6 +55,8 @@ def _resolve_module_key(filepath: Path) -> str:
 
 
 class KernelFitnessVisitor(ast.NodeVisitor):
+    """AST visitor that checks one kernel module against the Tier 1 substrate rules."""
+
     def __init__(self, filepath, filename, is_test=False):
         self.filepath = filepath
         self.filename = filename
@@ -323,6 +325,7 @@ class KernelFitnessVisitor(ast.NodeVisitor):
                 )
         self.generic_visit(node)
 def check_python_files():
+    """Parses every Python file in the kernel and runs KernelFitnessVisitor over it."""
     print("🔍 Sweeping Akasa Kernel (AST Analysis)...")
     for filepath in collect_unique_files([KERNEL_DIR], [".py"]):
         with open(filepath, "r", encoding="utf-8") as f:

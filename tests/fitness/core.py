@@ -27,9 +27,11 @@ KERNEL_RING_MAP = {
 }
 
 class FitnessState:
+    """Shared counter of violations found during one fitness run."""
     violations_found = 0
 
 def collect_unique_files(directories, extensions):
+    """Walks the given directories and returns each file with a listed extension once, skipping __pycache__."""
     seen = set()
     for directory in directories:
         for root, dirs, files in os.walk(directory):
@@ -42,6 +44,7 @@ def collect_unique_files(directories, extensions):
                         yield fp
 
 def report_violation(rule_name, filepath, line_num, message):
+    """Prints one rule violation with its repo-relative location and counts it."""
     FitnessState.violations_found += 1
     try:
         rel_path = Path(filepath).resolve().relative_to(PROJECT_ROOT.resolve())

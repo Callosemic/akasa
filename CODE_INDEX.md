@@ -120,7 +120,7 @@ akasa/
 │   │   ├── class HookPayload_SystemError(TypedDict) # System-wide error telemetry payload for unhandled exceptions.
 │   │   └── class HookRegistry      # The central Event Bus for the Akasa Micro-Kernel.
 │   ├── process.py                  # Volume-sandboxed process manager and execution wrapper
-│   │   ├── def execute_binary(cmd, cwd, env, check, ...) # Universal binary execution wrapper resolving system PATH, venv directories, and module CLI fallbacks across systemd, desktop, and isolated e...
+│   │   ├── def execute_binary(cmd, cwd, env, check, ...) # Universal binary execution wrapper resolving PATH, venv and module CLI fallbacks; strips the boot token, passes shell commands through as written, and kills the whole process tree on timeout.
 │   │   └── class ProcessManager    # Volume-sandboxed subprocess runner enforcing workspace directory boundaries.
 │   ├── py.typed                    # PEP 561 marker for static typing compliance
 │   ├── state.py                    # Ring 2: Workspace physics, extension enablement, and causal parsed-object JSON configuration cache
@@ -222,6 +222,7 @@ akasa/
 │       ├── 0010_fail_closed_peer_trust_dns_rebinding_gate_and_dag_wavefronts.md # ADR 0010: Fail-Closed Peer Classification, DNS-Rebinding Host Gate, Topological DAG Wavefronts, and Test Sandbox Quiescing
 │       ├── 0011_durable_credential_store_lazy_tokens_and_guarded_job_settlement.md # ADR 0011: Durable Stdlib Credential Store, Lazy Boot Token Initialization, and Claim-Guarded Worker Settlement
 │       ├── 0012_host_protected_vfs_targets_and_sandbox_drainage.md # ADR 0012: Host-Protected VFS Targets, Import Shadowing Defense, and Pre-Reset Write Drainage
+│       ├── 0013_process_tree_termination_and_verbatim_shell_execution.md # ADR 0013: Process-Tree Termination on Timeout and Verbatim Shell Command Execution
 │       ├── archived/               # Baseline architectural decisions assimilated into kernel
 │       │   ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001 specification
 │       │   ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
@@ -234,14 +235,14 @@ akasa/
 └── tests/                          # Architectural fitness tests and unit test suite
     ├── fitness/                    # Fitness rule package directory
     │   ├── __init__.py             # Unit test package initialization
-    │   │   └── def run_all()       # [comment required]
+    │   │   └── def run_all()       # Runs every kernel fitness rule.
     │   ├── core.py                 # Shared fitness test state, path collection, and violation reporter
-    │   │   ├── class FitnessState  # [comment required]
-    │   │   ├── def collect_unique_files(directories, extensions) # [comment required]
-    │   │   └── def report_violation(rule_name, filepath, line_num, message) # [comment required]
+    │   │   ├── class FitnessState  # Shared counter of violations found during one fitness run.
+    │   │   ├── def collect_unique_files(directories, extensions) # Walks the given directories and returns each file with a listed extension once, skipping __pycache__.
+    │   │   └── def report_violation(rule_name, filepath, line_num, message) # Prints one rule violation with its repo-relative location and counts it.
     │   └── rules_python.py         # AST visitor rules enforcing Tier 1 substrate purity and guardrails
-    │       ├── class KernelFitnessVisitor(ast.NodeVisitor) # [comment required]
-    │       └── def check_python_files() # [comment required]
+    │       ├── class KernelFitnessVisitor(ast.NodeVisitor) # AST visitor that checks one kernel module against the Tier 1 substrate rules.
+    │       └── def check_python_files() # Parses every Python file in the kernel and runs KernelFitnessVisitor over it.
     ├── fitness_functions.py        # CLI executable entry point for fitness validation
     ├── run_unit_tests.py           # CLI runner for Akasa kernel behavioral unit tests
     └── unit/                       # Behavioral unit tests for the Akasa kernel
@@ -255,6 +256,8 @@ akasa/
         │   └── class TestForwardedHeaderMembraneRule(unittest.TestCase) # S1: the FORWARDED_HEADER_MEMBRANE fitness rule keeps forwarding-header reads inside akasa/auth/peer.py.
         ├── test_kernel_hardening.py # Unit tests for RFC 0048 VFS micro-batching, idempotency, slotted AkasaURI, hook auth caching, and SQLite PRAGMAs
         │   └── class TestAkasaKernelHardening(unittest.TestCase) # Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening (Refactors A–F).
+        ├── test_process_tree_timeout.py # ProcessManager.run() and execute_binary(timeout=...) kill the whole process tree on timeout, and shell commands run as written.
+        │   └── class TestProcessTreeTimeout(unittest.TestCase) # A shell that backgrounds a long sleep leaves nothing running after its timeout.
         ├── test_protected_vfs_targets.py # Tests for host-registered protected VFS targets: whole-segment matching and import-shadowing paths
         │   └── class TestProtectedVfsTargets(unittest.TestCase) # register_protected_vfs_targets protects a module, everything that would shadow it, and nothing else.
         ├── test_settings_is_set.py # Tests that SettingsManager.is_set distinguishes saved values from schema defaults in every scope

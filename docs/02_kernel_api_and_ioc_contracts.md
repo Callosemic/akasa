@@ -159,8 +159,8 @@ ext_bp = AkasaExtension(
    * ctx.get_registered_capabilities() -> Dict[str, Dict[str, Any]]: Returns a shallow copy of the capability registry.
    * ctx.store (StoreManager): .get(filename, key, default=None), .set(filename, key, value) (persisted in <tenant_control_dir>/data/<ext_name>/<filename>).
  * Subprocess Execution (ctx.exec -> ProcessManager):
-   * Resolves binaries via execute_binary across system PATH, active virtual environments, and python module CLI fallbacks.
-   * .run(cmd, volume: Optional[str] = None, **kwargs) -> subprocess.CompletedProcess (defaults to capture_output=True, text=True, timeout=60).
+   * Resolves binaries via execute_binary across system PATH, active virtual environments, and python module CLI fallbacks. Strips `AKASA_BOOT_TOKEN` from child environments.
+   * .run(cmd, volume: Optional[str] = None, **kwargs) -> subprocess.CompletedProcess (defaults to capture_output=True, text=True, timeout=60; on timeout, terminates the entire process tree via session/group signaling). When `shell=True`, strings and argument sequences are passed through unmolested without binary-token resolution.
    * .popen(cmd, volume: Optional[str] = None, **kwargs) -> subprocess.Popen.
  * Path, DAG & Event Helpers:
    * ctx.resolve_path(filepath) -> Optional[str]
