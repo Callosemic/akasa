@@ -331,18 +331,42 @@ def _marshal_http_return(result: Any):
     return result
 
 
+def _materialize_schema_node(node: Any, wid: str) -> Any:
+    if callable(node):
+        try:
+            sig = inspect.signature(node)
+            node = node(wid) if len(sig.parameters) >= 1 else node()
+        except Exception:
+            return []
+    if isinstance(node, list):
+        return [_materialize_schema_node(item, wid) for item in node]
+    if isinstance(node, dict):
+        out: Dict[str, Any] = {}
+        for k, v in node.items():
+            if k in ("options", "default") and callable(v):
+                try:
+                    sig = inspect.signature(v)
+                    out[k] = v(wid) if len(sig.parameters) >= 1 else v()
+                except Exception:
+                    out[k] = [] if k == "options" else None
+            elif k in ("item_schema", "fields", "columns") and (isinstance(v, (list, dict)) or callable(v)):
+                out[k] = _materialize_schema_node(v, wid)
+            else:
+                out[k] = v
+        return out
+    return node
+
+
 def get_registered_settings_schemas(workspace_id: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]:
     """Evaluates and returns all registered declarative settings schemas for the target workspace."""
     wid = workspace_id or "default"
     evaluated: Dict[str, List[Dict[str, Any]]] = {}
     for ext_id, schema_spec in _REGISTERED_SETTINGS_SCHEMAS.items():
-        if callable(schema_spec):
-            try:
-                evaluated[ext_id] = schema_spec(wid)
-            except Exception:
-                evaluated[ext_id] = []
-        else:
-            evaluated[ext_id] = schema_spec
+        try:
+            raw_schema = schema_spec(wid) if callable(schema_spec) else schema_spec
+            evaluated[ext_id] = _materialize_schema_node(raw_schema, wid)
+        except Exception:
+            evaluated[ext_id] = []
     return evaluated
 
 class SettingsManager:
@@ -996,7 +1020,7 @@ class AkasaExtension:
         @self.route('settings/schema', methods=['GET'], docstring="[sync] Retrieves the declarative settings schema for this extension.")
         def get_settings_schema(ctx):
             schema = self.settings_schema(ctx.workspace_id) if callable(self.settings_schema) else self.settings_schema
-            return schema
+            return _materialize_schema_node(schema, ctx.workspace_id)
 
     def register_schema(self, db_name: str, schema_dict: Dict[str, Dict[str, str]]) -> None:
         """Registers an additional declarative SQLite schema owned by this extension."""

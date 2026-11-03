@@ -4,9 +4,12 @@ This index serves as the architectural map. It outlines the core directories and
 
 ```text
 akasa/
+├── .gitignore                      # Git ignore rules.
 ├── .gitkeep                        # Git preservation marker
 ├── CHANGELOG.md                    # Auto-generated semantic release changelog
 ├── CODE_INDEX.md                   # Architectural directory map and module overview
+├── LICENSE                         # Apache-2.0 open-source software license.
+├── NOTICE                          # Copyright notice and third-party software attributions.
 ├── README.md                       # Core substrate documentation and usage guide
 ├── akasa/                          # Central kernel package root
 │   ├── __init__.py                 # Ring 4: Two-phase bootloader and WSGI transport adapter
@@ -105,7 +108,7 @@ akasa/
 │   │   ├── class StoreManager      # Scoped key-value JSON persistence manager for extension data.
 │   │   ├── class DatabaseWrapper   # Lightweight ORM/CRUD wrapper for centralized SQLite access.
 │   │   ├── class ExtensionContext  # Pre-scoped context object injected into all SDK routes.
-│   │   └── class AkasaExtension    # Agnostic Blueprint wrapper that enforces tenant isolation, API routing, authorization, and SQLite schema migrations for kernel extensions.
+│   │   └── class AkasaExtension    # [stale?] Agnostic Blueprint wrapper that enforces tenant isolation, API routing, authorization, and SQLite schema migrations for kernel extensions.
 │   ├── hooks.py                    # Priority event bus (HookRegistry) and authorization engine
 │   │   ├── class HookPayload_MutateWorkspaceConfig(TypedDict) # Payload for mutate_workspace_config hook.
 │   │   ├── class HookPayload_VFSMutated(TypedDict) # Payload for vfs_mutated background telemetry broadcast.
@@ -261,7 +264,7 @@ akasa/
         ├── test_protected_vfs_targets.py # Tests for host-registered protected VFS targets: whole-segment matching and import-shadowing paths
         │   └── class TestProtectedVfsTargets(unittest.TestCase) # register_protected_vfs_targets protects a module, everything that would shadow it, and nothing else.
         ├── test_settings_is_set.py # Tests that SettingsManager.is_set distinguishes saved values from schema defaults in every scope
-        │   └── class TestSettingsIsSet(unittest.TestCase) # SettingsManager.is_set distinguishes saved values from schema defaults across every scope.
+        │   └── class TestSettingsIsSet(unittest.TestCase) # [stale?] SettingsManager.is_set distinguishes saved values from schema defaults across every scope.
         ├── test_vfs_reset_drain.py # Tests that reset_state drains queued VFS writes before switching the daemon cwd
         │   └── class TestVfsResetDrain(unittest.TestCase) # reset_state() drains queued VFS writes first, so they land under the cwd they were queued for.
         ├── test_worker_contracts.py # Unit tests for signature-driven worker validation, DAG chains, and envelope isolation

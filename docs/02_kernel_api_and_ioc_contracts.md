@@ -109,7 +109,7 @@ ext_bp = AkasaExtension(
  * Auto-Mounted Settings Routes:
    * GET /api/<workspace_id>/<name>/settings?repo=<optional_repo> -> Returns all settings with secrets masked (••••••••).
    * POST /api/<workspace_id>/<name>/settings?repo=<optional_repo> -> Updates settings across daemon, workspace, repo, and secure tiers, flushes the VFS barrier, and emits <name>_settings_updated.
-   * GET /api/<workspace_id>/<name>/settings/schema -> Returns the evaluated settings_schema.
+   * GET /api/<workspace_id>/<name>/settings/schema -> Returns the evaluated settings_schema (recursively materializing dynamic callables across root schema, options, default, and nested child schemas).
  * Decorators & Factories:
    * @ext_bp.route(rule, request_schema=None, response_schema=None, docstring=None, **options): Mounts /api/<workspace_id>/<name>/<rule>, records OpenAPI 3.0 schemas on ext_bp.bp.route_schemas, enforces extension_auth (unless core=True), and injects ctx: ExtensionContext as the first argument.
    * @ext_bp.worker(task_name): Registers a background worker callback in the Metronome ledger (<name>:<task_name>) and injects ctx: ExtensionContext bound to the active job_id and workspace_id.
@@ -157,6 +157,7 @@ ext_bp = AkasaExtension(
  * Settings & JSON Store:
    * ctx.settings (SettingsManager): .get(key, default=None, repo=None, mask_secrets=False), .is_set(key, repo=None) -> bool, .set(key, value, repo=None), .get_all(repo=None, mask_secrets=False), .update(payload_dict, repo=None).
    * ctx.get_registered_capabilities() -> Dict[str, Dict[str, Any]]: Returns a shallow copy of the capability registry.
+   * get_registered_settings_schemas(workspace_id: Optional[str] = None) -> Dict[str, List[Dict[str, Any]]]: Returns all registered settings schemas with recursive dynamic node materialization.
    * ctx.store (StoreManager): .get(filename, key, default=None), .set(filename, key, value) (persisted in <tenant_control_dir>/data/<ext_name>/<filename>).
  * Subprocess Execution (ctx.exec -> ProcessManager):
    * Resolves binaries via execute_binary across system PATH, active virtual environments, and python module CLI fallbacks. Strips `AKASA_BOOT_TOKEN` from child environments.

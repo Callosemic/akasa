@@ -9,7 +9,7 @@ from cryptography.fernet import Fernet
 
 import akasa
 import akasa.utils as akasa_utils
-from akasa.extension import SettingsManager
+from akasa.extension import AkasaExtension, SettingsManager, get_registered_capabilities, get_registered_settings_schemas
 from akasa.utils import get_daemon_host_config_path, save_json_config
 from akasa.vfs import sync_vfs_barrier
 
@@ -85,6 +85,40 @@ class TestSettingsIsSet(unittest.TestCase):
         sync_vfs_barrier("default")
         self.assertTrue(self.settings.is_set("daemon_value"))
         self.assertEqual(self.settings.get("daemon_value"), "from-root")
+
+    def test_get_registered_settings_schemas_materializes_callables_recursively(self):
+        """get_registered_settings_schemas evaluates callable root schemas, options, defaults, and nested schemas."""
+        dynamic_ext = AkasaExtension(
+            "dynamic_ext",
+            __name__,
+            settings_schema=lambda ws: [
+                {
+                    "id": "branch",
+                    "type": "select",
+                    "options": lambda target_ws: [f"{target_ws}-main", f"{target_ws}-dev"],
+                    "default": lambda: "default-branch",
+                    "item_schema": {
+                        "fields": [
+                            {"id": "sub_opt", "options": lambda: ["a", "b"]}
+                        ]
+                    }
+                }
+            ]
+        )
+
+        schemas = get_registered_settings_schemas("tenant_123")
+        self.assertIn("dynamic_ext", schemas)
+        field = schemas["dynamic_ext"][0]
+        self.assertEqual(field["options"], ["tenant_123-main", "tenant_123-dev"])
+        self.assertEqual(field["default"], "default-branch")
+        self.assertEqual(field["item_schema"]["fields"][0]["options"], ["a", "b"])
+
+        # The settings/schema route returns the same materialized schema, and it serializes to JSON.
+        handler = get_registered_capabilities()["dynamic_ext.settings.schema"]["handler"]
+        route_schema = handler(dynamic_ext.get_context("tenant_123"))
+        self.assertEqual(route_schema[0]["options"], ["tenant_123-main", "tenant_123-dev"])
+        self.assertEqual(route_schema[0]["item_schema"]["fields"][0]["options"], ["a", "b"])
+        json.dumps(route_schema)
 
 
 if __name__ == "__main__":
