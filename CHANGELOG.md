@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.7.0 (2026-11-03)
+
+### Features
+
+- **extension**: Implement recursive dynamic settings schema materialization and align contract
+  documentation
+  ([`ceec730`](https://github.com/Callosemic/akasa/commit/ceec73066225b5aaaa2ad9b8960c182f211306dd))
+
+
 ## v0.6.1 (2026-10-30)
 
 ### Bug Fixes
