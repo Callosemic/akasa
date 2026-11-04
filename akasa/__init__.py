@@ -15,7 +15,7 @@ from akasa.hooks import hooks
 import akasa.db as _akasa_db
 from akasa.db import close_thread_connections
 import akasa.vfs as _akasa_vfs
-from akasa.vfs import register_protected_vfs_targets
+from akasa.vfs import register_protected_vfs_targets, set_protected_write_handler, execute_confirmed_protected_write, is_protected_vfs_target
 import akasa.state as _akasa_state
 from akasa.state import register_core_module
 import akasa.workers as _akasa_workers

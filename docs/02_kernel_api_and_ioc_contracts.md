@@ -51,6 +51,9 @@ Because Akasa adheres to the **Blind Substrate Mandate**, the host application i
 * **`register_driver(scheme: str, driver_instance: Any, volume: Optional[str] = None)`**: Registers a custom VFS resolution driver (implementing `.resolve(uri_obj, workspace_id, physical_target) -> Optional[str]`) for an entire URI scheme (e.g., `'ctx'`) or a specific `(scheme, volume)` pair.
 * **`set_mount_authorizer(authorizer_fn: Callable)`**: Injects the bilateral peer-to-peer mount policy evaluator `authorizer_fn(target_ws: str, subscriber_ws: str, domain: str, rel_path: str) -> bool` governing read-only `ws://<target_ws>/<domain>/<rel_path>` virtual mounts.
 * **`register_protected_vfs_targets(*targets: Union[str, Tuple[str, str]])`**: DI Interface registering host-protected (namespace, basename) targets or paths that VFS mutations (`save`, `delete`, `move`, `bulk`) are prohibited from modifying or shadowing at Python import time.
+* **`set_protected_write_handler(handler: Optional[Callable[[Dict], Any]])`**: DI Interface for the host's policy on mutations that touch a protected target. The handler receives `{action, workspace_id, filepath, dest_path, content, data, origin}` and returns `(body, status)` or a body (status 202); the caller gets that answer and nothing is written. Without a handler, every such mutation is refused (403). Bulk operations hand each protected item to the handler and list the answers under `protected`. Inside a `VFSTransaction`, a protected save, delete, move or bulk item is not buffered: it goes to the handler at once and the caller gets its answer.
+* **`is_protected_vfs_target(filepath, workspace_id=None, is_absolute_artifact=False) -> bool`**: The guard's own check, for hosts that tell a person in advance that a change will be held. With a workspace it also checks the path the URI resolves to.
+* **`execute_confirmed_protected_write(workspace_id, filepath, content=None, data=None) -> (body, status)`**: Writes (or, with `content=None`, deletes) one protected target, skipping the protected-target check for that call only. Read-only mounts, volume resolution and the write queue still apply. Hosts call it only from their human confirmation path.
 
 ### 2.3 Flask Blueprints & WSGI Teardown
 * **`auth_bp` (`akasa.auth`)**: Exposes `POST /auth/bootstrap` for localhost, IoC hook (`execute_identity_handshake`), and static token authentication handshakes.
@@ -195,8 +198,9 @@ ext_bp = AkasaExtension(
     * extract_template_variables(text) -> List[Dict]: Extracts template parameters with default/required annotations.
     * interpolate_template_variables(text, values=None, resolver=None) -> str: Resolves inside-out template placeholders with fallbacks.
     * class ExecutionFrame: Slotted immutable execution context bound to contextvars across HTTP, IPC, Worker, and CLI transports.
-    * execution_frame(workspace_id=None, transport="CLI", method="CALL", payload=None, job_id=None): Context manager binding an active ExecutionFrame.
+    * execution_frame(workspace_id=None, transport="CLI", method="CALL", payload=None, job_id=None, origin=None): Context manager binding an active ExecutionFrame. `origin` says who started the call chain: an explicit origin wins, a nested frame keeps its caller's origin, and a frame with no caller takes its transport's default (`HTTP` → `ui`, `WORKER` → `worker`, `CLI` → `cli`, `IPC` → `internal`). Jobs and background hooks keep the origin of the code that submitted or emitted them.
     * get_current_frame() -> Optional[ExecutionFrame]: Returns active frame or None.
+    * get_current_origin() -> Optional[str]: The active frame's origin, or None outside a frame.
     * resolve_active_tenant(default="default") -> str: Resolves tenant from active frame or injected resolver.
     * sniff_tenant_id() -> str: Returns resolved active tenant workspace_id.
     * atomic_write_bytes(filepath, data, mode=None, lock=False) / atomic_write_text(filepath, content, encoding="utf-8", mode=None, lock=False): Atomic write with optional inter-process locking on .state.lock.

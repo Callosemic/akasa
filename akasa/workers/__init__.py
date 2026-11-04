@@ -12,6 +12,7 @@ from typing import TypedDict, List, Dict, Any, Optional, Literal, Union
 from concurrent.futures import ThreadPoolExecutor
 from akasa.context import (
     execution_frame,
+    get_current_origin,
     sniff_tenant_id,
     reclaim_process_memory,
     resolve_dag_wavefronts,
@@ -439,6 +440,10 @@ def _prepare_job_payload(args_json, workspace_id):
         args_payload = json.loads(args_json or "{}")
     if isinstance(args_payload, dict) and "_workspace_id" not in args_payload:
         args_payload["_workspace_id"] = workspace_id
+    # A job keeps the origin of whoever submitted it, so work started by a person is not mistaken for background work.
+    submitter_origin = get_current_origin()
+    if isinstance(args_payload, dict) and submitter_origin and "_origin" not in args_payload:
+        args_payload["_origin"] = submitter_origin
     serialized_json = json.dumps(args_payload)
     return workspace_id, conn, now, serialized_json
 def submit_job(job_id, ext_name, callback_name, interval_ms, args_json="{}", jitter_ms=0, workspace_id=None):
@@ -643,6 +648,7 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
     """Executes an immediate job and manages its lifecycle in the ledger."""
     func = _callbacks.get(f"{ext_name}:{callback_name}")
     kwargs = {}
+    job_origin = None
     if args_json:
         try:
             parsed = args_json if isinstance(args_json, dict) else json.loads(args_json)
@@ -650,6 +656,7 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
                 kwargs = parsed
                 if "_workspace_id" in kwargs:
                     target_ws = kwargs.pop("_workspace_id")
+                job_origin = kwargs.pop("_origin", None)
         except Exception as e:
             print(f"⚠️ [Worker] Failed to parse args_json for {job_id}: {e}")
     root_job_id = kwargs.get('root_job_id') or job_id
@@ -673,7 +680,7 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
             if 'job_id' in sig.parameters:
                 kwargs['job_id'] = job_id
 
-            with execution_frame(workspace_id=target_ws, transport="WORKER", job_id=job_id):
+            with execution_frame(workspace_id=target_ws, transport="WORKER", job_id=job_id, origin=job_origin):
                 result = func(**kwargs)
             if isinstance(result, str):
                 step_msg = result
@@ -900,6 +907,7 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
             target_ws = kwargs.pop("_workspace_id")
     except Exception:
         kwargs = {}
+    job_origin = kwargs.pop("_origin", None) if isinstance(kwargs, dict) else None
     if not is_extension_enabled(ext_name, target_ws):
         print(f"⚠️ [Worker] Extension '{ext_name}' is disabled in workspace '{target_ws}'. Dropping recurring job '{job_id}'.")
         conn = get_connection("workers", workspace_id=target_ws)
@@ -914,7 +922,7 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
                 kwargs['workspace_id'] = target_ws
             if 'job_id' in sig.parameters and 'job_id' not in kwargs:
                 kwargs['job_id'] = job_id
-            with execution_frame(workspace_id=target_ws, transport="WORKER", job_id=job_id):
+            with execution_frame(workspace_id=target_ws, transport="WORKER", job_id=job_id, origin=job_origin):
                 func(**kwargs)
         except Exception as e:
             print(f"❌ [Worker] Job {job_id} failed on workspace context [{target_ws}]: {e}")

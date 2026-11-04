@@ -9,6 +9,7 @@ from akasa.context import (
     ExecutionFrame,
     execution_frame,
     get_current_frame,
+    get_current_origin,
     set_tenant_resolver,
     resolve_active_tenant,
     sniff_tenant_id,

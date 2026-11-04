@@ -6,7 +6,7 @@ import traceback
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from typing import TypedDict, Optional, List, Dict, Any, Union, Callable
-from akasa.context import resolve_active_tenant, execution_frame
+from akasa.context import resolve_active_tenant, execution_frame, get_current_origin
 from akasa.events import sse_bus
 
 # --- EVENT BUS PAYLOAD CONTRACTS ---
@@ -296,11 +296,13 @@ class HookRegistry:
             sse_bus.emit_sse(event_name, safe_payload)
 
         workspace_ids = self._resolve_target_workspaces(event_name, kwargs)
+        # Background hooks keep the origin of the code that emitted the event.
+        emitter_origin = get_current_origin()
 
         def _run_hooks():
             try:
                 for wid in workspace_ids:
-                    with execution_frame(workspace_id=wid, transport="WORKER"):
+                    with execution_frame(workspace_id=wid, transport="WORKER", origin=emitter_origin):
                         kwargs['workspace_id'] = wid
                         with self._lock:
                             callbacks = [cb for _, cb in self._hooks.get(event_name, [])]

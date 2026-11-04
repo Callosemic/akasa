@@ -1,5 +1,6 @@
 import os
 import stat
+import contextvars
 import time
 import json
 import shutil
@@ -11,7 +12,7 @@ import threading
 from collections import OrderedDict
 from pathlib import Path, PurePosixPath
 from typing import Optional, Dict, List, Tuple, Any, Callable, Set, Union
-from akasa.context import parse_uri, is_subpath, atomic_write_text
+from akasa.context import parse_uri, is_subpath, atomic_write_text, get_current_origin
 from akasa.hooks import hooks
 from akasa.db import (
     get_connection,
@@ -815,11 +816,102 @@ def _is_s8_protected_target(filepath: Optional[str], resolved_path: Optional[str
     return False
 
 
+# Host policy for mutations that touch a protected target (S8). Without a handler they are refused.
+_PROTECTED_WRITE_HANDLER: Optional[Callable[[Dict[str, Any]], Any]] = None
+# Set only inside execute_confirmed_protected_write, for the duration of that one call.
+_CONFIRMED_PROTECTED_WRITE: contextvars.ContextVar[bool] = contextvars.ContextVar("akasa_confirmed_protected_write", default=False)
+
+
+def set_protected_write_handler(handler: Optional[Callable[[Dict[str, Any]], Any]]) -> None:
+    """
+    DI Interface: the host decides what happens to a VFS mutation that touches a protected target.
+
+    The handler is called as handler(request) with request = {"action": "save" | "delete" | "move",
+    "workspace_id", "filepath", "dest_path", "content", "data", "origin"}, where origin is the active execution
+    frame's origin. It returns (body, status), or a body alone (status 202), and that is what the caller gets back;
+    nothing is written. Passing None restores the default, which refuses every such mutation.
+    """
+    global _PROTECTED_WRITE_HANDLER
+    _PROTECTED_WRITE_HANDLER = handler
+
+
+def is_protected_vfs_target(filepath: Optional[str], workspace_id: Optional[str] = None, is_absolute_artifact: bool = False) -> bool:
+    """
+    True when filepath (or, given a workspace, the physical path it resolves to) is a host-protected target or
+    would shadow one. A pure check: hosts use it to tell a person ahead of time that a change will be held.
+    """
+    if not filepath:
+        return False
+    resolved = _resolve_physical_path(filepath, workspace_id, is_absolute_artifact) if workspace_id else None
+    return _is_s8_protected_target(filepath, resolved)
+
+
+def _protected_hit(*paths: Optional[str]) -> bool:
+    """True when any path touches a protected target, unless a confirmed protected write is in progress."""
+    if _CONFIRMED_PROTECTED_WRITE.get():
+        return False
+    return any(_is_s8_protected_target(p) for p in paths if p)
+
+
+def _route_protected_mutation(
+    action: str,
+    workspace_id: str,
+    filepath: str,
+    dest_path: Optional[str] = None,
+    content: Optional[str] = None,
+    data: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], int]:
+    """Hands a protected mutation to the host handler, or refuses it when none is registered."""
+    if _PROTECTED_WRITE_HANDLER is None:
+        print(f"🛑 [VFS Guarded Write] Refused {action} of protected file '{filepath}'.")
+        return {"status": "error", "message": _PROTECTED_WRITE_MESSAGE}, 403
+    request = {
+        "action": action,
+        "workspace_id": workspace_id,
+        "filepath": filepath,
+        "dest_path": dest_path,
+        "content": content,
+        "data": dict(data or {}),
+        "origin": get_current_origin(),
+    }
+    try:
+        result = _PROTECTED_WRITE_HANDLER(request)
+    except Exception as exc:
+        print(f"❌ [VFS Guarded Write] Protected write handler failed for '{filepath}': {exc}")
+        return {"status": "error", "message": _PROTECTED_WRITE_MESSAGE}, 403
+    if isinstance(result, tuple) and len(result) == 2 and isinstance(result[1], int):
+        return result[0], result[1]
+    return result, 202
+
+
+def execute_confirmed_protected_write(
+    workspace_id: str,
+    filepath: str,
+    content: Optional[str] = None,
+    data: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], int]:
+    """
+    Writes content to a protected target, or deletes it when content is None, skipping the protected-target check
+    for this one call. Every other guard still applies (read-only mounts, volume resolution, the write queue).
+    Hosts call this only from their human confirmation path, after a person approved this exact change.
+    """
+    token = _CONFIRMED_PROTECTED_WRITE.set(True)
+    try:
+        if content is None:
+            # The save path deletes too, and unlike execute_vfs_delete it honours is_absolute_artifact.
+            body = execute_vfs_save(workspace_id, filepath, "", dict(data or {}, action="delete"))
+        else:
+            body = execute_vfs_save(workspace_id, filepath, content, data)
+        return body, (202 if isinstance(body, dict) and body.get("status") == "accepted" else 400)
+    finally:
+        _CONFIRMED_PROTECTED_WRITE.reset(token)
+
+
 def execute_vfs_move(workspace_id, filepath, dest_path):
     if str(filepath).startswith("ws://") or str(dest_path).startswith("ws://"):
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}, 403
-    if _is_s8_protected_target(filepath) or _is_s8_protected_target(dest_path):
-        return {"status": "error", "message": _PROTECTED_WRITE_MESSAGE}, 403
+    if _protected_hit(filepath, dest_path):
+        return _route_protected_mutation("move", workspace_id, filepath, dest_path=dest_path)
     resolved_src = _resolve_physical_path(filepath, workspace_id)
     resolved_dest = _resolve_physical_path(dest_path, workspace_id)
     src_text = None
@@ -836,8 +928,8 @@ def execute_vfs_delete(workspace_id, filepath):
     if str(filepath).startswith("ws://"):
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}, 403
     resolved_path = _resolve_physical_path(filepath, workspace_id)
-    if _is_s8_protected_target(filepath, resolved_path):
-        return {"status": "error", "message": _PROTECTED_WRITE_MESSAGE}, 403
+    if _protected_hit(filepath, resolved_path):
+        return _route_protected_mutation("delete", workspace_id, filepath)
     seq = _stage_pending_write(resolved_path, _VFS_TOMBSTONE)
     _ensure_vfs_worker_alive()
     _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "delete", "_pending_seq": seq}))
@@ -845,12 +937,17 @@ def execute_vfs_delete(workspace_id, filepath):
 
 def execute_vfs_bulk(workspace_id, operations):
     sanitized = []
+    protected_results = []
     for op in operations:
         fp = op.get("filepath", "")
         dest = op.get("dest_path", "")
         if str(fp).startswith("ws://") or str(dest).startswith("ws://"):
             continue
-        if _is_s8_protected_target(fp) or _is_s8_protected_target(dest):
+        if _protected_hit(fp, dest):
+            body, status = _route_protected_mutation(
+                op.get("action", "save"), workspace_id, fp, dest_path=dest or None, content=op.get("content"), data=op,
+            )
+            protected_results.append({"filepath": fp, "status_code": status, **(body if isinstance(body, dict) else {"result": body})})
             continue
         op_copy = dict(op)
         act = op_copy.get("action", "save")
@@ -875,16 +972,21 @@ def execute_vfs_bulk(workspace_id, operations):
         sanitized.append(op_copy)
     _ensure_vfs_worker_alive()
     _VFS_WRITE_QUEUE.put((workspace_id, "", "", {"action": "bulk", "operations": sanitized}))
-    return {"status": "accepted", "message": f"Bulk operation ({len(sanitized)} item(s)) queued.", "operations": sanitized}, 202
+    result = {"status": "accepted", "message": f"Bulk operation ({len(sanitized)} item(s)) queued.", "operations": sanitized}
+    if protected_results:
+        result["protected"] = protected_results
+    return result, 202
 def execute_vfs_save(workspace_id, filepath, content, data=None):
     data = dict(data or {})
     if str(filepath).startswith("ws://"):
         print(f"🛑 [VFS Security] Write dropped: Virtual mount '{filepath}' is strictly read-only.")
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}
     resolved_path = _resolve_physical_path(filepath, workspace_id, data.get("is_absolute_artifact"))
-    if _is_s8_protected_target(filepath, resolved_path):
-        print(f"🛑 [VFS Guarded Write] Refused write to protected file '{filepath}'.")
-        return {"status": "error", "message": _PROTECTED_WRITE_MESSAGE}
+    if _protected_hit(filepath, resolved_path, data.get("delete_source")):
+        body, _status = _route_protected_mutation(
+            "delete" if data.get("action") == "delete" else "save", workspace_id, filepath, content=content, data=data,
+        )
+        return body
     # Pre-flight Volume Validation
     if not data.get("is_absolute_artifact"):
         if not resolved_path:
@@ -981,7 +1083,13 @@ def execute_vfs_save_physical(workspace_id, filepath, content, data, defer_event
     hooks.emit_background('vfs_mutated', workspace_id=workspace_id, mutations=emitted_mutations)
     return None
 class VFSTransaction:
-    """Provides dual-mode immediate queue dispatch and atomic buffered context-manager transactions for VFS mutations."""
+    """
+    Provides dual-mode immediate queue dispatch and atomic buffered context-manager transactions for VFS mutations.
+
+    A mutation of a protected target is never buffered: it goes to the host's protected-write handler at once and the
+    caller gets the handler's answer. It writes nothing, so it does not weaken the transaction's atomicity, and it is
+    not withdrawn if the transaction later fails (the host keeps it, for example as a pending change).
+    """
     def __init__(self, workspace_id):
         self.workspace_id = workspace_id
         self._buffer = []
@@ -995,9 +1103,10 @@ class VFSTransaction:
         if not data.get("is_absolute_artifact") and not resolved:
             print(f"⚠️ [VFS] Transaction dropped: Volume for '{filepath}' is not mounted.")
             return {"status": "error", "message": f"Volume for '{filepath}' is not mounted."}
-        if self._in_transaction:
+        if self._in_transaction and not _protected_hit(filepath, resolved, data.get("delete_source")):
             self._buffer.append((filepath, content, data))
             return {"status": "buffered", "message": f"File {filepath} buffered in transaction."}
+        # A protected save is handed to the host at once, so the caller sees its answer (see _route_protected_mutation).
         # Pre-flight Idempotency Gatekeeper: fast-path size + RAM cache check
         if not data.get("delete_source") and resolved and _is_file_identical(resolved, content):
             return {"status": "accepted", "message": f"File {filepath} unchanged (idempotent)."}
@@ -1009,6 +1118,9 @@ class VFSTransaction:
         if not data.get("is_absolute_artifact") and filepath and "://" not in str(filepath):
             raise ValueError(f"Non-canonical URI rejected by VFS delete (missing scheme:// prefix): '{filepath}'")
         data["action"] = "delete"
+        resolved = _resolve_physical_path(filepath, self.workspace_id, data.get("is_absolute_artifact"))
+        if self._in_transaction and _protected_hit(filepath, resolved):
+            return _route_protected_mutation("delete", self.workspace_id, filepath, data=data)
         if self._in_transaction:
             self._buffer.append((filepath, "", data))
             return {"status": "buffered", "message": "File deletion buffered."}, 202
@@ -1026,6 +1138,8 @@ class VFSTransaction:
             raise ValueError(f"Non-canonical URI rejected by VFS move (missing scheme:// prefix): '{filepath}' -> '{dest_path}'")
         data["action"] = "move"
         data["dest_path"] = dest_path
+        if self._in_transaction and _protected_hit(filepath, dest_path):
+            return _route_protected_mutation("move", self.workspace_id, filepath, dest_path=dest_path, data=data)
         if self._in_transaction:
             self._buffer.append((filepath, "", data))
             return {"status": "buffered", "message": "File move buffered."}, 202
@@ -1034,13 +1148,25 @@ class VFSTransaction:
     def bulk(self, operations: List[Dict[str, Any]]):
         """Queues a batch of VFS operations (move, delete, save) in a single atomic commit."""
         if self._in_transaction:
+            protected_results = []
+            buffered = []
             for op in (operations or []):
-                act = op.get("action", "save")
                 fp = op.get("filepath", "")
+                dest = op.get("dest_path", "")
                 content = op.get("content", "")
+                if _protected_hit(fp, dest):
+                    body, status = _route_protected_mutation(
+                        op.get("action", "save"), self.workspace_id, fp, dest_path=dest or None, content=content, data=op,
+                    )
+                    protected_results.append({"filepath": fp, "status_code": status, **(body if isinstance(body, dict) else {"result": body})})
+                    continue
                 op_copy = dict(op)
                 self._buffer.append((fp, content, op_copy))
-            return {"status": "buffered", "operations": operations}, 202
+                buffered.append(op)
+            result = {"status": "buffered", "operations": buffered}
+            if protected_results:
+                result["protected"] = protected_results
+            return result, 202
         return execute_vfs_bulk(self.workspace_id, operations)
 
     def evict_cache(self, resolved_path: str, preserve_ancestors: bool = False) -> None:

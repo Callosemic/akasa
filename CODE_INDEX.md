@@ -52,9 +52,10 @@ akasa/
 │   │       ├── def is_host_allowed(host, trusted_suffixes, allowed_hosts) # DNS-rebinding guard: accepts loopback hostnames, exact registered hosts, and hosts under a trusted suffix.
 │   │       └── def is_loopback_origin(url_str) # True when an Origin/Referer URL points at a loopback hostname (port ignored).
 │   ├── context.py                  # Ring 0: Pure stdlib execution context (ExecutionFrame), atomic file writes, and stateless utilities
-│   │   ├── class ExecutionFrame    # Immutable-style slotted execution frame bound to contextvars across HTTP, IPC, Worker, and CLI calls.
-│   │   ├── def execution_frame(workspace_id, transport, method, payload, ...) # Context manager binding an active ExecutionFrame for transport-agnostic tenant and payload resolution.
+│   │   ├── class ExecutionFrame    # Slotted execution frame bound to contextvars across HTTP, IPC, Worker and CLI calls; carries the call's origin (ui, mcp, routine, agent, worker, cli).
+│   │   ├── def execution_frame(workspace_id, transport, method, payload, ...) # Context manager binding an ExecutionFrame; an explicit origin wins, nested frames inherit, and each transport has a default origin.
 │   │   ├── def get_current_frame() # Returns the currently active ExecutionFrame on this context/thread, or None.
+│   │   ├── def get_current_origin() # Who started the active call chain ('ui', 'worker', or a host-set origin such as 'mcp'), or None outside a frame.
 │   │   ├── def set_tenant_resolver(resolver_fn) # DI Interface: Registers a transport-agnostic callable returning the active tenant workspace_id.
 │   │   ├── def resolve_active_tenant(default) # Resolves the active workspace_id from the active ExecutionFrame or injected tenant_resolver.
 │   │   ├── def sniff_tenant_id()   # Returns the active tenant workspace_id (defaults to 'default').
@@ -121,7 +122,7 @@ akasa/
 │   │   ├── class HookPayload_PreFileSave(TypedDict) # Payload emitted immediately before physical VFS disk mutation.
 │   │   ├── class HookPayload_JobBatonPassed(TypedDict) # Telemetry payload emitted during background worker step transitions.
 │   │   ├── class HookPayload_SystemError(TypedDict) # System-wide error telemetry payload for unhandled exceptions.
-│   │   └── class HookRegistry      # The central Event Bus for the Akasa Micro-Kernel.
+│   │   └── class HookRegistry      # The central Event Bus for the Akasa Micro-Kernel; background hooks run with the emitter's origin.
 │   ├── process.py                  # Volume-sandboxed process manager and execution wrapper
 │   │   ├── def execute_binary(cmd, cwd, env, check, ...) # Universal binary execution wrapper resolving PATH, venv and module CLI fallbacks; strips the boot token, passes shell commands through as written, and kills the whole process tree on timeout.
 │   │   └── class ProcessManager    # Volume-sandboxed subprocess runner enforcing workspace directory boundaries.
@@ -182,12 +183,15 @@ akasa/
 │   │   ├── def sync_vfs_barrier(workspace_id, timeout) # Halts the calling thread until all VFS writes queued prior to this call are physically flushed.
 │   │   ├── def start_vfs_pipeline(**kwargs) # Starts the background worker thread for asynchronous VFS writes.
 │   │   ├── def stop_vfs_pipeline(**kwargs) # Drains and terminates the background VFS commit worker thread.
-│   │   ├── def execute_vfs_move(workspace_id, filepath, dest_path) # Queues an atomic asynchronous file move operation.
-│   │   ├── def execute_vfs_delete(workspace_id, filepath) # Queues an atomic asynchronous file deletion operation.
-│   │   ├── def execute_vfs_bulk(workspace_id, operations) # Queues a consolidated batch of VFS operations for atomic commit.
-│   │   ├── def execute_vfs_save(workspace_id, filepath, content, data) # Stages and queues an atomic asynchronous file save operation.
+│   │   ├── def set_protected_write_handler(handler) # DI Interface: the host decides what happens to a mutation that touches a protected target; without a handler it is refused.
+│   │   ├── def is_protected_vfs_target(filepath, workspace_id, is_absolute_artifact) # True when filepath (or, given a workspace, the physical path it resolves to) is a host-protected target or would shadow one.
+│   │   ├── def execute_confirmed_protected_write(workspace_id, filepath, content, data) # Writes or deletes one protected target for the host's human confirmation path; every other guard still applies.
+│   │   ├── def execute_vfs_move(workspace_id, filepath, dest_path) # Queues an atomic file move; a move touching a protected target goes to the host handler instead.
+│   │   ├── def execute_vfs_delete(workspace_id, filepath) # Queues an atomic file deletion; a protected target goes to the host handler instead.
+│   │   ├── def execute_vfs_bulk(workspace_id, operations) # Queues a batch of VFS operations for atomic commit; protected items go to the host handler and are listed under 'protected'.
+│   │   ├── def execute_vfs_save(workspace_id, filepath, content, data) # Stages and queues an atomic file save; a protected target goes to the host handler and its answer is returned.
 │   │   ├── def execute_vfs_save_physical(workspace_id, filepath, content, data, ...) # Executes physical disk write with fsync, permissions, and ledger commit.
-│   │   └── class VFSTransaction    # Provides dual-mode immediate queue dispatch and atomic buffered context-manager transactions for VFS mutations.
+│   │   └── class VFSTransaction    # Immediate or buffered (context-manager) VFS mutations; protected mutations are never buffered and go to the host handler at once.
 │   └── workers/                    # Metronome worker engine and job ledger
 │       └── __init__.py             # Metronome worker engine, task scheduler, and job ledger
 │           ├── class ChainStepSchema(TypedDict) # Specification schema for an execution step in a worker chain.
@@ -226,6 +230,7 @@ akasa/
 │       ├── 0011_durable_credential_store_lazy_tokens_and_guarded_job_settlement.md # ADR 0011: Durable Stdlib Credential Store, Lazy Boot Token Initialization, and Claim-Guarded Worker Settlement
 │       ├── 0012_host_protected_vfs_targets_and_sandbox_drainage.md # ADR 0012: Host-Protected VFS Targets, Import Shadowing Defense, and Pre-Reset Write Drainage
 │       ├── 0013_process_tree_termination_and_verbatim_shell_execution.md # ADR 0013: Process-Tree Termination on Timeout and Verbatim Shell Command Execution
+│       ├── 0014_host_protected_write_policy_and_execution_origin.md # ADR 0014: Host Policy for Protected Writes and Execution Origin
 │       ├── archived/               # Baseline architectural decisions assimilated into kernel
 │       │   ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001 specification
 │       │   ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
@@ -263,6 +268,9 @@ akasa/
         │   └── class TestProcessTreeTimeout(unittest.TestCase) # A shell that backgrounds a long sleep leaves nothing running after its timeout.
         ├── test_protected_vfs_targets.py # Tests for host-registered protected VFS targets: whole-segment matching and import-shadowing paths
         │   └── class TestProtectedVfsTargets(unittest.TestCase) # register_protected_vfs_targets protects a module, everything that would shadow it, and nothing else.
+        ├── test_protected_write_handler.py # Tests for the protected write handler, confirmed protected writes, and execution-frame origins (defaults, inheritance, jobs)
+        │   ├── class TestProtectedWriteHandler(unittest.TestCase) # Without a handler protected mutations are refused; with one, saves, deletes, moves, bulk items and transactions get its answer and nothing is written.
+        │   └── class TestExecutionFrameOrigin(unittest.TestCase) # Transport defaults, explicit origins, inheritance, and jobs running with the submitter's origin.
         ├── test_settings_is_set.py # Tests that SettingsManager.is_set distinguishes saved values from schema defaults in every scope
         │   └── class TestSettingsIsSet(unittest.TestCase) # [stale?] SettingsManager.is_set distinguishes saved values from schema defaults across every scope.
         ├── test_vfs_reset_drain.py # Tests that reset_state drains queued VFS writes before switching the daemon cwd

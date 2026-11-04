@@ -34,9 +34,19 @@ _FILE_LOCKS: typing.Dict[str, threading.RLock] = {}
 _TENANT_RESOLVER: typing.Optional[typing.Callable[[], typing.Optional[str]]] = None
 
 
+# Default origin of a frame that starts a call chain, by transport. Hosts set more specific origins explicitly
+# (for example 'mcp', 'routine' or 'agent') where they dispatch; nested frames inherit their caller's origin.
+DEFAULT_ORIGIN_BY_TRANSPORT: typing.Dict[str, str] = {
+    "HTTP": "ui",
+    "WORKER": "worker",
+    "CLI": "cli",
+    "IPC": "internal",
+}
+
+
 class ExecutionFrame:
     """Immutable-style slotted execution frame bound to contextvars across HTTP, IPC, Worker, and CLI calls."""
-    __slots__ = ("workspace_id", "transport", "method", "payload", "job_id")
+    __slots__ = ("workspace_id", "transport", "method", "payload", "job_id", "origin")
 
     def __init__(
         self,
@@ -45,12 +55,14 @@ class ExecutionFrame:
         method: str = "CALL",
         payload: typing.Optional[typing.Dict[str, typing.Any]] = None,
         job_id: typing.Optional[str] = None,
+        origin: typing.Optional[str] = None,
     ):
         self.workspace_id = workspace_id or "default"
         self.transport = transport
         self.method = method
         self.payload = payload if isinstance(payload, dict) else {}
         self.job_id = job_id
+        self.origin = origin or DEFAULT_ORIGIN_BY_TRANSPORT.get(transport, "internal")
 
 
 _CURRENT_FRAME: contextvars.ContextVar[typing.Optional[ExecutionFrame]] = contextvars.ContextVar(
@@ -65,8 +77,14 @@ def execution_frame(
     method: str = "CALL",
     payload: typing.Optional[typing.Dict[str, typing.Any]] = None,
     job_id: typing.Optional[str] = None,
+    origin: typing.Optional[str] = None,
 ):
-    """Context manager binding an active ExecutionFrame for transport-agnostic tenant and payload resolution."""
+    """
+    Context manager binding an active ExecutionFrame for transport-agnostic tenant and payload resolution.
+
+    origin says who started the call chain. An explicit origin wins; otherwise a nested frame keeps its caller's
+    origin, and a frame with no caller takes its transport's default (DEFAULT_ORIGIN_BY_TRANSPORT).
+    """
     prev = _CURRENT_FRAME.get()
     resolved_ws = workspace_id or (prev.workspace_id if prev else None) or resolve_active_tenant("default")
     frame = ExecutionFrame(
@@ -75,6 +93,7 @@ def execution_frame(
         method=method,
         payload=payload if payload is not None else (prev.payload if prev else None),
         job_id=job_id if job_id is not None else (prev.job_id if prev else None),
+        origin=origin or (prev.origin if prev else None),
     )
     token = _CURRENT_FRAME.set(frame)
     try:
@@ -86,6 +105,12 @@ def execution_frame(
 def get_current_frame() -> typing.Optional[ExecutionFrame]:
     """Returns the currently active ExecutionFrame on this context/thread, or None."""
     return _CURRENT_FRAME.get()
+
+
+def get_current_origin() -> typing.Optional[str]:
+    """Who started the active call chain ('ui', 'worker', or a host-set origin such as 'mcp'), or None outside a frame."""
+    frame = _CURRENT_FRAME.get()
+    return frame.origin if frame is not None else None
 
 
 def set_tenant_resolver(resolver_fn: typing.Optional[typing.Callable[[], typing.Optional[str]]]) -> None:
