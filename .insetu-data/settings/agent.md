@@ -1,0 +1,4 @@
+- **Host-Agnostic Boundaries:** Never hardcode host paths (e.g., `.insetu`); resolve dynamically via `AKASA_CONTROL_DIR`.
+- **Blind Substrate Mandate:** Never bleed domain-specific business logic (UI, Git, specific repositories, or LLM orchestration) into the pure Ring 0 / Tier 1 kernel.
+- **Multi-Tenant State Isolation:** Never use unprotected globals for tenant data; use Ring 0 `ExecutionFrame` (`contextvars`), thread-local stores (`_local`), or tenant-keyed registries.
+- **Concurrency & VFS Confinement:** Route writes through the VFS write queue, enforce protected VFS target handlers, and avoid blocking worker/metronome pools.
