@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.8.0 (2026-11-03)
+
+### Features
+
+- **vfs**: Add protected write policy handler, confirmed writes, and execution origin propagation
+  ([`2bf7edc`](https://github.com/Callosemic/akasa/commit/2bf7edced72009546e150141c4857410513a81e0))
+
+
 ## v0.7.0 (2026-11-03)
 
 ### Features
