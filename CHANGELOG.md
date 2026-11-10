@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.9.0 (2026-11-10)
+
+### Features
+
+- **db**: Support declarative table constraints and indexes with expanded connection pool
+  ([`a94eed7`](https://github.com/Callosemic/akasa/commit/a94eed79a4da6ff57c4ccc121f5ca5cfc87f297d))
+
+
 ## v0.8.0 (2026-11-03)
 
 ### Features
