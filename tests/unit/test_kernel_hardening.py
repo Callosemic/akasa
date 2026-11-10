@@ -19,7 +19,7 @@ from akasa.context import (
     sniff_tenant_id,
     thread_safe_cache,
 )
-from akasa.db import get_connection
+from akasa.db import apply_declarative_schema, get_connection, register_schema
 from akasa.extension import AkasaExtension
 from akasa.hooks import hooks
 from akasa.process import execute_binary
@@ -203,6 +203,42 @@ class TestAkasaKernelHardening(unittest.TestCase):
         temp_store = conn.execute("PRAGMA temp_store;").fetchone()[0]
         self.assertEqual(str(journal_mode).lower(), "wal")
         self.assertEqual(int(temp_store), 2)
+
+    def test_declarative_schema_constraints_and_indexes(self):
+        """apply_declarative_schema creates __constraints__ with the table and both __indexes__ spellings (bare and full CREATE INDEX)."""
+        schema = {
+            "test_events": {
+                "id": "TEXT",
+                "kind": "TEXT",
+                "created_at": "REAL",
+                "__constraints__": ["PRIMARY KEY (id, kind)"],
+                "__indexes__": [
+                    "idx_test_events_created ON test_events(created_at)",
+                    "CREATE INDEX IF NOT EXISTS idx_test_events_kind ON test_events(kind)",
+                ],
+            }
+        }
+        register_schema("test_meta_db", schema)
+        conn = get_connection("test_meta_db", workspace_id=self.workspace_id)
+        apply_declarative_schema("test_meta_db", schema, workspace_id=self.workspace_id)
+
+        conn.execute("INSERT INTO test_events (id, kind, created_at) VALUES ('e1', 'a', 1.0)")
+        with self.assertRaises(conn.IntegrityError):
+            conn.execute("INSERT INTO test_events (id, kind, created_at) VALUES ('e1', 'a', 2.0)")
+        conn.execute("INSERT INTO test_events (id, kind, created_at) VALUES ('e1', 'b', 2.0)")
+
+        index_names = {row[1] for row in conn.execute("PRAGMA index_list(test_events)").fetchall()}
+        self.assertIn("idx_test_events_created", index_names)
+        self.assertIn("idx_test_events_kind", index_names)
+
+        # Re-applying is idempotent: no duplicate-index errors, no second table.
+        apply_declarative_schema("test_meta_db", schema, workspace_id=self.workspace_id)
+
+    def test_connection_pool_keeps_sixteen_databases_open_per_workspace(self):
+        """Sixteen databases in one workspace stay usable at once; this fails if the pool limit falls back below 16."""
+        conns = [get_connection(f"db_pool_test_{i}", workspace_id=self.workspace_id) for i in range(16)]
+        for conn in conns:
+            self.assertEqual(conn.execute("SELECT 1").fetchone()[0], 1)
 
     def test_subprocess_token_sanitization(self):
         """execute_binary purges AKASA_BOOT_TOKEN from child environments in run and popen modes."""

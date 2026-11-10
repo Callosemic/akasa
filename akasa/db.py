@@ -46,24 +46,59 @@ def register_schema(ext_name, schema_dict):
     """Registers a declarative SQLite schema for automatic workspace migration."""
     _REGISTERED_SCHEMAS[ext_name] = schema_dict
 
+def _build_table_ddl_and_indexes(table_name: str, columns: dict) -> Tuple[str, dict, List[str]]:
+    """Separates column definitions from declarative '__constraints__' and '__indexes__' metadata."""
+    real_cols = {
+        col: dtype
+        for col, dtype in columns.items()
+        if not str(col).startswith("__") and isinstance(dtype, str)
+    }
+    raw_constraints = columns.get("__constraints__") or []
+    constraints = [str(c).strip() for c in raw_constraints if str(c).strip()] if isinstance(raw_constraints, (list, tuple)) else []
+    raw_indexes = columns.get("__indexes__") or []
+    indexes: List[str] = []
+    if isinstance(raw_indexes, (list, tuple)):
+        for idx_spec in raw_indexes:
+            idx_str = str(idx_spec or "").strip()
+            if not idx_str:
+                continue
+            if idx_str.upper().startswith("CREATE "):
+                indexes.append(idx_str)
+            else:
+                indexes.append(f"CREATE INDEX IF NOT EXISTS {idx_str}")
+
+    col_defs = [f"{col} {dtype}" for col, dtype in real_cols.items()] + constraints
+    create_sql = f"CREATE TABLE IF NOT EXISTS {table_name} ({', '.join(col_defs)})"
+    return create_sql, real_cols, indexes
+
+
 def apply_declarative_schema(db_name, schema_dict, workspace_id=None):
-    """Generates CREATE TABLE and executes ALTER TABLE ADD COLUMN migrations via diffing."""
+    """Generates CREATE TABLE (including '__constraints__' and '__indexes__') and executes ALTER TABLE ADD COLUMN migrations via diffing."""
     conn = get_connection(db_name, workspace_id)
     for table_name, columns in schema_dict.items():
+        if not isinstance(columns, dict):
+            continue
+        create_sql, real_cols, index_sqls = _build_table_ddl_and_indexes(table_name, columns)
         # 1. Generate CREATE TABLE
-        col_defs = ", ".join([f"{col} {dtype}" for col, dtype in columns.items()])
-        conn.execute(f"CREATE TABLE IF NOT EXISTS {table_name} ({col_defs})")
+        conn.execute(create_sql)
 
         # 2. Diff columns and ALTER TABLE
         cursor = conn.execute(f"PRAGMA table_info({table_name})")
         existing_cols = {row['name'] for row in cursor.fetchall()}
 
-        for col, dtype in columns.items():
+        for col, dtype in real_cols.items():
             if col not in existing_cols:
                 try:
                     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} {dtype}")
                 except Exception as e:
                     print(f"⚠️ Auto-migration failed for {table_name}.{col}: {e}")
+
+        # 3. Apply declarative indexes idempotently
+        for idx_sql in index_sqls:
+            try:
+                conn.execute(idx_sql)
+            except Exception as e:
+                print(f"⚠️ Auto-index creation failed on {table_name}: {e}")
     conn.commit()
 # Register core worker database schema for tracking all file deltas and worker ledgers contextually
 register_schema('workers', {
@@ -234,7 +269,7 @@ def get_connection(db_name, workspace_id=None):
             conn = ws_conns.pop(db_name)
             ws_conns[db_name] = conn
             return conn
-        if len(ws_conns) >= 4:
+        if len(ws_conns) >= 16:
             oldest_db = next(iter(ws_conns))
             old_c = ws_conns.pop(oldest_db, None)
             if old_c:
@@ -299,8 +334,12 @@ def get_connection(db_name, workspace_id=None):
     if db_name in _REGISTERED_SCHEMAS and not getattr(conn, '_schema_applied', False):
         try:
             for table_name, columns in _REGISTERED_SCHEMAS[db_name].items():
-                col_defs = ", ".join([f"{col} {dtype}" for col, dtype in columns.items()])
-                conn.execute(f"CREATE TABLE IF NOT EXISTS {table_name} ({col_defs})")
+                if not isinstance(columns, dict):
+                    continue
+                create_sql, _, index_sqls = _build_table_ddl_and_indexes(table_name, columns)
+                conn.execute(create_sql)
+                for idx_sql in index_sqls:
+                    conn.execute(idx_sql)
             conn.commit()
             conn._schema_applied = True
         except Exception:

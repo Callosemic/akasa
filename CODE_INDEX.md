@@ -87,7 +87,7 @@ akasa/
 │   ├── db.py                       # Ring 2: Thread-local SQLite connection pool and WAL schema migrations
 │   │   ├── def set_db_physics_resolvers(physics_fn, all_workspaces_fn) # DI Interface: Ring 2 state module binds workspace physics resolvers so db.py has zero upward dependencies.
 │   │   ├── def register_schema(ext_name, schema_dict) # Registers a declarative SQLite schema for automatic workspace migration.
-│   │   ├── def apply_declarative_schema(db_name, schema_dict, workspace_id) # Generates CREATE TABLE and executes ALTER TABLE ADD COLUMN migrations via diffing.
+│   │   ├── def apply_declarative_schema(db_name, schema_dict, workspace_id) # Generates CREATE TABLE (including '__constraints__' and '__indexes__') and executes ALTER TABLE ADD COLUMN migrations via diffing.
 │   │   ├── def provision_workspace_schemas(workspace_id) # Applies all registered declarative SQLite schemas for a specific tenant workspace.
 │   │   ├── def recover_corrupt_databases(workspace_id) # Self-healing recovery routine: salvages rows from *.db.corrupt_* dumps inside the workspace's cache/db directory.
 │   │   ├── def migrate_legacy_sqlite_paths(workspace_id, db_name, table, column, ...) # Updates legacy substring paths inside a specific workspace SQLite table column if the database exists.
@@ -96,7 +96,7 @@ akasa/
 │   │   ├── def evict_cached_connection(workspace_id, db_name) # Safely closes and removes a single cached database connection on the current thread.
 │   │   ├── def close_thread_connections() # Closes and purges all cached SQLite connections on the calling thread to prevent FD leaks in per-request WSGI threads.
 │   │   ├── def reset()             # Resets Ring 0 context state for isolated test harnesses.
-│   │   └── def get_connection(db_name, workspace_id) # Returns a thread-local SQLite connection.
+│   │   └── def get_connection(db_name, workspace_id) # Returns a thread-local SQLite connection with 16-database per-workspace LRU pooling.
 │   ├── events.py                   # Thread-safe SSE event bus and client queue manager
 │   │   └── class EventBus          # Thread-safe Server-Sent Events (SSE) broadcasting bus and subscriber queue manager.
 │   ├── extension.py                # Ring 4: Extension SDK context wrappers, SettingsManager, and JobManager
@@ -263,7 +263,7 @@ akasa/
         │   ├── class TestBootstrapAndHostGate(unittest.TestCase) # S1: /auth/bootstrap only grants localhost trust to direct loopback requests; the gate rejects foreign Hosts.
         │   └── class TestForwardedHeaderMembraneRule(unittest.TestCase) # S1: the FORWARDED_HEADER_MEMBRANE fitness rule keeps forwarding-header reads inside akasa/auth/peer.py.
         ├── test_kernel_hardening.py # Unit tests for RFC 0048 VFS micro-batching, idempotency, slotted AkasaURI, hook auth caching, and SQLite PRAGMAs
-        │   └── class TestAkasaKernelHardening(unittest.TestCase) # Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening (Refactors A–F).
+        │   └── class TestAkasaKernelHardening(unittest.TestCase) # [stale?] Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening (Refactors A–F).
         ├── test_process_tree_timeout.py # ProcessManager.run() and execute_binary(timeout=...) kill the whole process tree on timeout, and shell commands run as written.
         │   └── class TestProcessTreeTimeout(unittest.TestCase) # A shell that backgrounds a long sleep leaves nothing running after its timeout.
         ├── test_protected_vfs_targets.py # Tests for host-registered protected VFS targets: whole-segment matching and import-shadowing paths

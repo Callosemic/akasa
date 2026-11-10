@@ -104,7 +104,7 @@ ext_bp = AkasaExtension(
     module_name: str,
     title: Optional[str] = None,
     description: str = "",
-    schema: Optional[Dict[str, Dict[str, str]]] = None,
+    schema: Optional[Dict[str, Dict[str, Any]]] = None,
     core: bool = False,
     settings_schema: Optional[Union[List[Dict[str, Any]], Callable[[str], List[Dict[str, Any]]]]] = None
 )
