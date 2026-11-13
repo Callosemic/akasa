@@ -5,7 +5,6 @@ import time
 import json
 import shutil
 import queue
-import difflib
 import hashlib
 import traceback
 import threading
@@ -14,12 +13,9 @@ from pathlib import Path, PurePosixPath
 from typing import Optional, Dict, List, Tuple, Any, Callable, Set, Union
 from akasa.context import parse_uri, is_subpath, atomic_write_text, get_current_origin
 from akasa.hooks import hooks
-from akasa.db import (
-    get_connection,
-    _get_tenant_control_dir as get_tenant_control_dir,
-    _get_all_workspace_ids as get_all_workspace_ids,
-)
+from akasa.db import get_connection, _get_tenant_control_dir as get_tenant_control_dir, _get_all_workspace_ids as get_all_workspace_ids
 from akasa.uri import AkasaURI
+from akasa.merge import three_way_merge_text
 
 _ARTIFACT_PATH_RESOLVER: Optional[Callable[[str, Optional[str]], str]] = None
 _PROTECTED_VFS_TARGETS: Set[Tuple[str, str]] = set()
@@ -226,135 +222,7 @@ def _relocate_vfs_ancestors(resolved_src: str, resolved_dest: str):
             _ANCESTOR_CACHE.move_to_end(resolved_dest)
 
 
-def _extract_diff_hunks(base_lines: List[str], target_lines: List[str]) -> List[Tuple[int, int, List[str]]]:
-    """Returns list of (base_start, base_end, replacement_lines) hunks transforming base_lines -> target_lines."""
-    matcher = difflib.SequenceMatcher(None, base_lines, target_lines, autojunk=False)
-    hunks: List[Tuple[int, int, List[str]]] = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == 'equal':
-            continue
-        hunks.append((i1, i2, target_lines[j1:j2]))
-    return hunks
 
-
-def _is_contiguous_line_subslice(needle: List[str], haystack: List[str]) -> bool:
-    if not needle:
-        return False
-    n_len = len(needle)
-    h_len = len(haystack)
-    if n_len > h_len:
-        return False
-    return any(haystack[idx:idx + n_len] == needle for idx in range(h_len - n_len + 1))
-
-
-def _is_subsequence_edit(disk_hunks: List[Tuple[int, int, List[str]]], incoming_hunks: List[Tuple[int, int, List[str]]]) -> bool:
-    """
-    Zombie-ACK Detector:
-    Checks if every hunk in disk_hunks (Base -> Disk V1) shares the same base span and is either identical to
-    or a contiguous line-slice extension within a corresponding hunk in incoming_hunks (Base -> Incoming V2).
-    """
-    if not disk_hunks:
-        return True
-    for d_start, d_end, d_rep in disk_hunks:
-        matched = False
-        for in_start, in_end, in_rep in incoming_hunks:
-            if in_start == d_start and in_end == d_end:
-                if d_rep == in_rep or _is_contiguous_line_subslice(d_rep, in_rep):
-                    matched = True
-                    break
-        if not matched:
-            return False
-    return True
-
-
-def three_way_merge_text(base_text: str, disk_text: str, incoming_text: str) -> Tuple[bool, str]:
-    """
-    Deterministic 3-Way Text Merger (Base -> Disk vs. Base -> Incoming).
-    Returns (is_clean_merge: bool, merged_text: str).
-    """
-    if disk_text == incoming_text:
-        return True, incoming_text
-    if disk_text == base_text:
-        return True, incoming_text
-    if incoming_text == base_text:
-        return True, disk_text
-
-    base_norm = base_text.replace('\r\n', '\n')
-    disk_norm = disk_text.replace('\r\n', '\n')
-    inc_norm = incoming_text.replace('\r\n', '\n')
-
-    if disk_norm == inc_norm:
-        return True, incoming_text
-    if disk_norm == base_norm:
-        return True, incoming_text
-    if inc_norm == base_norm:
-        return True, disk_text
-
-    base_lines = base_norm.split('\n')
-    disk_lines = disk_norm.split('\n')
-    inc_lines = inc_norm.split('\n')
-
-    disk_hunks = _extract_diff_hunks(base_lines, disk_lines)
-    inc_hunks = _extract_diff_hunks(base_lines, inc_lines)
-
-    # 1. Zombie-ACK Fast Path: Disk V1 is an earlier snapshot of the exact same edit stream in Incoming V2
-    if _is_subsequence_edit(disk_hunks, inc_hunks):
-        return True, incoming_text
-
-    # 2. Pure-Python 3-Way Hunk Merger (handles arbitrary non-overlapping & identical hunks)
-    out_lines: List[str] = []
-    base_cursor = 0
-    idx_d = 0
-    idx_i = 0
-    clean_hunk_merge = True
-
-    while idx_d < len(disk_hunks) or idx_i < len(inc_hunks):
-        d_hunk = disk_hunks[idx_d] if idx_d < len(disk_hunks) else None
-        i_hunk = inc_hunks[idx_i] if idx_i < len(inc_hunks) else None
-
-        if d_hunk and not i_hunk:
-            d_s, d_e, d_rep = d_hunk
-            out_lines.extend(base_lines[base_cursor:d_s])
-            out_lines.extend(d_rep)
-            base_cursor = d_e
-            idx_d += 1
-        elif i_hunk and not d_hunk:
-            i_s, i_e, i_rep = i_hunk
-            out_lines.extend(base_lines[base_cursor:i_s])
-            out_lines.extend(i_rep)
-            base_cursor = i_e
-            idx_i += 1
-        else:
-            d_s, d_e, d_rep = d_hunk
-            i_s, i_e, i_rep = i_hunk
-
-            if d_s == i_s and d_e == i_e and d_rep == i_rep:
-                out_lines.extend(base_lines[base_cursor:d_s])
-                out_lines.extend(d_rep)
-                base_cursor = d_e
-                idx_d += 1
-                idx_i += 1
-            elif d_e < i_s or (d_e == i_s and (d_s < d_e or i_s < i_e)):
-                out_lines.extend(base_lines[base_cursor:d_s])
-                out_lines.extend(d_rep)
-                base_cursor = d_e
-                idx_d += 1
-            elif i_e < d_s or (i_e == d_s and (i_s < i_e or d_s < d_e)):
-                out_lines.extend(base_lines[base_cursor:i_s])
-                out_lines.extend(i_rep)
-                base_cursor = i_e
-                idx_i += 1
-            else:
-                clean_hunk_merge = False
-                break
-    if clean_hunk_merge:
-        out_lines.extend(base_lines[base_cursor:])
-        merged_str = '\n'.join(out_lines)
-        if '\r\n' in disk_text and '\r\n' not in merged_str:
-            merged_str = merged_str.replace('\n', '\r\n')
-        return True, merged_str
-
-    return False, incoming_text
 def get_vfs_cache_stats() -> dict:
     """Returns public telemetry statistics for the VFS read cache and write queue."""
     with _VFS_CACHE_LOCK:

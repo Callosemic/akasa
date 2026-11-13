@@ -134,6 +134,7 @@ ext_bp = AkasaExtension(
  * Database (ctx.db -> DatabaseWrapper):
    * Scoped to <tenant_control_dir>/cache/db/<ext_name>.db.
    * ctx.get_db(db_name: Optional[str] = None) -> DatabaseWrapper: Returns an SQLite wrapper for any registered workspace database.
+   * Queries return `akasa.db.Row` instances (`sqlite3.Row` subclass supporting positional/column-name indexing, value unpacking, and `.get(key, default=None)`).
    * Methods: .execute(sql, params), .executemany(sql, seq), .commit(), .get_all(table, order_by=None), .get_by_id(table, id_val, id_col="id"), .insert_or_replace(table, data_dict), .update(table, data_dict, where_col, where_val), .delete(table, where_col, where_val).
  * Virtual File System (ctx.vfs -> VFSTransaction):
    * All paths must be canonical scheme:// URIs unless data={"is_absolute_artifact": True} is passed.
@@ -209,7 +210,7 @@ ext_bp = AkasaExtension(
    * Methods: .join(child_path: str) -> AkasaURI, .relative_to(base_uri: AkasaURI) -> str, .match(pattern: str) -> bool.
  * Event Bus Barrier (akasa.hooks):
    * hooks.sync_event_bus_barrier(timeout: float = 5.0) -> bool: Awaits completion of all queued background event bus handlers.
- * VFS OCC & 3-Way Merge (akasa.vfs, akasa.state):
+ * VFS OCC & 3-Way Merge (akasa.merge, akasa.vfs, akasa.state):
    * drain_write_queue(timeout: float = 5.0) -> None: Blocks until every queued VFS write has reached physical disk; logs warnings on timeout without raising.
    * read_cached_physical_text(resolved_path: str, bypass_read_cache: bool = False) -> Tuple[Optional[int], Optional[str]]: Unified Read-Your-Writes primitive checking _VFS_PENDING_WRITES, _VFS_READ_CACHE, and physical disk.
    * heal_daemon_config_files(remove_legacy_system_json: bool = False) -> Tuple[str, str]: Splits legacy system.json into workspaces.json and host.json.
@@ -217,7 +218,7 @@ ext_bp = AkasaExtension(
    * compute_vfs_sha256(text: str) -> str
    * record_vfs_ancestor(workspace_id: str, filepath_or_resolved: str, text: str, text_hash: Optional[str] = None) -> str
    * lookup_vfs_ancestor(workspace_id: str, filepath_or_resolved: str, base_hash: Optional[str], fallback_base_content: Optional[str] = None) -> Optional[str]
-   * three_way_merge_text(base_text: str, disk_text: str, incoming_text: str) -> Tuple[bool, str]
+   * three_way_merge_text(base_text: str, disk_text: str, incoming_text: str) -> Tuple[bool, str] (canonical in `akasa.merge`, re-exported in `akasa.vfs`)
    * get_vfs_cache_stats() -> dict
  * System Heartbeat & SSE Bus (akasa.sync, akasa.events):
    * get_system_deltas(workspace_id=None, since_ts=0.0) -> dict

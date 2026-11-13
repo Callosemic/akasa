@@ -60,11 +60,26 @@ class KernelFitnessVisitor(ast.NodeVisitor):
     def __init__(self, filepath, filename, is_test=False):
         self.filepath = filepath
         self.filename = filename
-        self.is_test = is_test or "tests" in Path(filepath).parts or filename.startswith("test_")
-        self.module_key = _resolve_module_key(Path(filepath)) if not self.is_test else ""
+        resolved_fp = Path(filepath).resolve()
+        self.is_test = is_test or "tests" in resolved_fp.parts or filename.startswith("test_")
+        self.in_kernel_dir = KERNEL_DIR.resolve() in resolved_fp.parents
+        self.module_key = _resolve_module_key(resolved_fp) if not self.is_test else ""
         self.my_ring = KERNEL_RING_MAP.get(self.module_key, 4)
         self.top_level_imports = set()
     def visit_Module(self, node):
+        if (
+            not self.is_test
+            and self.in_kernel_dir
+            and self.module_key
+            and self.module_key != "__init__"
+            and self.module_key not in KERNEL_RING_MAP
+        ):
+            report_violation(
+                "UNREGISTERED_KERNEL_RING_MODULE",
+                self.filepath,
+                1,
+                f"Kernel module '{self.module_key}' is not registered in KERNEL_RING_MAP in tests/fitness/core.py."
+            )
         top_level_funcs = set()
         for stmt in node.body:
             if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):

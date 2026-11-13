@@ -240,6 +240,36 @@ class TestAkasaKernelHardening(unittest.TestCase):
         for conn in conns:
             self.assertEqual(conn.execute("SELECT 1").fetchone()[0], 1)
 
+    def test_query_rows_support_get_and_still_behave_as_rows(self):
+        """A row from execute() answers get() like a dict, and keeps everything a sqlite row does."""
+        conn = get_connection("row_shape_test", workspace_id=self.workspace_id)
+        conn.execute("CREATE TABLE IF NOT EXISTS people (id INTEGER, name TEXT)")
+        conn.execute("CREATE TABLE IF NOT EXISTS pets (id INTEGER, owner_id INTEGER, name TEXT)")
+        conn.execute("DELETE FROM people")
+        conn.execute("DELETE FROM pets")
+        conn.execute("INSERT INTO people (id, name) VALUES (7, 'Ada')")
+        conn.execute("INSERT INTO pets (id, owner_id, name) VALUES (3, 7, NULL)")
+
+        row = conn.execute("SELECT id, name FROM people").fetchone()
+        self.assertEqual(row.get("name"), "Ada")
+        self.assertIsNone(row.get("missing"))
+        self.assertEqual(row.get("missing", "fallback"), "fallback")
+        self.assertEqual(row.get(0), 7)
+        self.assertEqual(row.get(9, "fallback"), "fallback")
+        self.assertEqual((row["name"], row[0]), ("Ada", 7))
+        person_id, person_name = row
+        self.assertEqual((person_id, person_name), (7, "Ada"), "A row unpacks to its values, not its column names")
+        self.assertEqual(dict(row), {"id": 7, "name": "Ada"})
+
+        pet = conn.execute("SELECT name FROM pets").fetchone()
+        self.assertIsNone(pet.get("name", "fallback"), "A stored NULL is returned as None, not replaced by the default")
+
+        joined = conn.execute("SELECT people.id, pets.id, pets.name FROM people JOIN pets ON pets.owner_id = people.id").fetchone()
+        self.assertEqual(len(joined), 3, "Both id columns of a join are kept")
+        self.assertEqual((joined[0], joined[1]), (7, 3))
+
+        self.assertTrue(all(hasattr(r, "get") for r in conn.execute("SELECT id FROM people").fetchall()))
+
     def test_subprocess_token_sanitization(self):
         """execute_binary purges AKASA_BOOT_TOKEN from child environments in run and popen modes."""
         os.environ["AKASA_BOOT_TOKEN"] = "token_in_os_environ"
@@ -421,6 +451,20 @@ class TestAkasaKernelHardening(unittest.TestCase):
                 KernelFitnessVisitor(cred_path, "credentials.py", is_test=False).visit(cred_tree)
             out_cred = buf_cred.getvalue()
             self.assertIn("CREDENTIALS_STDLIB_ONLY", out_cred)
+
+            # 4. Ring 0 enforcement on merge.py and unmapped kernel module detection
+            merge_path = KERNEL_DIR / "merge.py"
+            merge_tree = ast.parse("from akasa.vfs import resolve_physical_path\n", filename=str(merge_path))
+            buf_merge = io.StringIO()
+            with contextlib.redirect_stdout(buf_merge):
+                KernelFitnessVisitor(merge_path, "merge.py", is_test=False).visit(merge_tree)
+            self.assertIn("KERNEL_RING_DAG_MANDATE", buf_merge.getvalue())
+
+            unmapped_path = KERNEL_DIR / "unmapped_kernel_module.py"
+            buf_unmapped = io.StringIO()
+            with contextlib.redirect_stdout(buf_unmapped):
+                KernelFitnessVisitor(unmapped_path, "unmapped_kernel_module.py", is_test=False).visit(ast.parse("x = 1\n"))
+            self.assertIn("UNREGISTERED_KERNEL_RING_MODULE", buf_unmapped.getvalue())
         finally:
             FitnessState.violations_found = prev
 

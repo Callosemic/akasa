@@ -12,6 +12,24 @@ from akasa.hooks import hooks
 _local = threading.local()
 
 _REGISTERED_SCHEMAS = {}
+
+
+class Row(sqlite3.Row):
+    """
+    A query result row: sqlite3.Row (read by column name or position, unpacks to its values) plus a dict-style get().
+    Every connection uses it, so a row from execute() and a dict from the context's get_all() or get_by_id() can
+    both be read with row["col"] and row.get("col"). It stays a Row and not a dict on purpose: a dict would unpack
+    to column names and silently drop one of two columns with the same name in a join.
+    """
+    __slots__ = ()
+
+    def get(self, key, default=None):
+        try:
+            return self[key]
+        except (IndexError, KeyError):
+            return default
+
+
 _PHYSICS_RESOLVER: Optional[Callable[[Optional[str]], Tuple[str, str]]] = None
 _ALL_WORKSPACES_RESOLVER: Optional[Callable[[], List[str]]] = None
 
@@ -297,7 +315,7 @@ def get_connection(db_name, workspace_id=None):
 
     def _connect():
         conn = sqlite3.connect(db_path, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
+        conn.row_factory = Row
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA busy_timeout=5000;")

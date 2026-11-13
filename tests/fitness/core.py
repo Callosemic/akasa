@@ -13,6 +13,7 @@ KERNEL_RING_MAP = {
     "types": 0,
     "uri": 0,
     "context": 0,
+    "merge": 0,
     "events": 1,
     "hooks": 1,
     "db": 2,

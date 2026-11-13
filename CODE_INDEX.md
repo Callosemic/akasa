@@ -4,6 +4,9 @@ This index serves as the architectural map. It outlines the core directories and
 
 ```text
 akasa/
+├── .github/                        # GitHub repository configuration and automation workflows.
+│   └── workflows/                  # Continuous integration workflow definitions.
+│       └── ci.yml                  # Runs the shared Callosemic stack battery (akasa -> sutram -> insetu) on every push to main.
 ├── .gitignore                      # Git ignore rules.
 ├── .gitkeep                        # Git preservation marker
 ├── CHANGELOG.md                    # Auto-generated semantic release changelog
@@ -42,7 +45,7 @@ akasa/
 │   │       ├── def get_proxy_headers() # Returns the lowercase forwarding header names that mark a request as proxied.
 │   │       ├── def register_allowed_host() # DI Interface: Registers exact hostnames (no port) accepted by Host validation, e.g.
 │   │       ├── def get_allowed_hosts() # Returns the registered exact-match hostnames.
-│   │       ├── def reset()         # Resets Ring 0 context state for isolated test harnesses.
+│   │       ├── def reset()         # Resets registered proxy headers and allowed hosts for isolated test harnesses.
 │   │       ├── def parse_ip(value) # Parses an IP literal, tolerating IPv6 brackets, an IPv4 ':port' suffix, and IPv4-mapped IPv6.
 │   │       ├── def is_loopback_ip(value) # True for 127.0.0.0/8, ::1, and IPv4-mapped loopback addresses.
 │   │       ├── def normalize_hostname(value) # Lowercases a Host header value and strips any port, IPv6 brackets, and a trailing root dot.
@@ -85,6 +88,7 @@ akasa/
 │   │   ├── def interpolate_template_variables(text, values, resolver) # Inside-out template variable interpolator for {{ var }}, {{ var | fallback_var | default }}, and nested placeholders.
 │   │   └── def reset()             # Resets Ring 0 context state for isolated test harnesses.
 │   ├── db.py                       # Ring 2: Thread-local SQLite connection pool and WAL schema migrations
+│   │   ├── class Row(sqlite3.Row)  # A query result row: sqlite3.Row (read by column name or position, unpacks to its values) plus a dict-style get().
 │   │   ├── def set_db_physics_resolvers(physics_fn, all_workspaces_fn) # DI Interface: Ring 2 state module binds workspace physics resolvers so db.py has zero upward dependencies.
 │   │   ├── def register_schema(ext_name, schema_dict) # Registers a declarative SQLite schema for automatic workspace migration.
 │   │   ├── def apply_declarative_schema(db_name, schema_dict, workspace_id) # Generates CREATE TABLE (including '__constraints__' and '__indexes__') and executes ALTER TABLE ADD COLUMN migrations via diffing.
@@ -95,8 +99,8 @@ akasa/
 │   │   ├── def close_workspace_connections(workspace_id, **kwargs) # Evicts and closes thread-local SQLite connections for an unmounting tenant workspace.
 │   │   ├── def evict_cached_connection(workspace_id, db_name) # Safely closes and removes a single cached database connection on the current thread.
 │   │   ├── def close_thread_connections() # Closes and purges all cached SQLite connections on the calling thread to prevent FD leaks in per-request WSGI threads.
-│   │   ├── def reset()             # Resets Ring 0 context state for isolated test harnesses.
-│   │   └── def get_connection(db_name, workspace_id) # Returns a thread-local SQLite connection with 16-database per-workspace LRU pooling.
+│   │   ├── def reset()             # Closes pooled thread-local SQLite connections for isolated test harnesses.
+│   │   └── def get_connection(db_name, workspace_id) # Returns a thread-local SQLite connection configured with Row factory and 16-database per-workspace LRU pooling.
 │   ├── events.py                   # Thread-safe SSE event bus and client queue manager
 │   │   └── class EventBus          # Thread-safe Server-Sent Events (SSE) broadcasting bus and subscriber queue manager.
 │   ├── extension.py                # Ring 4: Extension SDK context wrappers, SettingsManager, and JobManager
@@ -109,7 +113,7 @@ akasa/
 │   │   ├── class StoreManager      # Scoped key-value JSON persistence manager for extension data.
 │   │   ├── class DatabaseWrapper   # Lightweight ORM/CRUD wrapper for centralized SQLite access.
 │   │   ├── class ExtensionContext  # Pre-scoped context object injected into all SDK routes.
-│   │   └── class AkasaExtension    # [stale?] Agnostic Blueprint wrapper that enforces tenant isolation, API routing, authorization, and SQLite schema migrations for kernel extensions.
+│   │   └── class AkasaExtension    # Agnostic Blueprint wrapper enforcing tenant isolation, API routing, authorization, and SQLite schema migrations for kernel extensions.
 │   ├── hooks.py                    # Priority event bus (HookRegistry) and authorization engine
 │   │   ├── class HookPayload_MutateWorkspaceConfig(TypedDict) # Payload for mutate_workspace_config hook.
 │   │   ├── class HookPayload_VFSMutated(TypedDict) # Payload for vfs_mutated background telemetry broadcast.
@@ -123,6 +127,8 @@ akasa/
 │   │   ├── class HookPayload_JobBatonPassed(TypedDict) # Telemetry payload emitted during background worker step transitions.
 │   │   ├── class HookPayload_SystemError(TypedDict) # System-wide error telemetry payload for unhandled exceptions.
 │   │   └── class HookRegistry      # The central Event Bus for the Akasa Micro-Kernel; background hooks run with the emitter's origin.
+│   ├── merge.py                    # The three-way text merge, rewritten as one algorithm that also exists line for line in sutram's JavaScript (issue #18).
+│   │   └── def three_way_merge_text(base_text, disk_text, incoming_text) # Deterministic 3-Way Text Merger (Base -> Disk vs. Base -> Incoming).
 │   ├── process.py                  # Volume-sandboxed process manager and execution wrapper
 │   │   ├── def execute_binary(cmd, cwd, env, check, ...) # Universal binary execution wrapper resolving PATH, venv and module CLI fallbacks; strips the boot token, passes shell commands through as written, and kills the whole process tree on timeout.
 │   │   └── class ProcessManager    # Volume-sandboxed subprocess runner enforcing workspace directory boundaries.
@@ -171,7 +177,6 @@ akasa/
 │   │   ├── def compute_vfs_sha256(text) # Computes deterministic SHA-256 hash of file content for causal receipts.
 │   │   ├── def record_vfs_ancestor(workspace_id, filepath_or_resolved, text, text_hash) # Records file revision in the in-memory ancestor ring buffer.
 │   │   ├── def lookup_vfs_ancestor(workspace_id, filepath_or_resolved, base_hash, fallback_base_content) # Retrieves historical file content from ancestor cache by hash.
-│   │   ├── def three_way_merge_text(base_text, disk_text, incoming_text) # Deterministic 3-Way Text Merger (Base -> Disk vs. Base -> Incoming).
 │   │   ├── def get_vfs_cache_stats() # Returns public telemetry statistics for the VFS read cache and write queue.
 │   │   ├── def evict_vfs_cache(resolved_path, preserve_ancestors) # Purges a path and its children from VFS read and ancestor caches.
 │   │   ├── class DefaultVFSDriver  # Standard filesystem VFS driver mapping logical paths to physical volume targets.
@@ -249,7 +254,7 @@ akasa/
     │   │   ├── def collect_unique_files(directories, extensions) # Walks the given directories and returns each file with a listed extension once, skipping __pycache__.
     │   │   └── def report_violation(rule_name, filepath, line_num, message) # Prints one rule violation with its repo-relative location and counts it.
     │   └── rules_python.py         # AST visitor rules enforcing Tier 1 substrate purity and guardrails
-    │       ├── class KernelFitnessVisitor(ast.NodeVisitor) # AST visitor that checks one kernel module against the Tier 1 substrate rules.
+    │       ├── class KernelFitnessVisitor(ast.NodeVisitor) # [stale?] AST visitor that checks one kernel module against the Tier 1 substrate rules.
     │       └── def check_python_files() # Parses every Python file in the kernel and runs KernelFitnessVisitor over it.
     ├── fitness_functions.py        # CLI executable entry point for fitness validation
     ├── run_unit_tests.py           # CLI runner for Akasa kernel behavioral unit tests
@@ -263,7 +268,7 @@ akasa/
         │   ├── class TestBootstrapAndHostGate(unittest.TestCase) # S1: /auth/bootstrap only grants localhost trust to direct loopback requests; the gate rejects foreign Hosts.
         │   └── class TestForwardedHeaderMembraneRule(unittest.TestCase) # S1: the FORWARDED_HEADER_MEMBRANE fitness rule keeps forwarding-header reads inside akasa/auth/peer.py.
         ├── test_kernel_hardening.py # Unit tests for RFC 0048 VFS micro-batching, idempotency, slotted AkasaURI, hook auth caching, and SQLite PRAGMAs
-        │   └── class TestAkasaKernelHardening(unittest.TestCase) # [stale?] Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening (Refactors A–F).
+        │   └── class TestAkasaKernelHardening(unittest.TestCase) # [stale?] Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening and Row factory access.
         ├── test_process_tree_timeout.py # ProcessManager.run() and execute_binary(timeout=...) kill the whole process tree on timeout, and shell commands run as written.
         │   └── class TestProcessTreeTimeout(unittest.TestCase) # A shell that backgrounds a long sleep leaves nothing running after its timeout.
         ├── test_protected_vfs_targets.py # Tests for host-registered protected VFS targets: whole-segment matching and import-shadowing paths
@@ -272,7 +277,9 @@ akasa/
         │   ├── class TestProtectedWriteHandler(unittest.TestCase) # Without a handler protected mutations are refused; with one, saves, deletes, moves, bulk items and transactions get its answer and nothing is written.
         │   └── class TestExecutionFrameOrigin(unittest.TestCase) # Transport defaults, explicit origins, inheritance, and jobs running with the submitter's origin.
         ├── test_settings_is_set.py # Tests that SettingsManager.is_set distinguishes saved values from schema defaults in every scope
-        │   └── class TestSettingsIsSet(unittest.TestCase) # [stale?] SettingsManager.is_set distinguishes saved values from schema defaults across every scope.
+        │   └── class TestSettingsIsSet(unittest.TestCase) # Verifies SettingsManager.is_set distinguishes saved values from schema defaults across every scope.
+        ├── test_three_way_merge.py # Tests for the merge: one-sided and identical changes, edits to different and neighbouring lines, overlapping edits as conflicts that return...
+        │   └── class TestThreeWayMerge(unittest.TestCase) # three_way_merge_text(base, disk, incoming) merges two edits of one base, or reports a conflict and loses nothing.
         ├── test_vfs_reset_drain.py # Tests that reset_state drains queued VFS writes before switching the daemon cwd
         │   └── class TestVfsResetDrain(unittest.TestCase) # reset_state() drains queued VFS writes first, so they land under the cwd they were queued for.
         ├── test_worker_contracts.py # Unit tests for signature-driven worker validation, DAG chains, and envelope isolation

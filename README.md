@@ -48,7 +48,7 @@ Kernel modules are layered in rings. A module may import from its own ring or an
 
 | Ring | Modules | Responsibility |
 | :--- | :--- | :--- |
-| **0** | `types`, `uri`, `context` | Pure standard-library primitives: execution frames, URI parsing, atomic writes, template interpolation. |
+| **0** | `types`, `uri`, `context`, `merge` | Pure standard-library primitives: execution frames, URI parsing, atomic writes, template interpolation, 3-way text merge. |
 | **1** | `events`, `hooks` | The event bus, hook authorization and the server-sent events (SSE) channel. |
 | **2** | `db`, `vfs`, `state`, `utils` | Persistence: SQLite pooling and migrations, the VFS and write queue, workspace configuration. |
 | **3** | `process`, `workers`, `sync` | Execution: sandboxed subprocesses, the Metronome job engine, state heartbeats. |
