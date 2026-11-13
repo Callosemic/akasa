@@ -2,6 +2,15 @@
 
 <!-- version list -->
 
+## v0.10.0 (2026-11-13)
+
+### Features
+
+- **kernel**: Extract patience-diff three-way merge into akasa.merge and add dict-compatible Row
+  factory
+  ([`e92e6f9`](https://github.com/Callosemic/akasa/commit/e92e6f96169e0934b111b2981a75d57e2dc6e980))
+
+
 ## v0.9.0 (2026-11-10)
 
 ### Features
