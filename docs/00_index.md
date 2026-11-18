@@ -20,6 +20,7 @@ This directory contains the core architectural specifications, integration contr
 * **[ADR 0012: Host-Protected VFS Targets, Import Shadowing Defense, and Pre-Reset Write Drainage](./adrs/0012_host_protected_vfs_targets_and_sandbox_drainage.md)**
 * **[ADR 0013: Process-Tree Termination on Timeout and Verbatim Shell Command Execution](./adrs/0013_process_tree_termination_and_verbatim_shell_execution.md)**
 * **[ADR 0014: Host Policy for Protected Writes and Execution Origin](./adrs/0014_host_protected_write_policy_and_execution_origin.md)**
+* **[ADR 0015: Public-Origin Read-Only VFS Boundary, Ring 0 BoundedCache, ExecutionFrame Baggage Propagation, and MemoryVFSTransaction](./adrs/0015_public_origin_readonly_vfs_bounded_cache_and_baggage.md)**
 
 ### Superseded Records
 * **[ADR 0003: OpenAPI Reflection, DAG Step Orchestration, and System Error Hooks](./adrs/superseded/0003_openapi_reflection_dag_orchestration_and_error_hooks.md)** *(Superseded by ADR 0010)*

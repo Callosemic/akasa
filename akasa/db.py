@@ -90,34 +90,36 @@ def _build_table_ddl_and_indexes(table_name: str, columns: dict) -> Tuple[str, d
     return create_sql, real_cols, indexes
 
 
-def apply_declarative_schema(db_name, schema_dict, workspace_id=None):
-    """Generates CREATE TABLE (including '__constraints__' and '__indexes__') and executes ALTER TABLE ADD COLUMN migrations via diffing."""
-    conn = get_connection(db_name, workspace_id)
-    for table_name, columns in schema_dict.items():
+def _apply_schema_to_conn(conn, schema_dict: dict) -> None:
+    """Applies CREATE TABLE, ALTER TABLE ADD COLUMN diffing, and declarative indexes to an open SQLite connection."""
+    for table_name, columns in (schema_dict or {}).items():
         if not isinstance(columns, dict):
             continue
         create_sql, real_cols, index_sqls = _build_table_ddl_and_indexes(table_name, columns)
-        # 1. Generate CREATE TABLE
         conn.execute(create_sql)
-
-        # 2. Diff columns and ALTER TABLE
         cursor = conn.execute(f"PRAGMA table_info({table_name})")
-        existing_cols = {row['name'] for row in cursor.fetchall()}
-
+        existing_cols = {row["name"] for row in cursor.fetchall()}
         for col, dtype in real_cols.items():
             if col not in existing_cols:
                 try:
                     conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {col} {dtype}")
                 except Exception as e:
                     print(f"⚠️ Auto-migration failed for {table_name}.{col}: {e}")
-
-        # 3. Apply declarative indexes idempotently
         for idx_sql in index_sqls:
             try:
                 conn.execute(idx_sql)
             except Exception as e:
                 print(f"⚠️ Auto-index creation failed on {table_name}: {e}")
     conn.commit()
+
+
+def apply_declarative_schema(db_name, schema_dict, workspace_id=None):
+    """Generates CREATE TABLE (including '__constraints__' and '__indexes__') and executes ALTER TABLE ADD COLUMN migrations via diffing."""
+    conn = get_connection(db_name, workspace_id)
+    _apply_schema_to_conn(conn, schema_dict)
+    if not hasattr(_local, "applied_schemas"):
+        _local.applied_schemas = set()
+    _local.applied_schemas.add(id(conn))
 # Register core worker database schema for tracking all file deltas and worker ledgers contextually
 register_schema('workers', {
     'vfs_event_log': {
@@ -221,6 +223,18 @@ def init_declarative_schemas(**kwargs):
     for ws_id in _get_all_workspace_ids():
         provision_workspace_schemas(ws_id)
         hooks.emit('workspace_boot', workspace_id=ws_id)
+def _close_pooled_conn(conn) -> None:
+    """Closes a pooled SQLite connection and removes its id from thread-local applied_schemas tracking."""
+    if conn is None:
+        return
+    if hasattr(_local, "applied_schemas"):
+        _local.applied_schemas.discard(id(conn))
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
 @hooks.on('workspace_shutdown')
 def close_workspace_connections(workspace_id=None, **kwargs):
     """Evicts and closes thread-local SQLite connections for an unmounting tenant workspace."""
@@ -229,10 +243,8 @@ def close_workspace_connections(workspace_id=None, **kwargs):
     ws_dict = _local.connections.pop(workspace_id, None)
     if isinstance(ws_dict, dict):
         for conn in ws_dict.values():
-            try:
-                conn.close()
-            except Exception:
-                pass
+            _close_pooled_conn(conn)
+
 
 def evict_cached_connection(workspace_id, db_name):
     """Safely closes and removes a single cached database connection on the current thread."""
@@ -240,13 +252,13 @@ def evict_cached_connection(workspace_id, db_name):
         return
     ws_dict = _local.connections.get(workspace_id)
     if isinstance(ws_dict, dict) and db_name in ws_dict:
-        try:
-            ws_dict[db_name].close()
-        except Exception:
-            pass
-        del ws_dict[db_name]
+        _close_pooled_conn(ws_dict.pop(db_name))
+
+
 def close_thread_connections():
     """Closes and purges all cached SQLite connections on the calling thread to prevent FD leaks in per-request WSGI threads."""
+    if hasattr(_local, "applied_schemas"):
+        _local.applied_schemas.clear()
     if not hasattr(_local, 'connections'):
         return
     conns_map = _local.connections
@@ -254,10 +266,7 @@ def close_thread_connections():
     for ws_dict in conns_map.values():
         if isinstance(ws_dict, dict):
             for conn in ws_dict.values():
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                _close_pooled_conn(conn)
 
 
 hooks.set_thread_cleanup(close_thread_connections)
@@ -289,12 +298,7 @@ def get_connection(db_name, workspace_id=None):
             return conn
         if len(ws_conns) >= 16:
             oldest_db = next(iter(ws_conns))
-            old_c = ws_conns.pop(oldest_db, None)
-            if old_c:
-                try:
-                    old_c.close()
-                except Exception:
-                    pass
+            _close_pooled_conn(ws_conns.pop(oldest_db, None))
     else:
         # Evict oldest workspace when more than 3 distinct workspaces are open on this thread
         if len(_local.connections) >= 3:
@@ -302,10 +306,7 @@ def get_connection(db_name, workspace_id=None):
             old_conns = _local.connections.pop(oldest_ws, {})
             if isinstance(old_conns, dict):
                 for old_c in old_conns.values():
-                    try:
-                        old_c.close()
-                    except Exception:
-                        pass
+                    _close_pooled_conn(old_c)
         _local.connections[workspace_id] = {}
 
     cfg_path, _ = _get_workspace_physics(workspace_id)
@@ -349,17 +350,12 @@ def get_connection(db_name, workspace_id=None):
         else:
             raise
     _local.connections[workspace_id][db_name] = conn
-    if db_name in _REGISTERED_SCHEMAS and not getattr(conn, '_schema_applied', False):
+    if not hasattr(_local, "applied_schemas"):
+        _local.applied_schemas = set()
+    if db_name in _REGISTERED_SCHEMAS and id(conn) not in _local.applied_schemas:
         try:
-            for table_name, columns in _REGISTERED_SCHEMAS[db_name].items():
-                if not isinstance(columns, dict):
-                    continue
-                create_sql, _, index_sqls = _build_table_ddl_and_indexes(table_name, columns)
-                conn.execute(create_sql)
-                for idx_sql in index_sqls:
-                    conn.execute(idx_sql)
-            conn.commit()
-            conn._schema_applied = True
+            _apply_schema_to_conn(conn, _REGISTERED_SCHEMAS[db_name])
+            _local.applied_schemas.add(id(conn))
         except Exception:
             pass
     return conn

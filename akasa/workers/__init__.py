@@ -4,6 +4,7 @@ import time
 import json
 import uuid
 import random
+import contextvars
 import inspect
 import traceback
 import threading
@@ -12,6 +13,7 @@ from typing import TypedDict, List, Dict, Any, Optional, Literal, Union
 from concurrent.futures import ThreadPoolExecutor
 from akasa.context import (
     execution_frame,
+    get_current_baggage,
     get_current_origin,
     sniff_tenant_id,
     reclaim_process_memory,
@@ -100,6 +102,8 @@ _callbacks = {}
 _callback_specs: Dict[str, Dict[str, Any]] = {}
 _ENVELOPE_KEYS = frozenset({
     "_workspace_id",
+    "_origin",
+    "_baggage",
     "_chain",
     "_dag_root_id",
     "_dag_step_id",
@@ -359,7 +363,10 @@ def run_parallel(fn, items, max_workers: int = 4) -> list:
             _io_pool_local.in_pool = False
             close_thread_connections()
 
-    futures = [_io_executor.submit(_safe_worker, item) for item in items_list]
+    futures = [
+        _io_executor.submit(contextvars.copy_context().run, _safe_worker, item)
+        for item in items_list
+    ]
     return [f.result() for f in futures]
 
 
@@ -442,8 +449,11 @@ def _prepare_job_payload(args_json, workspace_id):
         args_payload["_workspace_id"] = workspace_id
     # A job keeps the origin of whoever submitted it, so work started by a person is not mistaken for background work.
     submitter_origin = get_current_origin()
-    if isinstance(args_payload, dict) and submitter_origin and "_origin" not in args_payload:
+    if isinstance(args_payload, dict) and submitter_origin:
         args_payload["_origin"] = submitter_origin
+    submitter_baggage = get_current_baggage()
+    if isinstance(args_payload, dict) and submitter_baggage:
+        args_payload["_baggage"] = submitter_baggage
     serialized_json = json.dumps(args_payload)
     return workspace_id, conn, now, serialized_json
 def submit_job(job_id, ext_name, callback_name, interval_ms, args_json="{}", jitter_ms=0, workspace_id=None):
@@ -649,6 +659,7 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
     func = _callbacks.get(f"{ext_name}:{callback_name}")
     kwargs = {}
     job_origin = None
+    job_baggage = None
     if args_json:
         try:
             parsed = args_json if isinstance(args_json, dict) else json.loads(args_json)
@@ -657,6 +668,7 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
                 if "_workspace_id" in kwargs:
                     target_ws = kwargs.pop("_workspace_id")
                 job_origin = kwargs.pop("_origin", None)
+                job_baggage = kwargs.pop("_baggage", None)
         except Exception as e:
             print(f"⚠️ [Worker] Failed to parse args_json for {job_id}: {e}")
     root_job_id = kwargs.get('root_job_id') or job_id
@@ -680,7 +692,7 @@ def _execute_immediate_job(job_id, ext_name, callback_name, args_json, target_ws
             if 'job_id' in sig.parameters:
                 kwargs['job_id'] = job_id
 
-            with execution_frame(workspace_id=target_ws, transport="WORKER", job_id=job_id, origin=job_origin):
+            with execution_frame(workspace_id=target_ws, transport="WORKER", job_id=job_id, origin=job_origin, baggage=job_baggage):
                 result = func(**kwargs)
             if isinstance(result, str):
                 step_msg = result
@@ -908,6 +920,7 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
     except Exception:
         kwargs = {}
     job_origin = kwargs.pop("_origin", None) if isinstance(kwargs, dict) else None
+    job_baggage = kwargs.pop("_baggage", None) if isinstance(kwargs, dict) else None
     if not is_extension_enabled(ext_name, target_ws):
         print(f"⚠️ [Worker] Extension '{ext_name}' is disabled in workspace '{target_ws}'. Dropping recurring job '{job_id}'.")
         conn = get_connection("workers", workspace_id=target_ws)
@@ -922,7 +935,7 @@ def _execute_job(job_id, ext_name, callback_name, interval_ms, jitter_ms, args_j
                 kwargs['workspace_id'] = target_ws
             if 'job_id' in sig.parameters and 'job_id' not in kwargs:
                 kwargs['job_id'] = job_id
-            with execution_frame(workspace_id=target_ws, transport="WORKER", job_id=job_id, origin=job_origin):
+            with execution_frame(workspace_id=target_ws, transport="WORKER", job_id=job_id, origin=job_origin, baggage=job_baggage):
                 func(**kwargs)
         except Exception as e:
             print(f"❌ [Worker] Job {job_id} failed on workspace context [{target_ws}]: {e}")

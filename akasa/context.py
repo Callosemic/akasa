@@ -1,30 +1,14 @@
-from pathlib import Path
+from collections import OrderedDict
 from functools import wraps
 from graphlib import TopologicalSorter, CycleError
-import contextlib
-import contextvars
-import ctypes
-import gc
-import json
-import os
-import re
-import sys
-import socket
-import threading
-import time
-import typing
-import unicodedata
+from pathlib import Path
+import contextlib, contextvars, copy, ctypes, gc, json, os, re, socket, sys, threading, time, typing, unicodedata, weakref
 from akasa.uri import AkasaURI
 
-try:
-    import fcntl as _fcntl
-except ImportError:
-    _fcntl = None
-
-try:
-    import msvcrt as _msvcrt
-except ImportError:
-    _msvcrt = None
+try: import fcntl as _fcntl
+except ImportError: _fcntl = None
+try: import msvcrt as _msvcrt
+except ImportError: _msvcrt = None
 
 _cwd = os.getcwd()
 _in_test_sandbox = False
@@ -46,54 +30,40 @@ DEFAULT_ORIGIN_BY_TRANSPORT: typing.Dict[str, str] = {
 
 class ExecutionFrame:
     """Immutable-style slotted execution frame bound to contextvars across HTTP, IPC, Worker, and CLI calls."""
-    __slots__ = ("workspace_id", "transport", "method", "payload", "job_id", "origin")
+    __slots__ = ("workspace_id", "transport", "method", "payload", "job_id", "origin", "baggage")
 
-    def __init__(
-        self,
-        workspace_id: str = "default",
-        transport: str = "CLI",
-        method: str = "CALL",
-        payload: typing.Optional[typing.Dict[str, typing.Any]] = None,
-        job_id: typing.Optional[str] = None,
-        origin: typing.Optional[str] = None,
-    ):
+    def __init__(self, workspace_id: str = "default", transport: str = "CLI", method: str = "CALL",
+                 payload: typing.Optional[typing.Dict[str, typing.Any]] = None, job_id: typing.Optional[str] = None,
+                 origin: typing.Optional[str] = None, baggage: typing.Optional[typing.Dict[str, typing.Any]] = None):
         self.workspace_id = workspace_id or "default"
-        self.transport = transport
-        self.method = method
+        self.transport, self.method = transport, method
         self.payload = payload if isinstance(payload, dict) else {}
         self.job_id = job_id
         self.origin = origin or DEFAULT_ORIGIN_BY_TRANSPORT.get(transport, "internal")
+        self.baggage = dict(baggage) if isinstance(baggage, dict) else {}
 
 
-_CURRENT_FRAME: contextvars.ContextVar[typing.Optional[ExecutionFrame]] = contextvars.ContextVar(
-    "akasa_current_frame", default=None
-)
+_CURRENT_FRAME: contextvars.ContextVar[typing.Optional[ExecutionFrame]] = contextvars.ContextVar("akasa_current_frame", default=None)
 
 
 @contextlib.contextmanager
-def execution_frame(
-    workspace_id: typing.Optional[str] = None,
-    transport: str = "CLI",
-    method: str = "CALL",
-    payload: typing.Optional[typing.Dict[str, typing.Any]] = None,
-    job_id: typing.Optional[str] = None,
-    origin: typing.Optional[str] = None,
-):
-    """
-    Context manager binding an active ExecutionFrame for transport-agnostic tenant and payload resolution.
-
-    origin says who started the call chain. An explicit origin wins; otherwise a nested frame keeps its caller's
-    origin, and a frame with no caller takes its transport's default (DEFAULT_ORIGIN_BY_TRANSPORT).
-    """
+def execution_frame(workspace_id: typing.Optional[str] = None, transport: str = "CLI", method: str = "CALL",
+                    payload: typing.Optional[typing.Dict[str, typing.Any]] = None, job_id: typing.Optional[str] = None,
+                    origin: typing.Optional[str] = None, baggage: typing.Optional[typing.Dict[str, typing.Any]] = None):
+    """Context manager binding an active ExecutionFrame for transport-agnostic tenant, payload, origin, and baggage resolution."""
     prev = _CURRENT_FRAME.get()
     resolved_ws = workspace_id or (prev.workspace_id if prev else None) or resolve_active_tenant("default")
+    merged_baggage = dict(prev.baggage) if (prev and prev.baggage) else {}
+    if isinstance(baggage, dict):
+        for k, v in baggage.items():
+            if v is not None and v != "":
+                merged_baggage[str(k)] = v
     frame = ExecutionFrame(
-        workspace_id=resolved_ws,
-        transport=transport,
-        method=method,
+        workspace_id=resolved_ws, transport=transport, method=method,
         payload=payload if payload is not None else (prev.payload if prev else None),
         job_id=job_id if job_id is not None else (prev.job_id if prev else None),
-        origin=origin or (prev.origin if prev else None),
+        origin="public" if (prev and prev.origin == "public") else (origin or (prev.origin if prev else None)),
+        baggage=merged_baggage,
     )
     token = _CURRENT_FRAME.set(frame)
     try:
@@ -111,6 +81,12 @@ def get_current_origin() -> typing.Optional[str]:
     """Who started the active call chain ('ui', 'worker', or a host-set origin such as 'mcp'), or None outside a frame."""
     frame = _CURRENT_FRAME.get()
     return frame.origin if frame is not None else None
+
+
+def get_current_baggage() -> typing.Dict[str, typing.Any]:
+    """Returns a shallow copy of the active ExecutionFrame's domain-agnostic baggage dictionary."""
+    frame = _CURRENT_FRAME.get()
+    return dict(frame.baggage) if (frame is not None and frame.baggage) else {}
 
 
 def set_tenant_resolver(resolver_fn: typing.Optional[typing.Callable[[], typing.Optional[str]]]) -> None:
@@ -308,70 +284,135 @@ def atomic_write_text(filepath: str, content: str, encoding: str = "utf-8", mode
 
 
 def clone_json_value(val: typing.Any) -> typing.Any:
-    """Fast recursive container cloner for JSON-compatible structures (dicts/lists) without copy.deepcopy overhead."""
+    """Fast recursive container cloner for JSON-compatible structures (dicts/lists/tuples) without copy.deepcopy overhead."""
     if isinstance(val, dict):
         return {k: clone_json_value(v) for k, v in val.items()}
     if isinstance(val, list):
         return [clone_json_value(item) for item in val]
+    if isinstance(val, tuple):
+        return tuple(clone_json_value(item) for item in val)
     return val
 
 
+_REGISTERED_CACHES_LOCK = threading.Lock()
+_REGISTERED_CACHES: typing.Dict[str, "BoundedCache"] = {}
+_ALL_CACHE_INSTANCES: "weakref.WeakSet[BoundedCache]" = weakref.WeakSet()
+_UNSET = object()
+
+
+class BoundedCache:
+    """Ring 0 thread-safe bounded LRU cache with causal revision-token validation, optional monotonic TTL, and auto-reset."""
+
+    def __init__(self, name: str, max_entries: int = 512, ttl: typing.Optional[float] = None, copy_mode: str = "json"):
+        self.name, self.max_entries = str(name), max(1, int(max_entries))
+        self.ttl = float(ttl) if ttl is not None and ttl > 0 else None
+        self.copy_mode = copy_mode if copy_mode in ("json", "deepcopy", "none") else "json"
+        self._lock = threading.RLock()
+        self._store: "OrderedDict[typing.Any, typing.Tuple[typing.Any, float, typing.Any]]" = OrderedDict()
+        with _REGISTERED_CACHES_LOCK:
+            _REGISTERED_CACHES[self.name] = self
+            _ALL_CACHE_INSTANCES.add(self)
+
+    def _clone(self, val: typing.Any) -> typing.Any:
+        if self.copy_mode == "none" or val is None: return val
+        return copy.deepcopy(val) if self.copy_mode == "deepcopy" else clone_json_value(val)
+
+    def get(self, key: typing.Any, default: typing.Any = None, *, revision: typing.Any = _UNSET) -> typing.Any:
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None: return default
+            stored_rev, expires_at, stored_val = entry
+            if expires_at is not None and time.monotonic() >= expires_at:
+                del self._store[key]
+                return default
+            if revision is not _UNSET and stored_rev != revision: return default
+            self._store.move_to_end(key)
+            return self._clone(stored_val)
+
+    def put(self, key: typing.Any, value: typing.Any, *, revision: typing.Any = None, ttl: typing.Optional[float] = None) -> typing.Any:
+        eff_ttl = float(ttl) if (ttl is not None and ttl > 0) else self.ttl
+        expires_at = (time.monotonic() + eff_ttl) if eff_ttl is not None else None
+        with self._lock:
+            self._store[key] = (revision, expires_at, self._clone(value))
+            self._store.move_to_end(key)
+            while len(self._store) > self.max_entries:
+                self._store.popitem(last=False)
+        return value
+
+    def pop(self, key: typing.Any, default: typing.Any = None) -> typing.Any:
+        with self._lock:
+            entry = self._store.pop(key, None)
+            return self._clone(entry[2]) if entry is not None else default
+
+    def clear(self) -> None:
+        with self._lock: self._store.clear()
+
+    def clear_where(self, predicate: typing.Callable[[typing.Any], bool]) -> int:
+        with self._lock:
+            keys = [k for k in self._store.keys() if predicate(k)]
+            for k in keys: del self._store[k]
+            return len(keys)
+
+    def __contains__(self, key: typing.Any) -> bool:
+        with self._lock:
+            if key not in self._store: return False
+            expires_at = self._store[key][1]
+            if expires_at is not None and time.monotonic() >= expires_at:
+                del self._store[key]
+                return False
+            return True
+
+    def __len__(self) -> int:
+        with self._lock: return len(self._store)
+
+    def approx_kb(self) -> float:
+        """Returns the approximate UTF-8 serialized size in KB of all entries currently in the cache."""
+        with self._lock:
+            vals = [e[2] for e in self._store.values()]
+        total = sum(len(v.encode("utf-8")) if isinstance(v, str) else len(json.dumps(v, default=str).encode("utf-8")) for v in vals)
+        return round(total / 1024.0, 2)
+
+
+def get_registered_cache_stats() -> typing.Dict[str, int]:
+    """Returns entry counts for all registered Ring 0 BoundedCache instances."""
+    with _REGISTERED_CACHES_LOCK:
+        caches = list(_REGISTERED_CACHES.values())
+    return {f"cache_{c.name}_entries": len(c) for c in caches}
+
+
 def thread_safe_cache(ttl=2.0, key_maker=lambda *args, **kwargs: "global"):
-    """
-    A non-blocking, single-flight TTL cache with invalidation race protection.
-    Prevents lock contention during invalidation and eliminates DB cache stampedes.
-    """
+    """Non-blocking, single-flight TTL cache with invalidation race protection."""
     def decorator(func):
-        cache = {}
-        compilation_locks = {}
-        invalidated_at = {}
+        cache, compilation_locks, invalidated_at = {}, {}, {}
         state_lock = threading.Lock()
+        _copy_out = lambda v: dict(v) if isinstance(v, dict) else (list(v) if isinstance(v, list) else v)
 
         def _get_key_lock(key):
             with state_lock:
-                if key not in compilation_locks:
-                    compilation_locks[key] = threading.Lock()
-                return compilation_locks[key]
+                return compilation_locks.setdefault(key, threading.Lock())
 
         @wraps(func)
         def wrapper(*args, **kwargs):
             key = key_maker(*args, **kwargs)
-            now = time.time()
-            has_cached = False
-            cached_val = None
             with state_lock:
-                if key in cache and (not ttl or now - cache[key]['ts'] < ttl):
-                    has_cached = True
-                    cached_val = cache[key]['val']
-            if has_cached:
-                return dict(cached_val) if isinstance(cached_val, dict) else (list(cached_val) if isinstance(cached_val, list) else cached_val)
-
-            key_lock = _get_key_lock(key)
-            with key_lock:
-                has_cached = False
-                cached_val = None
+                if key in cache and (not ttl or time.time() - cache[key]['ts'] < ttl):
+                    return _copy_out(cache[key]['val'])
+            with _get_key_lock(key):
                 with state_lock:
-                    if key in cache and (not ttl or now - cache[key]['ts'] < ttl):
-                        has_cached = True
-                        cached_val = cache[key]['val']
-
-                if has_cached:
-                    return dict(cached_val) if isinstance(cached_val, dict) else (list(cached_val) if isinstance(cached_val, list) else cached_val)
-
+                    if key in cache and (not ttl or time.time() - cache[key]['ts'] < ttl):
+                        return _copy_out(cache[key]['val'])
                 calc_start = time.time()
                 result = func(*args, **kwargs)
-
                 with state_lock:
                     if invalidated_at.get(key, 0) < calc_start:
                         cache[key] = {'ts': time.time(), 'val': result}
-                    return dict(result) if isinstance(result, dict) else (list(result) if isinstance(result, list) else result)
+                    return _copy_out(result)
 
         def invalidate(*args, **kwargs):
             key = key_maker(*args, **kwargs)
             with state_lock:
                 invalidated_at[key] = time.time()
-                if key in cache:
-                    del cache[key]
+                cache.pop(key, None)
 
         def clear_all():
             with state_lock:
@@ -380,8 +421,7 @@ def thread_safe_cache(ttl=2.0, key_maker=lambda *args, **kwargs: "global"):
                     invalidated_at[k] = now
                 cache.clear()
 
-        wrapper.invalidate = invalidate
-        wrapper.clear_all = clear_all
+        wrapper.invalidate, wrapper.clear_all = invalidate, clear_all
         return wrapper
     return decorator
 
@@ -742,7 +782,11 @@ def interpolate_template_variables(
 
 
 def reset() -> None:
-    """Resets Ring 0 context state for isolated test harnesses."""
+    """Resets Ring 0 context state and purges all registered BoundedCache instances for isolated test harnesses."""
     set_tenant_resolver(None)
     with _FILE_LOCKS_GUARD:
         _FILE_LOCKS.clear()
+    with _REGISTERED_CACHES_LOCK:
+        caches = list(set(_REGISTERED_CACHES.values()) | set(_ALL_CACHE_INSTANCES))
+    for c in caches:
+        c.clear()

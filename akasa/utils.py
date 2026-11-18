@@ -6,8 +6,11 @@ Unified Ring 2 compatibility facade re-exporting Ring 0 (akasa.context) and Ring
 
 import akasa.context as _akasa_context
 from akasa.context import (
+    BoundedCache,
     ExecutionFrame,
     execution_frame,
+    get_registered_cache_stats,
+    get_current_baggage,
     get_current_frame,
     get_current_origin,
     set_tenant_resolver,
@@ -40,10 +43,6 @@ from akasa.context import (
     interpolate_template_variables,
 )
 from akasa.state import (
-    _JSON_CACHE,
-    _JSON_MTIME,
-    _JSON_PARSED_CACHE,
-    _JSON_CACHE_LOCK,
     heal_daemon_config_files,
     get_system_index_path,
     get_daemon_host_config_path,

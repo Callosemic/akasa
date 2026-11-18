@@ -5,8 +5,10 @@ import os
 import threading
 import typing
 from akasa.context import (
+    BoundedCache,
     get_control_dir_name,
     get_daemon_cwd,
+    get_registered_cache_stats,
     sniff_tenant_id,
     atomic_write_text,
     clone_json_value,
@@ -23,10 +25,7 @@ from akasa.vfs import (
     set_vfs_artifact_path_resolver,
 )
 _HEAL_LOCAL = threading.local()
-_JSON_CACHE_LOCK = threading.RLock()
-_JSON_CACHE: typing.Dict[str, str] = {}
-_JSON_MTIME: typing.Dict[str, int] = {}
-_JSON_PARSED_CACHE: typing.Dict[str, typing.Tuple[int, typing.Any]] = {}
+_JSON_CONFIG_CACHE = BoundedCache("json_config", max_entries=256)
 _CORE_MODULES: typing.Set[str] = set()
 
 
@@ -75,30 +74,21 @@ def heal_daemon_config_files(remove_legacy_system_json: bool = False) -> typing.
                         )
                         restored = {"workspaces": merged_ws, "active_workspace": active_ws}
                         atomic_write_text(ws_path.as_posix(), json.dumps(restored, indent=2), encoding="utf-8", lock=True)
-                        with _JSON_CACHE_LOCK:
-                            _JSON_CACHE.pop(ws_path.as_posix(), None)
-                            _JSON_MTIME.pop(ws_path.as_posix(), None)
-                            _JSON_PARSED_CACHE.pop(ws_path.as_posix(), None)
+                        _JSON_CONFIG_CACHE.pop(ws_path.as_posix(), None)
 
                     host_keys = {k: v for k, v in sys_data.items() if k not in ("workspaces", "active_workspace")}
                     if host_keys and (remove_legacy_system_json or not host_path.exists()):
                         host_data = load_json_config(host_path.as_posix(), {}) if host_path.exists() else {}
                         merged_host = {**host_keys, **host_data} if host_path.exists() else host_keys
                         atomic_write_text(host_path.as_posix(), json.dumps(merged_host, indent=2), encoding="utf-8", lock=True)
-                        with _JSON_CACHE_LOCK:
-                            _JSON_CACHE.pop(host_path.as_posix(), None)
-                            _JSON_MTIME.pop(host_path.as_posix(), None)
-                            _JSON_PARSED_CACHE.pop(host_path.as_posix(), None)
+                        _JSON_CONFIG_CACHE.pop(host_path.as_posix(), None)
 
                     if remove_legacy_system_json:
                         try:
                             os.remove(sys_path.as_posix())
                         except OSError:
                             pass
-                        with _JSON_CACHE_LOCK:
-                            _JSON_CACHE.pop(sys_path.as_posix(), None)
-                            _JSON_MTIME.pop(sys_path.as_posix(), None)
-                            _JSON_PARSED_CACHE.pop(sys_path.as_posix(), None)
+                        _JSON_CONFIG_CACHE.pop(sys_path.as_posix(), None)
             except Exception:
                 pass
         elif ws_path.exists():
@@ -110,10 +100,7 @@ def heal_daemon_config_files(remove_legacy_system_json: bool = False) -> typing.
                         "active_workspace": "default",
                     }
                     atomic_write_text(ws_path.as_posix(), json.dumps(restored_default, indent=2), encoding="utf-8", lock=True)
-                    with _JSON_CACHE_LOCK:
-                        _JSON_CACHE.pop(ws_path.as_posix(), None)
-                        _JSON_MTIME.pop(ws_path.as_posix(), None)
-                        _JSON_PARSED_CACHE.pop(ws_path.as_posix(), None)
+                    _JSON_CONFIG_CACHE.pop(ws_path.as_posix(), None)
             except Exception:
                 pass
     finally:
@@ -136,28 +123,26 @@ def get_daemon_host_config_path() -> str:
 
 def get_json_cache_stats() -> dict:
     """Returns telemetry statistics for the internal JSON configuration cache."""
-    with _JSON_CACHE_LOCK:
-        json_cache_bytes = sum(len(v.encode('utf-8')) for v in _JSON_CACHE.values() if isinstance(v, str))
-        files_count = len(_JSON_CACHE)
     return {
-        "json_config_cache_files": files_count,
-        "json_config_cache_kb": round(json_cache_bytes / 1024, 2),
+        "json_config_cache_files": len(_JSON_CONFIG_CACHE),
+        "json_config_cache_kb": _JSON_CONFIG_CACHE.approx_kb(),
     }
 
 
 def get_kernel_memory_telemetry() -> dict:
-    """Combines VFS read/write cache statistics and JSON config cache statistics into a single telemetry dict."""
+    """Combines VFS read/write cache statistics, JSON config cache statistics, and BoundedCache stats into a single telemetry dict."""
     return {
         **get_vfs_cache_stats(),
         **get_json_cache_stats(),
+        **get_registered_cache_stats(),
     }
 
 
 def load_json_config(filepath, default_fallback=None):
     """
     Reads and parses a JSON configuration file backed by the VFS Read-Your-Writes cache.
-    Caches parsed Python objects keyed by the VFS causal revision token (-pending_seq or st_mtime_ns),
-    returning a fast container clone on cache hits without re-running json.loads().
+    Caches parsed Python objects in `_JSON_CONFIG_CACHE` keyed by the VFS causal revision token
+    (-pending_seq or st_mtime_ns), returning a fast container clone on cache hits without re-running json.loads().
     """
     if default_fallback is None:
         default_fallback = {}
@@ -165,32 +150,22 @@ def load_json_config(filepath, default_fallback=None):
         return clone_json_value(default_fallback)
 
     norm_key = Path(filepath).as_posix()
-    with _JSON_CACHE_LOCK:
-        mtime_known = norm_key in _JSON_MTIME and norm_key in _JSON_CACHE
-
-    rev_token, raw_text = read_cached_physical_text(norm_key, bypass_read_cache=not mtime_known)
+    has_cached_key = norm_key in _JSON_CONFIG_CACHE
+    rev_token, raw_text = read_cached_physical_text(norm_key, bypass_read_cache=not has_cached_key)
     if rev_token is None or raw_text is None:
-        with _JSON_CACHE_LOCK:
-            _JSON_CACHE.pop(norm_key, None)
-            _JSON_MTIME.pop(norm_key, None)
-            _JSON_PARSED_CACHE.pop(norm_key, None)
+        _JSON_CONFIG_CACHE.pop(norm_key, None)
         return clone_json_value(default_fallback)
 
-    with _JSON_CACHE_LOCK:
-        cached_entry = _JSON_PARSED_CACHE.get(norm_key)
-        if mtime_known and cached_entry is not None and cached_entry[0] == rev_token and _JSON_MTIME.get(norm_key) == rev_token:
-            return clone_json_value(cached_entry[1])
+    cached = _JSON_CONFIG_CACHE.get(norm_key, revision=rev_token)
+    if cached is not None:
+        return cached
 
     try:
         parsed = json.loads(raw_text)
     except Exception:
         return clone_json_value(default_fallback)
 
-    with _JSON_CACHE_LOCK:
-        _JSON_CACHE[norm_key] = raw_text
-        _JSON_MTIME[norm_key] = rev_token
-        _JSON_PARSED_CACHE[norm_key] = (rev_token, parsed)
-
+    _JSON_CONFIG_CACHE.put(norm_key, parsed, revision=rev_token)
     return clone_json_value(parsed)
 
 
@@ -198,7 +173,6 @@ def save_json_config(filepath, data, workspace_id=None):
     """Stages a JSON configuration write onto the VFS pipeline and updates the parsed object cache atomically."""
     norm_key = Path(filepath).as_posix()
     content = json.dumps(data, indent=2)
-    cloned_data = clone_json_value(data)
 
     execute_vfs_save(
         workspace_id or "default",
@@ -208,11 +182,8 @@ def save_json_config(filepath, data, workspace_id=None):
     )
 
     rev_token, _ = read_cached_physical_text(norm_key)
-    with _JSON_CACHE_LOCK:
-        _JSON_CACHE[norm_key] = content
-        if rev_token is not None:
-            _JSON_MTIME[norm_key] = rev_token
-            _JSON_PARSED_CACHE[norm_key] = (rev_token, cloned_data)
+    if rev_token is not None:
+        _JSON_CONFIG_CACHE.put(norm_key, data, revision=rev_token)
 
 
 def get_workspace_physics(workspace_id=None):
@@ -432,10 +403,7 @@ def resolve_system_artifact_path(filepath, workspace_id):
     return resolve_sandbox_path(filepath, workspace_id)
 def reset() -> None:
     """Purges JSON configuration caches and load_config TTL cache for isolated test harnesses."""
-    with _JSON_CACHE_LOCK:
-        _JSON_CACHE.clear()
-        _JSON_MTIME.clear()
-        _JSON_PARSED_CACHE.clear()
+    _JSON_CONFIG_CACHE.clear()
     load_config.clear_all()
 
 

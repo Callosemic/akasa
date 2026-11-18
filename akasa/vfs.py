@@ -146,11 +146,7 @@ def drain_write_queue(timeout: float = 5.0) -> None:
 
 
 def reset() -> None:
-    """
-    Drains the async write queue, then purges the VFS read cache, pending write overlay, and ancestor
-    ring buffer for isolated test harnesses. Draining first matters: a write queued under one daemon
-    cwd must not execute after the harness switches cwd, or it lands at the wrong physical path.
-    """
+    """Drains the async write queue, then purges the VFS read cache, pending write overlay, and ancestor ring buffer."""
     global _VFS_READ_CACHE_BYTES
     drain_write_queue()
     with _VFS_CACHE_LOCK:
@@ -646,12 +642,7 @@ _PROTECTED_WRITE_MESSAGE = "Refusing to modify a host-protected file (registered
 
 
 def _protected_segment_match(segments: List[str], ns_segments: List[str], protected_base: str) -> bool:
-    """
-    True when the path names the protected module or anything that would shadow it at import time:
-    the file itself, a same-named package directory (<stem>/__init__.py), compiled or extension
-    variants (<stem>.cpython-*.so, <stem>.pyc), and __pycache__ entries. The namespace must be the
-    directory the module sits in, compared by whole path segments (so 'pkg' never matches 'pkg-demo').
-    """
+    """True when `segments` names `protected_base` or an import-shadowing variant within `ns_segments`."""
     stem = protected_base.rsplit(".", 1)[0] if "." in protected_base else protected_base
     for idx, seg in enumerate(segments):
         is_file = idx == len(segments) - 1
@@ -691,23 +682,13 @@ _CONFIRMED_PROTECTED_WRITE: contextvars.ContextVar[bool] = contextvars.ContextVa
 
 
 def set_protected_write_handler(handler: Optional[Callable[[Dict[str, Any]], Any]]) -> None:
-    """
-    DI Interface: the host decides what happens to a VFS mutation that touches a protected target.
-
-    The handler is called as handler(request) with request = {"action": "save" | "delete" | "move",
-    "workspace_id", "filepath", "dest_path", "content", "data", "origin"}, where origin is the active execution
-    frame's origin. It returns (body, status), or a body alone (status 202), and that is what the caller gets back;
-    nothing is written. Passing None restores the default, which refuses every such mutation.
-    """
+    """DI Interface: registers the host policy callback invoked when a VFS mutation touches a protected target."""
     global _PROTECTED_WRITE_HANDLER
     _PROTECTED_WRITE_HANDLER = handler
 
 
 def is_protected_vfs_target(filepath: Optional[str], workspace_id: Optional[str] = None, is_absolute_artifact: bool = False) -> bool:
-    """
-    True when filepath (or, given a workspace, the physical path it resolves to) is a host-protected target or
-    would shadow one. A pure check: hosts use it to tell a person ahead of time that a change will be held.
-    """
+    """True when `filepath` (or its resolved physical path) is a host-protected target or would shadow one."""
     if not filepath:
         return False
     resolved = _resolve_physical_path(filepath, workspace_id, is_absolute_artifact) if workspace_id else None
@@ -722,25 +703,16 @@ def _protected_hit(*paths: Optional[str]) -> bool:
 
 
 def _route_protected_mutation(
-    action: str,
-    workspace_id: str,
-    filepath: str,
-    dest_path: Optional[str] = None,
-    content: Optional[str] = None,
-    data: Optional[Dict[str, Any]] = None,
+    action: str, workspace_id: str, filepath: str, dest_path: Optional[str] = None,
+    content: Optional[str] = None, data: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], int]:
     """Hands a protected mutation to the host handler, or refuses it when none is registered."""
     if _PROTECTED_WRITE_HANDLER is None:
         print(f"🛑 [VFS Guarded Write] Refused {action} of protected file '{filepath}'.")
         return {"status": "error", "message": _PROTECTED_WRITE_MESSAGE}, 403
     request = {
-        "action": action,
-        "workspace_id": workspace_id,
-        "filepath": filepath,
-        "dest_path": dest_path,
-        "content": content,
-        "data": dict(data or {}),
-        "origin": get_current_origin(),
+        "action": action, "workspace_id": workspace_id, "filepath": filepath, "dest_path": dest_path,
+        "content": content, "data": dict(data or {}), "origin": get_current_origin(),
     }
     try:
         result = _PROTECTED_WRITE_HANDLER(request)
@@ -753,16 +725,9 @@ def _route_protected_mutation(
 
 
 def execute_confirmed_protected_write(
-    workspace_id: str,
-    filepath: str,
-    content: Optional[str] = None,
-    data: Optional[Dict[str, Any]] = None,
+    workspace_id: str, filepath: str, content: Optional[str] = None, data: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], int]:
-    """
-    Writes content to a protected target, or deletes it when content is None, skipping the protected-target check
-    for this one call. Every other guard still applies (read-only mounts, volume resolution, the write queue).
-    Hosts call this only from their human confirmation path, after a person approved this exact change.
-    """
+    """Writes or deletes a protected target after human confirmation, bypassing only the protected-target check for this call."""
     token = _CONFIRMED_PROTECTED_WRITE.set(True)
     try:
         if content is None:
@@ -776,6 +741,8 @@ def execute_confirmed_protected_write(
 
 
 def execute_vfs_move(workspace_id, filepath, dest_path):
+    if get_current_origin() == "public":
+        return {"status": "error", "message": "Public routes are strictly read-only."}, 403
     if str(filepath).startswith("ws://") or str(dest_path).startswith("ws://"):
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}, 403
     if _protected_hit(filepath, dest_path):
@@ -793,6 +760,8 @@ def execute_vfs_move(workspace_id, filepath, dest_path):
     _VFS_WRITE_QUEUE.put((workspace_id, filepath, "", {"action": "move", "dest_path": dest_path, "_pending_seq": seq}))
     return {"status": "accepted", "message": f"File move queued."}, 202
 def execute_vfs_delete(workspace_id, filepath):
+    if get_current_origin() == "public":
+        return {"status": "error", "message": "Public routes are strictly read-only."}, 403
     if str(filepath).startswith("ws://"):
         return {"status": "error", "message": "Cross-workspace virtual mounts ('ws://') are strictly read-only."}, 403
     resolved_path = _resolve_physical_path(filepath, workspace_id)
@@ -804,6 +773,8 @@ def execute_vfs_delete(workspace_id, filepath):
     return {"status": "accepted", "message": f"File deletion queued."}, 202
 
 def execute_vfs_bulk(workspace_id, operations):
+    if get_current_origin() == "public":
+        return {"status": "error", "message": "Public routes are strictly read-only."}, 403
     sanitized = []
     protected_results = []
     for op in operations:
@@ -845,6 +816,8 @@ def execute_vfs_bulk(workspace_id, operations):
         result["protected"] = protected_results
     return result, 202
 def execute_vfs_save(workspace_id, filepath, content, data=None):
+    if get_current_origin() == "public":
+        return {"status": "error", "message": "Public routes are strictly read-only."}
     data = dict(data or {})
     if str(filepath).startswith("ws://"):
         print(f"🛑 [VFS Security] Write dropped: Virtual mount '{filepath}' is strictly read-only.")
@@ -1051,26 +1024,25 @@ class VFSTransaction:
 
     def three_way_merge(self, base_text: str, disk_text: str, incoming_text: str) -> Tuple[bool, str]:
         return three_way_merge_text(base_text, disk_text, incoming_text)
-    def read(self, filepath, is_absolute_artifact=False):
-        """Safely resolves and reads a file's contents with a single stat syscall."""
+    def read_with_revision(self, filepath, is_absolute_artifact=False) -> Tuple[Optional[int], Optional[str]]:
+        """Safely resolves and reads `(revision_token, content)` with Read-Your-Writes consistency."""
         if not is_absolute_artifact and filepath and "://" not in str(filepath):
             raise ValueError(f"Non-canonical URI rejected by VFS read (missing scheme:// prefix): '{filepath}'")
         if self._in_transaction and self._buffer:
-            for buf_fp, buf_content, buf_data in reversed(self._buffer):
+            for idx, (buf_fp, buf_content, buf_data) in enumerate(reversed(self._buffer), start=1):
                 if buf_fp == filepath:
-                    if buf_data.get("action") == "delete":
-                        return None
-                    return buf_content
+                    return (None, None) if buf_data.get("action") == "delete" else (-(1_000_000 + idx), buf_content)
         resolved = _resolve_physical_path(filepath, self.workspace_id, is_absolute_artifact)
-        if not resolved:
-            return None
-        _, text = read_cached_physical_text(resolved)
-        return text
+        return read_cached_physical_text(resolved) if resolved else (None, None)
+
+    def read(self, filepath, is_absolute_artifact=False):
+        """Safely resolves and reads a file's contents with a single stat syscall."""
+        return self.read_with_revision(filepath, is_absolute_artifact=is_absolute_artifact)[1]
 
     def __enter__(self):
-        self._in_transaction = True
-        self._buffer = []
+        self._in_transaction, self._buffer = True, []
         return self
+
     def __exit__(self, exc_type, exc_val, exc_tb):
         self._in_transaction = False
         if exc_type is None and self._buffer:
@@ -1078,37 +1050,70 @@ class VFSTransaction:
                 filepath, content, data = self._buffer[0]
                 execute_vfs_save(self.workspace_id, filepath, content, data)
             else:
-                bulk_ops = []
-                for filepath, content, data in self._buffer:
-                    op_data = dict(data or {})
-                    op_data["action"] = op_data.get("action", "save")
-                    op_data["filepath"] = filepath
-                    op_data["content"] = content
-                    bulk_ops.append(op_data)
-                execute_vfs_bulk(self.workspace_id, bulk_ops)
-
+                execute_vfs_bulk(self.workspace_id, [
+                    {**dict(data or {}), "action": (data or {}).get("action", "save"), "filepath": fp, "content": content}
+                    for fp, content, data in self._buffer
+                ])
         self._buffer = []
+
     def walk(self, directory_path, exts=None):
         """Safely sweeps a directory within the workspace bounds, yielding strict workspace-relative file paths."""
         resolved_dir = _resolve_physical_path(directory_path, self.workspace_id)
-
         if not resolved_dir or not os.path.exists(resolved_dir):
             return
         for root, dirs, files in os.walk(resolved_dir):
-            # Inversion of Control: Host application defines standard noise to ignore
             ignored_dirs = hooks.emit_first('request_vfs_ignore_dirs', workspace_id=self.workspace_id, default=[])
             dirs[:] = [d for d in dirs if d not in ignored_dirs]
             for file in files:
                 if exts and not any(file.endswith(ext) for ext in exts):
                     continue
+                rel = os.path.relpath(Path(root).joinpath(file).as_posix(), resolved_dir).replace('\\', '/')
+                yield directory_path if rel == '.' else (rel if not directory_path else f"{directory_path.rstrip('/')}/{rel}")
 
-                abs_path = Path(root).joinpath(file).as_posix()
-                rel_to_resolved = os.path.relpath(abs_path, resolved_dir).replace('\\', '/')
 
-                if rel_to_resolved == '.':
-                    yield directory_path
-                elif not directory_path:
-                    yield rel_to_resolved
-                else:
-                    sep = "" if directory_path.endswith('/') else "/"
-                    yield f"{directory_path}{sep}{rel_to_resolved}"
+class MemoryVFSTransaction(VFSTransaction):
+    """Canonical in-memory VFSTransaction backed by a dict (`files`), implementing the full VFS contract without disk I/O."""
+    def __init__(self, files: Optional[Dict[str, str]] = None, workspace_id: str = "default"):
+        super().__init__(workspace_id)
+        self.files: Dict[str, str] = dict(files or {})
+
+    def read_with_revision(self, filepath, is_absolute_artifact=False) -> Tuple[Optional[int], Optional[str]]:
+        if not is_absolute_artifact and filepath and "://" not in str(filepath):
+            raise ValueError(f"Non-canonical URI rejected by VFS read (missing scheme:// prefix): '{filepath}'")
+        val = self.files.get(str(filepath))
+        return (hash(val), val) if val is not None else (None, None)
+
+    def save(self, filepath, content, data=None):
+        if isinstance(data, dict) and data.get("action") == "delete":
+            self.files.pop(str(filepath), None)
+        else:
+            if isinstance(data, dict) and data.get("delete_source"):
+                self.files.pop(str(data["delete_source"]), None)
+            self.files[str(filepath)] = str(content)
+        return {"status": "accepted"}
+
+    def delete(self, filepath, data=None):
+        self.files.pop(str(filepath), None)
+        return {"status": "accepted"}, 202
+
+    def move(self, filepath, dest_path, data=None):
+        if str(filepath) in self.files:
+            self.files[str(dest_path)] = self.files.pop(str(filepath))
+        return {"status": "accepted"}, 202
+
+    def bulk(self, operations: List[Dict[str, Any]]):
+        for op in operations or []:
+            act, fp, dest = op.get("action", "save"), str(op.get("filepath") or ""), str(op.get("dest_path") or "")
+            if act == "delete" and fp: self.files.pop(fp, None)
+            elif act == "move" and fp and dest and fp in self.files: self.files[dest] = self.files.pop(fp)
+            elif act == "save" and fp: self.files[fp] = str(op.get("content") or "")
+        return {"status": "accepted", "operations": list(operations or [])}, 202
+
+    def __enter__(self): return self
+    def __exit__(self, exc_type, exc_val, exc_tb): return False
+
+    def walk(self, directory_path, exts=None):
+        prefix = str(directory_path).rstrip("/") + "/"
+        for k in sorted(self.files.keys()):
+            if k.startswith(prefix) and (not exts or any(k.endswith(e) for e in exts)):
+                yield k

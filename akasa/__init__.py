@@ -2,9 +2,10 @@ import os
 import queue
 import threading
 from typing import Optional, Iterable, Tuple, Callable, Union
-from flask import Flask, request, jsonify, Response, has_request_context
+from flask import Flask, g, request, jsonify, Response, has_request_context
 import akasa.context as _akasa_context
 from akasa.context import (
+    execution_frame,
     set_daemon_cwd,
     set_tenant_resolver,
     register_trusted_host_suffix,
@@ -154,6 +155,16 @@ def init_app(
     allowed_prefixes = tuple(public_prefixes or ())
     allowed_suffixes = tuple(public_suffixes or ())
 
+    @app.teardown_request
+    def _akasa_reset_public_request_frame(exception=None):
+        frame_cm = getattr(g, "_akasa_public_frame_cm", None)
+        if frame_cm is not None:
+            g._akasa_public_frame_cm = None
+            try:
+                frame_cm.__exit__(None, None, None)
+            except Exception:
+                pass
+
     @app.teardown_appcontext
     def _akasa_cleanup_request_db_connections(exception=None):
         close_thread_connections()
@@ -174,18 +185,23 @@ def init_app(
             if not is_host_allowed(peer.host, get_trusted_host_suffixes()):
                 return jsonify({"error": "421 Misdirected Request: Host not allowed."}), 421
         req_route = request.path
-        if (
-            req_route in allowed_routes
-            or (allowed_prefixes and req_route.startswith(allowed_prefixes))
-            or (allowed_suffixes and req_route.endswith(allowed_suffixes))
-        ):
-            return None
         client_token = (
             request.headers.get(token_header)
             or request.headers.get("X-Akasa-Token")
             or request.args.get("token")
         )
-        if not _akasa_credentials.verify_token(client_token, get_boot_token()):
+        has_valid_token = _akasa_credentials.verify_token(client_token, get_boot_token())
+        if (
+            req_route in allowed_routes
+            or (allowed_prefixes and req_route.startswith(allowed_prefixes))
+            or (allowed_suffixes and req_route.endswith(allowed_suffixes))
+        ):
+            if not has_valid_token and req_route != "/auth/bootstrap":
+                cm = execution_frame(transport="HTTP", method=request.method, origin="public")
+                cm.__enter__()
+                g._akasa_public_frame_cm = cm
+            return None
+        if not has_valid_token:
             return jsonify({"error": "401 Unauthorized: Invalid or missing execution credentials."}), 401
         return None
 

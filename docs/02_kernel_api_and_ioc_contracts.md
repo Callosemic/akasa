@@ -24,7 +24,7 @@ Host applications can wire the full Tier 1 kernel lifecycle via the top-level `a
 
 * **`akasa.tune_process_resources()`**: Raises `RLIMIT_NOFILE` to 65,536, bounds glibc arenas (`MALLOC_ARENA_MAX=2`), and sets thread stack size to 1 MB.
 * **`akasa.configure(control_dir, proxy_headers=(), allowed_hosts=(), protected_vfs_targets=(), ...)`**: Phase A headless configuration setting control directory, trusted namespaces, extension namespaces, core modules, SSE passthrough events, trusted tunnel suffixes, additional proxy headers, allowed hostnames, and host-protected VFS targets.
-* **`akasa.init_app(app: Flask, enforce_host_validation=True, ...)`**: Phase B transport wiring. Attaches `ForceHTTPSProxyFix`, mounts authentication blueprints (`auth_bp`, `security_bp`), enforces DNS-rebinding Host header validation (`421 Misdirected Request`), sets up `@app.teardown_appcontext` SQLite connection purging, injects anti-caching response headers, enforces token gates, and mounts optional SSE streaming routes.
+* **`akasa.init_app(app: Flask, enforce_host_validation=True, ...)`**: Phase B transport wiring. Attaches `ForceHTTPSProxyFix`, mounts authentication blueprints (`auth_bp`, `security_bp`), enforces DNS-rebinding Host header validation (`421 Misdirected Request`), binds unauthenticated public-allowlist requests (except `/auth/bootstrap`) to `ExecutionFrame(..., origin="public")` (enforcing read-only VFS semantics), sets up `@app.teardown_appcontext` SQLite connection purging, injects anti-caching response headers, enforces token gates, and mounts optional SSE streaming routes.
 * **`akasa.boot(skip_if_reloader_parent=False)`**: Fires `hooks.emit('system_boot')`, gracefully bypassing parent processes during Werkzeug debug reloads.
 * **`akasa.reset_state(cwd=None, control_dir=None)`**: Closes pooled database handles, purges JSON/VFS/Ancestor RAM caches, and resets workspace state for isolated test harnesses.
 
@@ -136,9 +136,10 @@ ext_bp = AkasaExtension(
    * ctx.get_db(db_name: Optional[str] = None) -> DatabaseWrapper: Returns an SQLite wrapper for any registered workspace database.
    * Queries return `akasa.db.Row` instances (`sqlite3.Row` subclass supporting positional/column-name indexing, value unpacking, and `.get(key, default=None)`).
    * Methods: .execute(sql, params), .executemany(sql, seq), .commit(), .get_all(table, order_by=None), .get_by_id(table, id_val, id_col="id"), .insert_or_replace(table, data_dict), .update(table, data_dict, where_col, where_val), .delete(table, where_col, where_val).
- * Virtual File System (ctx.vfs -> VFSTransaction):
+ * Virtual File System (ctx.vfs -> VFSTransaction; in-memory alternative: MemoryVFSTransaction):
    * All paths must be canonical scheme:// URIs unless data={"is_absolute_artifact": True} is passed.
-   * Methods: .read(filepath, is_absolute_artifact=False) -> Optional[str], .save(filepath, content, data=None), .delete(filepath, data=None), .move(filepath, dest_path, data=None), .bulk(operations), .walk(directory_path, exts=None) -> Iterator[str].
+   * Methods: .read(filepath, is_absolute_artifact=False) -> Optional[str], .read_with_revision(filepath, is_absolute_artifact=False) -> Tuple[Optional[int], Optional[str]], .save(filepath, content, data=None), .delete(filepath, data=None), .move(filepath, dest_path, data=None), .bulk(operations), .walk(directory_path, exts=None) -> Iterator[str].
+   * `MemoryVFSTransaction(files=None, workspace_id="default")`: Canonical dict-backed `VFSTransaction` implementing the full VFS contract in RAM without disk I/O.
    * OCC & Merging: .compute_sha256(text), .record_ancestor(filepath, text), .lookup_ancestor(filepath, base_hash), .three_way_merge(base_text, disk_text, incoming_text), .evict_cache(resolved_path).
    * Supports with ctx.vfs: context manager to batch multiple mutations into a single atomic execute_vfs_bulk commit.
    * ctx.sync_vfs_barrier(timeout=5.0): Blocks until all preceding VFS writes are physically flushed to disk.
@@ -194,14 +195,17 @@ ext_bp = AkasaExtension(
     * is_loopback_origin(url_str) -> bool: Verifies whether Origin/Referer URLs resolve to loopback hostnames.
     * register_proxy_header(*names) / get_proxy_headers(): Registers additional proxy header names.
     * register_allowed_host(*hosts) / get_allowed_hosts(): Registers exact-match allowed hostnames.
-* ExecutionFrame, DAG Wavefront & Context Primitives (akasa.context):
+* ExecutionFrame, DAG Wavefront, BoundedCache & Context Primitives (akasa.context):
+    * class BoundedCache(name, max_entries=512, ttl=None, copy_mode="json"): Ring 0 thread-safe bounded LRU cache with optional `revision` token matching, monotonic `ttl`, defensive cloning (`"json"` | `"deepcopy"` | `"none"`), and automatic `reset()` purging on `akasa.reset_state()`.
+    * get_registered_cache_stats() -> Dict[str, int]: Returns entry counts for all registered `BoundedCache` instances (merged into `get_kernel_memory_telemetry()`).
     * resolve_dag_wavefronts(items, id_key="id", parents_key="depends_on", order_key="order") -> List[List[Dict]]: Level-order topological wavefront sorting using stdlib `graphlib.TopologicalSorter`.
     * extract_template_variables(text) -> List[Dict]: Extracts template parameters with default/required annotations.
     * interpolate_template_variables(text, values=None, resolver=None) -> str: Resolves inside-out template placeholders with fallbacks.
-    * class ExecutionFrame: Slotted immutable execution context bound to contextvars across HTTP, IPC, Worker, and CLI transports.
-    * execution_frame(workspace_id=None, transport="CLI", method="CALL", payload=None, job_id=None, origin=None): Context manager binding an active ExecutionFrame. `origin` says who started the call chain: an explicit origin wins, a nested frame keeps its caller's origin, and a frame with no caller takes its transport's default (`HTTP` → `ui`, `WORKER` → `worker`, `CLI` → `cli`, `IPC` → `internal`). Jobs and background hooks keep the origin of the code that submitted or emitted them.
+    * class ExecutionFrame: Slotted immutable execution context bound to contextvars across HTTP, IPC, Worker, and CLI transports (`workspace_id`, `transport`, `method`, `payload`, `job_id`, `origin`, `baggage`).
+    * execution_frame(workspace_id=None, transport="CLI", method="CALL", payload=None, job_id=None, origin=None, baggage=None): Context manager binding an active ExecutionFrame. `origin` says who started the call chain: an explicit origin wins, a nested frame keeps its caller's origin, and a frame with no caller takes its transport's default (`HTTP` → `ui`, `WORKER` → `worker`, `CLI` → `cli`, `IPC` → `internal`). Unauthenticated public HTTP routes run under `origin="public"`, which the VFS write entry points refuse; `public` is sticky, so a nested frame under it stays `public` whatever origin it names. `baggage` merges non-empty keys across nested frames and propagates through `run_parallel()` and worker job envelopes.
     * get_current_frame() -> Optional[ExecutionFrame]: Returns active frame or None.
     * get_current_origin() -> Optional[str]: The active frame's origin, or None outside a frame.
+    * get_current_baggage() -> Dict[str, Any]: Returns a shallow copy of the active frame's baggage dictionary.
     * resolve_active_tenant(default="default") -> str: Resolves tenant from active frame or injected resolver.
     * sniff_tenant_id() -> str: Returns resolved active tenant workspace_id.
     * atomic_write_bytes(filepath, data, mode=None, lock=False) / atomic_write_text(filepath, content, encoding="utf-8", mode=None, lock=False): Atomic write with optional inter-process locking on .state.lock.

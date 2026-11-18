@@ -19,7 +19,7 @@ akasa/
 │   │   ├── def tune_process_resources() # Tier 1 OS Resource Governance: Raises file descriptor limits, bounds glibc arenas, and caps thread stack size.
 │   │   ├── class ForceHTTPSProxyFix # WSGI Middleware to force HTTPS scheme when behind reverse proxies or trusted tunnel suffixes.
 │   │   ├── def configure(control_dir, trusted_namespaces, extension_namespaces, core_modules, ...) # Phase A: Headless-safe process & HookRegistry physics configuration.
-│   │   ├── def init_app(app, token_header, public_routes, public_prefixes, ...) # Phase B: Wires Flask transport, authentication gate, DB connection teardown, and optional SSE stream.
+│   │   ├── def init_app(app, token_header, public_routes, public_prefixes, ...) # Phase B: Wires Flask transport, authentication gate, public-origin read-only frame lifecycle, DB connection teardown, and optional SSE stream.
 │   │   ├── def boot(skip_if_reloader_parent) # Ignites the Akasa kernel lifecycle (DB migrations, VFS write pipeline, and Worker Metronome).
 │   │   └── def reset_state(cwd, control_dir) # First-class test harness reset: delegates to each Ring subsystem's reset() contract.
 │   ├── auth/                       # Ring 4: Authentication blueprint, token exchange, and Fernet encryption
@@ -55,10 +55,11 @@ akasa/
 │   │       ├── def is_host_allowed(host, trusted_suffixes, allowed_hosts) # DNS-rebinding guard: accepts loopback hostnames, exact registered hosts, and hosts under a trusted suffix.
 │   │       └── def is_loopback_origin(url_str) # True when an Origin/Referer URL points at a loopback hostname (port ignored).
 │   ├── context.py                  # Ring 0: Pure stdlib execution context (ExecutionFrame), atomic file writes, and stateless utilities
-│   │   ├── class ExecutionFrame    # Slotted execution frame bound to contextvars across HTTP, IPC, Worker and CLI calls; carries the call's origin (ui, mcp, routine, agent, worker, cli).
-│   │   ├── def execution_frame(workspace_id, transport, method, payload, ...) # Context manager binding an ExecutionFrame; an explicit origin wins, nested frames inherit, and each transport has a default origin.
+│   │   ├── class ExecutionFrame    # Slotted execution frame bound to contextvars across HTTP, IPC, Worker and CLI calls; carries the call's origin (ui, public, mcp, routine, agent, worker, cli) and baggage.
+│   │   ├── def execution_frame(workspace_id, transport, method, payload, ...) # [stale?] Context manager binding an ExecutionFrame; an explicit origin wins, nested frames inherit origin and merge baggage, and each transport has a default origin.
 │   │   ├── def get_current_frame() # Returns the currently active ExecutionFrame on this context/thread, or None.
 │   │   ├── def get_current_origin() # Who started the active call chain ('ui', 'worker', or a host-set origin such as 'mcp'), or None outside a frame.
+│   │   ├── def get_current_baggage() # Returns a shallow copy of the active ExecutionFrame's domain-agnostic baggage dictionary.
 │   │   ├── def set_tenant_resolver(resolver_fn) # DI Interface: Registers a transport-agnostic callable returning the active tenant workspace_id.
 │   │   ├── def resolve_active_tenant(default) # Resolves the active workspace_id from the active ExecutionFrame or injected tenant_resolver.
 │   │   ├── def sniff_tenant_id()   # Returns the active tenant workspace_id (defaults to 'default').
@@ -73,7 +74,9 @@ akasa/
 │   │   ├── def allocate_ephemeral_port(host) # Asks the OS kernel for an available ephemeral TCP port.
 │   │   ├── def atomic_write_bytes(filepath, data, mode, lock) # Atomically writes bytes to filepath using a dot-prefixed sibling temporary file, os.fsync, permission preservation, and os.replace.
 │   │   ├── def atomic_write_text(filepath, content, encoding, mode, ...) # Atomically writes UTF-8 text to filepath via atomic_write_bytes.
-│   │   ├── def clone_json_value(val) # Fast recursive container cloner for JSON-compatible structures (dicts/lists) without copy.deepcopy overhead.
+│   │   ├── def clone_json_value(val) # Fast recursive container cloner for JSON-compatible structures (dicts/lists/tuples) without copy.deepcopy overhead.
+│   │   ├── class BoundedCache      # Ring 0 thread-safe bounded LRU cache with causal revision-token validation, optional monotonic TTL, defensive value cloning ('json' | 'deepc...
+│   │   ├── def get_registered_cache_stats() # Returns entry counts for all registered Ring 0 BoundedCache instances.
 │   │   ├── def thread_safe_cache(ttl, key_maker) # A non-blocking, single-flight TTL cache with invalidation race protection.
 │   │   ├── def typeddict_to_openapi(td_class) # Transforms a Python TypedDict into an OpenAPI 3.0 JSON Schema object natively.
 │   │   ├── def generate_idempotency_hash(payload) # Generates a deterministic JSON string hash for a dictionary payload.
@@ -86,7 +89,7 @@ akasa/
 │   │   ├── def resolve_dag_wavefronts(items, id_key, parents_key, order_key) # Compiles a list of node dictionaries into level-order topological wavefronts (generations) using stdlib graphlib.TopologicalSorter.
 │   │   ├── def extract_template_variables(text) # Scans text for {{ var }} or {{ var | default }} placeholders (including {{ macro_var }}), ignoring system multipliers and wordcount tags.
 │   │   ├── def interpolate_template_variables(text, values, resolver) # Inside-out template variable interpolator for {{ var }}, {{ var | fallback_var | default }}, and nested placeholders.
-│   │   └── def reset()             # Resets Ring 0 context state for isolated test harnesses.
+│   │   └── def reset()             # Resets Ring 0 context state and purges all registered BoundedCache instances for isolated test harnesses.
 │   ├── db.py                       # Ring 2: Thread-local SQLite connection pool and WAL schema migrations
 │   │   ├── class Row(sqlite3.Row)  # A query result row: sqlite3.Row (read by column name or position, unpacks to its values) plus a dict-style get().
 │   │   ├── def set_db_physics_resolvers(physics_fn, all_workspaces_fn) # DI Interface: Ring 2 state module binds workspace physics resolvers so db.py has zero upward dependencies.
@@ -137,10 +140,10 @@ akasa/
 │   │   ├── def heal_daemon_config_files(remove_legacy_system_json) # Kernel-level daemon config healer: Synchronizes any legacy system.json into workspaces.json and host.json.
 │   │   ├── def get_system_index_path() # Returns the canonical path to the daemon's workspaces.json routing index.
 │   │   ├── def get_daemon_host_config_path() # Returns the canonical path to the daemon's host.json settings file.
-│   │   ├── def get_json_cache_stats() # Returns telemetry statistics for the internal JSON configuration cache.
-│   │   ├── def get_kernel_memory_telemetry() # Combines VFS read/write cache statistics and JSON config cache statistics into a single telemetry dict.
-│   │   ├── def load_json_config(filepath, default_fallback) # Reads and parses a JSON configuration file backed by the VFS Read-Your-Writes cache.
-│   │   ├── def save_json_config(filepath, data, workspace_id) # Stages a JSON configuration write onto the VFS pipeline and updates the parsed object cache atomically.
+│   │   ├── def get_json_cache_stats() # Returns telemetry statistics for the internal BoundedCache-backed JSON configuration cache.
+│   │   ├── def get_kernel_memory_telemetry() # Combines VFS read/write cache statistics and JSON config cache statistics with registered BoundedCache stats into a single telemetry dict.
+│   │   ├── def load_json_config(filepath, default_fallback) # Reads and parses a JSON configuration file backed by the VFS Read-Your-Writes cache and BoundedCache.
+│   │   ├── def save_json_config(filepath, data, workspace_id) # Stages a JSON configuration write onto the VFS pipeline and updates the BoundedCache parsed object cache atomically.
 │   │   ├── def get_workspace_physics(workspace_id) # Resolves the canonical (config_path, workspace_root) 2-tuple for a tenant workspace.
 │   │   ├── def get_physics_for(workspace_id) # Alias for get_workspace_physics(workspace_id).
 │   │   ├── def get_tenant_control_dir(workspace_id) # Returns the control directory path for the specified tenant workspace.
@@ -153,7 +156,7 @@ akasa/
 │   │   ├── def is_extension_enabled(ext_name, workspace_id) # Returns True if ext_name is a core module or enabled in the active workspace's extensions list.
 │   │   ├── def resolve_sandbox_path(filepath, workspace_id) # Tier 1 Safe Path Resolution: Prevents directory traversal breakouts.
 │   │   ├── def resolve_system_artifact_path(filepath, workspace_id) # Safely resolves a system artifact path inside active or registered tenant control directories.
-│   │   └── def reset()             # Purges JSON configuration caches and load_config TTL cache for isolated test harnesses.
+│   │   └── def reset()             # Purges the JSON configuration BoundedCache and load_config TTL cache for isolated test harnesses.
 │   ├── sync.py                     # Ring 3: Kernel state heartbeat and system delta calculator
 │   │   └── def get_system_deltas(workspace_id, since_ts) # Calculates lightweight system deltas and collects domain-specific signatures.
 │   ├── types.py                    # Tier 1 type definitions, protocols, and event contracts
@@ -191,12 +194,13 @@ akasa/
 │   │   ├── def set_protected_write_handler(handler) # DI Interface: the host decides what happens to a mutation that touches a protected target; without a handler it is refused.
 │   │   ├── def is_protected_vfs_target(filepath, workspace_id, is_absolute_artifact) # True when filepath (or, given a workspace, the physical path it resolves to) is a host-protected target or would shadow one.
 │   │   ├── def execute_confirmed_protected_write(workspace_id, filepath, content, data) # Writes or deletes one protected target for the host's human confirmation path; every other guard still applies.
-│   │   ├── def execute_vfs_move(workspace_id, filepath, dest_path) # Queues an atomic file move; a move touching a protected target goes to the host handler instead.
-│   │   ├── def execute_vfs_delete(workspace_id, filepath) # Queues an atomic file deletion; a protected target goes to the host handler instead.
-│   │   ├── def execute_vfs_bulk(workspace_id, operations) # Queues a batch of VFS operations for atomic commit; protected items go to the host handler and are listed under 'protected'.
-│   │   ├── def execute_vfs_save(workspace_id, filepath, content, data) # Stages and queues an atomic file save; a protected target goes to the host handler and its answer is returned.
+│   │   ├── def execute_vfs_move(workspace_id, filepath, dest_path) # Queues an atomic file move (rejecting public origins); a move touching a protected target goes to the host handler instead.
+│   │   ├── def execute_vfs_delete(workspace_id, filepath) # Queues an atomic file deletion (rejecting public origins); a protected target goes to the host handler instead.
+│   │   ├── def execute_vfs_bulk(workspace_id, operations) # Queues a batch of VFS operations for atomic commit (rejecting public origins); protected items go to the host handler and are listed under 'protected'.
+│   │   ├── def execute_vfs_save(workspace_id, filepath, content, data) # Stages and queues an atomic file save (rejecting public origins); a protected target goes to the host handler and its answer is returned.
 │   │   ├── def execute_vfs_save_physical(workspace_id, filepath, content, data, ...) # Executes physical disk write with fsync, permissions, and ledger commit.
-│   │   └── class VFSTransaction    # Immediate or buffered (context-manager) VFS mutations; protected mutations are never buffered and go to the host handler at once.
+│   │   ├── class VFSTransaction    # Immediate or buffered (context-manager) VFS mutations with read_with_revision() causal tokens; protected mutations are never buffered and go to the host handler at once.
+│   │   └── class MemoryVFSTransaction(VFSTransaction) # Canonical in-memory VFSTransaction backed by a dict (`files`), implementing the full VFS contract without disk I/O.
 │   └── workers/                    # Metronome worker engine and job ledger
 │       └── __init__.py             # Metronome worker engine, task scheduler, and job ledger
 │           ├── class ChainStepSchema(TypedDict) # Specification schema for an execution step in a worker chain.
@@ -205,7 +209,7 @@ akasa/
 │           ├── def validate_worker_kwargs(ext_name, callback_name, kwargs, allow_extra) # Synchronously validates worker keyword arguments against the registered function signature and type annotations, and verifies strict JSON se...
 │           ├── def validate_dag_chain_kwargs(steps, kwargs) # Validates shared pipeline kwargs across all steps in a DAG chain.
 │           ├── def start_dag_chain(steps, workspace_id, on_complete_hook, job_category, **kwargs) # Parallel-capable DAG Chain Coordinator.
-│           ├── def run_parallel(fn, items, max_workers) # Executes `fn(item)` across `items` using the shared bounded Akasa I/O ThreadPoolExecutor and deterministically closes thread-local SQLite co...
+│           ├── def run_parallel(fn, items, max_workers) # Executes `fn(item)` across `items` using the shared bounded Akasa I/O ThreadPoolExecutor with contextvars propagation and deterministically closes thread-local SQLite co...
 │           ├── def wait_for_jobs(workspace_id, prefix, job_id, timeout) # Blocks the calling thread until all matching in-flight immediate jobs complete or timeout elapses.
 │           ├── def register_callback(ext_name, callback_name, func, raw_func) # Extensions register their background functions here to be triggered by the Metronome.
 │           ├── def submit_job(job_id, ext_name, callback_name, interval_ms, ...) # Schedules a recurring background task in the SQLite Ledger.
@@ -236,10 +240,11 @@ akasa/
 │       ├── 0012_host_protected_vfs_targets_and_sandbox_drainage.md # ADR 0012: Host-Protected VFS Targets, Import Shadowing Defense, and Pre-Reset Write Drainage
 │       ├── 0013_process_tree_termination_and_verbatim_shell_execution.md # ADR 0013: Process-Tree Termination on Timeout and Verbatim Shell Command Execution
 │       ├── 0014_host_protected_write_policy_and_execution_origin.md # ADR 0014: Host Policy for Protected Writes and Execution Origin
+│       ├── 0015_public_origin_readonly_vfs_bounded_cache_and_baggage.md # ADR 0015: Public-Origin Read-Only VFS Boundary, Ring 0 BoundedCache, ExecutionFrame Baggage Propagation, and MemoryVFSTransaction│       ├── archived/               # Baseline architectural decisions assimilated into kernel
 │       ├── archived/               # Baseline architectural decisions assimilated into kernel
-│       │   ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001 specification
-│       │   ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002 specification
-│       │   └── 0004_vfs_bulk_mutation_batching_and_atomic_consolidation.md # ADR 0004 specification
+│       │   ├── 0001_domain_agnostic_ioc_and_process_sandboxing.md # ADR 0001: Domain-Agnostic Inversion of Control & Process Sandboxing
+│       │   ├── 0002_thread_safe_caching_sse_bus_and_vfs_barriers.md # ADR 0002: Thread-Safe Caching, SSE Event Bus, and Non-Blocking VFS Barriers
+│       │   └── 0004_vfs_bulk_mutation_batching_and_atomic_consolidation.md # ADR 0004: Asynchronous VFS Bulk Mutation Batching and Transaction Consolidation
 │       └── superseded/             # Obsolete architectural decisions replaced by newer ADRs
 │           ├── .gitkeep            # Git preservation marker
 │           ├── 0003_openapi_reflection_dag_orchestration_and_error_hooks.md # ADR 0003 specification
@@ -267,6 +272,10 @@ akasa/
         │   ├── class TestPeerClassification(unittest.TestCase) # S1: classify_peer is the single source of truth for request origin and fails closed on any proxy signal.
         │   ├── class TestBootstrapAndHostGate(unittest.TestCase) # S1: /auth/bootstrap only grants localhost trust to direct loopback requests; the gate rejects foreign Hosts.
         │   └── class TestForwardedHeaderMembraneRule(unittest.TestCase) # S1: the FORWARDED_HEADER_MEMBRANE fitness rule keeps forwarding-header reads inside akasa/auth/peer.py.
+        ├── test_bounded_cache_baggage_and_public_origin.py # Behavioral unit tests for Ring 0 BoundedCache, ExecutionFrame baggage propagation, public-origin read-only VFS enforcement, MemoryVFSTransac...
+        │   ├── class TestBoundedCache(unittest.TestCase) # BoundedCache enforces LRU capacity, revision matching, monotonic TTL, defensive cloning, and reset purging.
+        │   ├── class TestExecutionFrameBaggageAndWorkers(unittest.TestCase) # ExecutionFrame baggage merges across nested frames, run_parallel(), and worker job payloads.
+        │   └── class TestPublicOriginReadOnlyVfsAndMemoryVfs(unittest.TestCase) # [stale?] Unauthenticated public routes execute with origin='public' and are blocked from mutating the VFS.
         ├── test_kernel_hardening.py # Unit tests for RFC 0048 VFS micro-batching, idempotency, slotted AkasaURI, hook auth caching, and SQLite PRAGMAs
         │   └── class TestAkasaKernelHardening(unittest.TestCase) # [stale?] Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening and Row factory access.
         ├── test_process_tree_timeout.py # ProcessManager.run() and execute_binary(timeout=...) kill the whole process tree on timeout, and shell commands run as written.
