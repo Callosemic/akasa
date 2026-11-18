@@ -2,6 +2,19 @@
 
 <!-- version list -->
 
+## v0.11.0 (2026-11-18)
+
+### Bug Fixes
+
+- **db**: Discard id(conn) from applied_schemas on close, so a reused
+  ([`30dcadc`](https://github.com/Callosemic/akasa/commit/30dcadcfe8d89124d9ca89a0eacb1f8d4df87184))
+
+### Features
+
+- **kernel**: Read-only public origin, BoundedCache, frame baggage, MemoryVFS
+  ([`30dcadc`](https://github.com/Callosemic/akasa/commit/30dcadcfe8d89124d9ca89a0eacb1f8d4df87184))
+
+
 ## v0.10.0 (2026-11-13)
 
 ### Features
