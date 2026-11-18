@@ -2,6 +2,14 @@
 
 <!-- version list -->
 
+## v0.11.1 (2026-11-18)
+
+### Bug Fixes
+
+- **db**: Retire pooled connections on other threads after reset
+  ([`9f0232e`](https://github.com/Callosemic/akasa/commit/9f0232e6c74ee7cb5ca794a02597ac51a621d5d7))
+
+
 ## v0.11.0 (2026-11-18)
 
 ### Bug Fixes
