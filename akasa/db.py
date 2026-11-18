@@ -272,9 +272,15 @@ def close_thread_connections():
 hooks.set_thread_cleanup(close_thread_connections)
 
 
+_DB_GENERATION = 0
+
+
 def reset() -> None:
-    """Closes pooled thread-local SQLite connections for isolated test harnesses."""
+    """Closes this thread's pooled connections and retires every other thread's at its next get_connection() call."""
+    global _DB_GENERATION
+    _DB_GENERATION += 1
     close_thread_connections()
+    _local.generation = _DB_GENERATION
 
 
 def get_connection(db_name, workspace_id=None):
@@ -283,6 +289,10 @@ def get_connection(db_name, workspace_id=None):
     Groups connections by workspace_id -> db_name to support stateless multi-tenancy
     without prematurely evicting active databases within the same workspace.
     """
+    if getattr(_local, "generation", 0) != _DB_GENERATION:
+        # A reset() ran on another thread since this thread last connected: its cached connections may point at a retired sandbox.
+        close_thread_connections()
+        _local.generation = _DB_GENERATION
     if not hasattr(_local, 'connections'):
         _local.connections = {}
     if not workspace_id:

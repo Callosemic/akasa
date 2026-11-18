@@ -102,8 +102,8 @@ akasa/
 │   │   ├── def close_workspace_connections(workspace_id, **kwargs) # Evicts and closes thread-local SQLite connections for an unmounting tenant workspace.
 │   │   ├── def evict_cached_connection(workspace_id, db_name) # Safely closes and removes a single cached database connection on the current thread.
 │   │   ├── def close_thread_connections() # Closes and purges all cached SQLite connections on the calling thread to prevent FD leaks in per-request WSGI threads.
-│   │   ├── def reset()             # Closes pooled thread-local SQLite connections for isolated test harnesses.
-│   │   └── def get_connection(db_name, workspace_id) # Returns a thread-local SQLite connection configured with Row factory and 16-database per-workspace LRU pooling.
+│   │   ├── def reset()             # [stale?] Closes pooled thread-local SQLite connections for isolated test harnesses.
+│   │   └── def get_connection(db_name, workspace_id) # [stale?] Returns a thread-local SQLite connection configured with Row factory and 16-database per-workspace LRU pooling.
 │   ├── events.py                   # Thread-safe SSE event bus and client queue manager
 │   │   └── class EventBus          # Thread-safe Server-Sent Events (SSE) broadcasting bus and subscriber queue manager.
 │   ├── extension.py                # Ring 4: Extension SDK context wrappers, SettingsManager, and JobManager
@@ -274,7 +274,7 @@ akasa/
         │   └── class TestForwardedHeaderMembraneRule(unittest.TestCase) # S1: the FORWARDED_HEADER_MEMBRANE fitness rule keeps forwarding-header reads inside akasa/auth/peer.py.
         ├── test_bounded_cache_baggage_and_public_origin.py # Behavioral unit tests for Ring 0 BoundedCache, ExecutionFrame baggage propagation, public-origin read-only VFS enforcement, MemoryVFSTransac...
         │   ├── class TestBoundedCache(unittest.TestCase) # BoundedCache enforces LRU capacity, revision matching, monotonic TTL, defensive cloning, and reset purging.
-        │   ├── class TestExecutionFrameBaggageAndWorkers(unittest.TestCase) # ExecutionFrame baggage merges across nested frames, run_parallel(), and worker job payloads.
+        │   ├── class TestExecutionFrameBaggageAndWorkers(unittest.TestCase) # [stale?] ExecutionFrame baggage merges across nested frames, run_parallel(), and worker job payloads.
         │   └── class TestPublicOriginReadOnlyVfsAndMemoryVfs(unittest.TestCase) # [stale?] Unauthenticated public routes execute with origin='public' and are blocked from mutating the VFS.
         ├── test_kernel_hardening.py # Unit tests for RFC 0048 VFS micro-batching, idempotency, slotted AkasaURI, hook auth caching, and SQLite PRAGMAs
         │   └── class TestAkasaKernelHardening(unittest.TestCase) # [stale?] Behavioral unit tests for RFC 0048 Akasa Micro-Kernel Hardening and Row factory access.

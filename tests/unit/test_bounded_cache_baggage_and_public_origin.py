@@ -4,6 +4,7 @@ import os
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from flask import Flask
@@ -163,6 +164,8 @@ class TestExecutionFrameBaggageAndWorkers(unittest.TestCase):
         _execute_immediate_job("imm_bag_1", "baggage_ext", "imm_task", args_json, "default")
         self.assertEqual(seen_imm, [("agent", {"run_id": "r-9"})])
 
+        # _execute_immediate_job closes this thread's pooled connections when it finishes.
+        conn = get_connection("workers", workspace_id="default")
         conn.execute(
             "INSERT OR REPLACE INTO jobs (id, ext_name, callback_name, interval_ms, status, args_json) "
             "VALUES ('sched_bag_1', 'baggage_ext', 'sched_task', 0, 'running', ?)",
@@ -232,8 +235,11 @@ class TestPublicOriginReadOnlyVfsAndMemoryVfs(unittest.TestCase):
         auth = client.post("/share/view", headers={"Host": "localhost", "X-Test-Token": token}).get_json()
         self.assertIsNone(auth["origin"])
         self.assertEqual(auth["save_status"], "accepted")
+        self.assertEqual((auth["del_status"], auth["blk_status"]), (202, 202))
         sync_vfs_barrier("default")
-        self.assertTrue((self.repo / "unauth.txt").exists())
+        # The route saves unauth.txt and then deletes it, so the bulk save of c.txt is the write that must land.
+        self.assertTrue((self.repo / "c.txt").exists())
+        self.assertFalse((self.repo / "unauth.txt").exists())
 
     def test_public_origin_is_sticky_under_nested_explicit_origin(self):
         with execution_frame(workspace_id="default", transport="HTTP", origin="public"):
@@ -285,6 +291,16 @@ class TestPublicOriginReadOnlyVfsAndMemoryVfs(unittest.TestCase):
         conn2 = get_connection("evict_probe", workspace_id="default")
         row = conn2.execute("SELECT id FROM items WHERE id='k1'").fetchone()
         self.assertEqual(row["id"], "k1")
+
+    def test_reset_retires_connections_cached_on_other_threads(self):
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            first = pool.submit(get_connection, "gen_probe", "default").result()
+            self.assertIs(pool.submit(get_connection, "gen_probe", "default").result(), first)
+            akasa.reset_state(cwd=self.root.as_posix(), control_dir=".akasa")
+            second = pool.submit(get_connection, "gen_probe", "default").result()
+        self.assertIsNot(second, first)
+        with self.assertRaisesRegex(Exception, "closed database"):
+            first.execute("SELECT 1")
 
 
 if __name__ == "__main__":
